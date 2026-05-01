@@ -1,0 +1,23 @@
+{
+  "name": "@interp-shield/backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "build": "node --check server.js && node --check config/env.js && node --check routes/auth.js && node --check routes/user.js && node --check services/authService.js && node --check services/userService.js && node --check services/deepgram.js && node --check services/gemini.js && node --check services/interpreter.js && node --check sockets/interpreterSocket.js",
+    "start": "node server.js",
+    "lint": "node --check server.js && node --check config/env.js && node --check routes/auth.js && node --check routes/user.js && node --check services/authService.js && node --check services/userService.js && node --check services/deepgram.js && node --check services/gemini.js && node --check services/interpreter.js && node --check sockets/interpreterSocket.js",
+    "clean": "node -e \"console.log('backend has no generated build output')\""
+  },
+  "dependencies": {
+    "@deepgram/sdk": "^5.0.0",
+    "@google/genai": "^1.51.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "google-auth-library": "^10.6.2",
+    "socket.io": "^4.8.1"
+  }
+}
