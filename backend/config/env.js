@@ -9,6 +9,7 @@ const backendRoot = path.resolve(__dirname, "..");
 const projectRoot = path.resolve(backendRoot, "..");
 const isProductionProcess = process.env.NODE_ENV === "production";
 
+dotenv.config({ quiet: true });
 dotenv.config({ path: path.join(projectRoot, ".env"), quiet: true });
 dotenv.config({ path: path.join(backendRoot, ".env"), quiet: true, override: !isProductionProcess });
 
@@ -89,6 +90,8 @@ export const getPublicConfig = () => ({
 });
 
 export const warnAboutMissingConfig = () => {
+  console.log("Deepgram key exists:", Boolean(env.deepgramApiKey));
+
   if (!env.mongoUri) {
     console.warn("MONGO_URI is missing. Auth and user data require MongoDB Atlas in production.");
   }

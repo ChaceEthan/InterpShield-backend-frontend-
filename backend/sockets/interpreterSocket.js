@@ -94,6 +94,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       const shouldTranslate = payload.translate !== false;
       const twoWay = Boolean(payload.twoWay);
       lastSequence = -1;
+      console.log("Interpreter session starts", { socketId: socket.id, sourceLang, targetLang, shouldTranslate, twoWay });
 
       try {
         session = await createInterpreterSession({

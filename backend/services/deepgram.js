@@ -1,6 +1,16 @@
 // @ts-nocheck
 import { DeepgramClient } from "@deepgram/sdk";
 
+const placeholderApiKeys = new Set(["", "null", "undefined", "your_deepgram_api_key", "YOUR_DEEPGRAM_API_KEY_HERE"]);
+
+const readDeepgramKey = (value) => {
+  const trimmed = value?.trim() || "";
+  const unquoted = trimmed.match(/^(['"])(.*)\1$/)?.[2] || trimmed;
+  return placeholderApiKeys.has(unquoted) ? "" : unquoted;
+};
+
+const createClient = (apiKey) => new DeepgramClient({ apiKey });
+
 export const createDeepgramSession = ({
   apiKey,
   sourceLang,
@@ -9,8 +19,11 @@ export const createDeepgramSession = ({
   onError,
   onClose
 }) => {
-  if (!apiKey) {
-    throw new Error("Deepgram key is missing");
+  const runtimeApiKey = readDeepgramKey(apiKey || process.env.DEEPGRAM_API_KEY);
+  console.log("Deepgram key exists:", Boolean(runtimeApiKey));
+
+  if (!runtimeApiKey) {
+    throw new Error("Missing Deepgram API key");
   }
 
   let connection = null;
@@ -43,11 +56,11 @@ export const createDeepgramSession = ({
   };
 
   const start = async () => {
-    const deepgram = new DeepgramClient({ apiKey });
+    const deepgram = createClient(runtimeApiKey);
     stopped = false;
     const options = {
       model: "nova-3",
-      Authorization: `Token ${apiKey}`,
+      Authorization: `Token ${runtimeApiKey}`,
       interim_results: "true",
       punctuate: "true",
       smart_format: "true",
@@ -68,6 +81,7 @@ export const createDeepgramSession = ({
 
     connection.on("open", () => {
       isOpen = true;
+      console.log("Deepgram connected");
       console.log("Deepgram stream started");
       keepAliveTimer = setInterval(() => {
         if (isOpen && connection?.sendKeepAlive) {
@@ -99,7 +113,9 @@ export const createDeepgramSession = ({
     });
 
     connection.on("error", (error) => {
-      onError?.(error?.message || "Deepgram streaming error");
+      const message = error?.message || "Deepgram streaming error";
+      console.error("Deepgram error:", message);
+      onError?.(message);
     });
 
     connection.on("close", () => {
