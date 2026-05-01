@@ -68,6 +68,7 @@ interface AppUser {
   id: string;
   name: string;
   email: string;
+  avatar?: string;
   picture?: string;
   plan: Plan;
   provider: string;
@@ -139,8 +140,7 @@ declare global {
   }
 }
 
-const API = import.meta.env.VITE_API_URL;
-const API_BASE_URL = API?.replace(/\/$/, "");
+const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const AUDIO_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
@@ -252,13 +252,13 @@ const initialView = (): View => {
 };
 
 const requestApi = async <T,>(path: string, options: RequestInit = {}, token?: string | null): Promise<T> => {
-  if (!API_BASE_URL) {
+  if (!API) {
     throw new Error("Backend API URL is missing. Set VITE_API_URL and restart the frontend.");
   }
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, {
+    response = await fetch(`${API}${path}`, {
       ...options,
       credentials: "include",
       headers: {
@@ -277,10 +277,10 @@ const requestApi = async <T,>(path: string, options: RequestInit = {}, token?: s
 };
 
 const saveSession = (token: string, user: AppUser) => {
-  sessionStorage.setItem("interp_shield_token", token);
-  sessionStorage.setItem("interp_shield_user", JSON.stringify(user));
-  localStorage.removeItem("interp_shield_token");
-  localStorage.removeItem("interp_shield_user");
+  localStorage.setItem("interp_shield_token", token);
+  localStorage.setItem("interp_shield_user", JSON.stringify(user));
+  sessionStorage.removeItem("interp_shield_token");
+  sessionStorage.removeItem("interp_shield_user");
 };
 
 const clearSessionStorage = () => {
@@ -420,12 +420,10 @@ const LanguageSelect = ({
 const GoogleSignIn = ({
   loading,
   onCredential,
-  onDemo,
   onError
 }: {
   loading: boolean;
   onCredential: (credential: string) => void;
-  onDemo: () => void;
   onError: (message: string) => void;
 }) => {
   const [loaded, setLoaded] = useState(false);
@@ -485,7 +483,7 @@ const GoogleSignIn = ({
 
   if (!GOOGLE_CLIENT_ID) {
     return (
-      <button type="button" onClick={onDemo} className="flex w-full items-center justify-center gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm font-black text-slate-800 shadow-lg shadow-slate-950/20 transition hover:-translate-y-0.5 hover:bg-slate-50">
+      <button type="button" onClick={() => onError("Google Sign-In is not configured for this deployment.")} className="flex w-full items-center justify-center gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm font-black text-slate-800 shadow-lg shadow-slate-950/20 transition hover:-translate-y-0.5 hover:bg-slate-50">
         <GoogleIcon />
         Continue with Google
       </button>
@@ -511,7 +509,6 @@ const AuthPage = ({
   error,
   onSubmit,
   onGoogle,
-  onGoogleDemo,
   onGoogleError,
   onNavigate
 }: {
@@ -520,7 +517,6 @@ const AuthPage = ({
   error: string | null;
   onSubmit: (payload: { name?: string; email: string; password: string }) => void;
   onGoogle: (credential: string) => void;
-  onGoogleDemo: () => void;
   onGoogleError: (message: string) => void;
   onNavigate: (view: View) => void;
 }) => {
@@ -586,7 +582,7 @@ const AuthPage = ({
           <span className="h-px flex-1 bg-white/10" />
         </div>
 
-        <GoogleSignIn loading={loading} onCredential={onGoogle} onDemo={onGoogleDemo} onError={onGoogleError} />
+        <GoogleSignIn loading={loading} onCredential={onGoogle} onError={onGoogleError} />
 
         <button onClick={() => onNavigate(isSignup ? "login" : "signup")} className="mt-4 w-full rounded-lg border border-white/10 px-4 py-3 text-sm font-bold text-slate-300 hover:bg-white/5">
           {isSignup ? "Already have an account? Login" : "New here? Create an account"}
@@ -729,7 +725,7 @@ export default function App() {
       try {
         const data = await requestApi<{ user: AppUser }>("/api/auth/me", {}, activeToken);
         setUser(data.user);
-        sessionStorage.setItem("interp_shield_user", JSON.stringify(data.user));
+        localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
         applyUserSettings(data.user.settings);
       } catch {
         clearSessionStorage();
@@ -750,7 +746,7 @@ export default function App() {
         body: JSON.stringify(settings)
       }, token);
       setUser(data.user);
-      sessionStorage.setItem("interp_shield_user", JSON.stringify(data.user));
+      localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
     } catch {
       setAlert("Unable to save settings.");
     }
@@ -797,7 +793,12 @@ export default function App() {
   useEffect(() => {
     if (!token || !user) return undefined;
 
-    const socket = io(API_BASE_URL, {
+    if (!API) {
+      setAlert("Backend API URL is missing. Set VITE_API_URL and restart the frontend.");
+      return undefined;
+    }
+
+    const socket = io(API, {
       auth: { token },
       transports: ["websocket", "polling"],
       reconnectionAttempts: 10,
@@ -961,28 +962,6 @@ export default function App() {
     }
   }, []);
 
-  const handleGoogleDemo = useCallback(async () => {
-    setAuthLoading(true);
-    setAuthError(null);
-
-    try {
-      const session = await requestApi<{ token: string; user: AppUser }>("/api/auth/google", {
-        method: "POST",
-        body: JSON.stringify({
-          profile: {
-            name: "Google Demo User",
-            email: "google-demo@interpshield.local"
-          }
-        })
-      });
-      applyAuthSession(session);
-    } catch (error) {
-      setAuthError(error instanceof Error ? error.message : "Google sign-in failed.");
-    } finally {
-      setAuthLoading(false);
-    }
-  }, []);
-
   const logout = async () => {
     if (token) await requestApi("/api/auth/logout", { method: "POST" }, token).catch(() => undefined);
 
@@ -1002,7 +981,7 @@ export default function App() {
     try {
       const data = await requestApi<{ user: AppUser }>("/api/user/upgrade", { method: "POST" }, token);
       setUser(data.user);
-      sessionStorage.setItem("interp_shield_user", JSON.stringify(data.user));
+      localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
       setAlert("Plan updated. Pro features are active.");
       navigate("dashboard");
     } catch (error) {
@@ -1572,8 +1551,8 @@ export default function App() {
       <div className="fixed inset-0 -z-10 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.14),transparent_30%),radial-gradient(circle_at_82%_14%,rgba(16,185,129,0.1),transparent_26%),linear-gradient(180deg,#020617,#0f172a_62%,#020617)]" />
       {renderTopNav()}
       {view === "landing" && renderLanding()}
-      {view === "login" && <AuthPage mode="login" loading={authLoading} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleDemo={handleGoogleDemo} onGoogleError={setAuthError} onNavigate={navigate} />}
-      {view === "signup" && <AuthPage mode="signup" loading={authLoading} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleDemo={handleGoogleDemo} onGoogleError={setAuthError} onNavigate={navigate} />}
+      {view === "login" && <AuthPage mode="login" loading={authLoading} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleError={setAuthError} onNavigate={navigate} />}
+      {view === "signup" && <AuthPage mode="signup" loading={authLoading} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleError={setAuthError} onNavigate={navigate} />}
       {view === "dashboard" && isAuthed && renderDashboard()}
       {view === "pricing" && renderPricing()}
       {view === "history" && isAuthed && renderHistory()}

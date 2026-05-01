@@ -3,6 +3,7 @@ import http from "node:http";
 import cors from "cors";
 import express from "express";
 import { Server } from "socket.io";
+import { connectDatabase, getDatabaseStatus } from "./config/database.js";
 import { env, getPublicConfig, warnAboutMissingConfig } from "./config/env.js";
 import { createAuthRouter } from "./routes/auth.js";
 import { createUserRouter } from "./routes/user.js";
@@ -34,7 +35,12 @@ app.get("/api/config", (_req, res) => {
 });
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, service: "interp-shield-backend", ...getPublicConfig() });
+  res.json({
+    status: "ok",
+    service: "interp-shield-backend",
+    database: getDatabaseStatus(),
+    ...getPublicConfig()
+  });
 });
 
 app.use("/api/auth", createAuthRouter(env));
@@ -52,7 +58,18 @@ app.use((error, _req, res, _next) => {
 
 registerInterpreterSocket(io, env, getPublicConfig);
 
-server.listen(env.port, () => {
-  console.log(`InterpShield backend listening on port ${env.port}`);
-  console.log(`Local backend URL: http://localhost:${env.port}`);
-});
+const startServer = async () => {
+  try {
+    await connectDatabase(env);
+
+    server.listen(env.port, () => {
+      console.log(`Server running on port ${env.port}`);
+      console.log(`Local backend URL: http://localhost:${env.port}`);
+    });
+  } catch (error) {
+    console.error("Failed to start InterpShield backend:", error?.message || error);
+    process.exit(1);
+  }
+};
+
+void startServer();

@@ -7,9 +7,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const backendRoot = path.resolve(__dirname, "..");
 const projectRoot = path.resolve(backendRoot, "..");
+const isProductionProcess = process.env.NODE_ENV === "production";
 
 dotenv.config({ path: path.join(projectRoot, ".env"), quiet: true });
-dotenv.config({ path: path.join(backendRoot, ".env"), quiet: true });
+dotenv.config({ path: path.join(backendRoot, ".env"), quiet: true, override: !isProductionProcess });
 
 const placeholderValues = new Set([
   "",
@@ -17,6 +18,7 @@ const placeholderValues = new Set([
   "undefined",
   "your_deepgram_api_key",
   "your_gemini_api_key",
+  "your_mongo_uri",
   "demo_deepgram_key_replace_me",
   "demo_gemini_key_replace_me",
   "YOUR_DEEPGRAM_API_KEY_HERE",
@@ -44,7 +46,7 @@ const readOrigins = (...values) => {
   const origins = values
     .filter(Boolean)
     .flatMap((value) => value.split(","))
-    .map((origin) => origin.trim())
+    .map((origin) => origin.trim().replace(/\/$/, "").toLowerCase())
     .filter(Boolean);
 
   if (origins.length === 0 || origins.includes("*")) return defaultClientOrigins;
@@ -53,12 +55,15 @@ const readOrigins = (...values) => {
 
 export const env = {
   port: readNumber(process.env.PORT, 5000),
-  clientOrigins: readOrigins(process.env.CLIENT_ORIGINS, process.env.CLIENT_ORIGIN),
+  nodeEnv: process.env.NODE_ENV || "development",
+  clientOrigins: readOrigins(process.env.CLIENT_ORIGINS, process.env.CLIENT_ORIGIN, process.env.FRONTEND_URL),
   dataDir: readProjectPath(process.env.DATA_DIR, path.join(projectRoot, ".data")),
+  mongoUri: readSecret(process.env.MONGO_URI),
   deepgramApiKey: readSecret(process.env.DEEPGRAM_API_KEY),
   geminiApiKey: readSecret(process.env.GEMINI_API_KEY),
   googleClientId: readSecret(process.env.GOOGLE_CLIENT_ID),
-  jwtSecret: readSecret(process.env.JWT_SECRET) || "interp-shield-local-dev-secret-change-me",
+  hasJwtSecret: Boolean(readSecret(process.env.JWT_SECRET)),
+  jwtSecret: readSecret(process.env.JWT_SECRET) || (isProductionProcess ? "" : "interp-shield-local-dev-secret-change-me"),
   jwtIssuer: process.env.JWT_ISSUER || "interp-shield",
   maxSessionSeconds: readNumber(process.env.MAX_SESSION_SECONDS, 120),
   audioChunkMs: readNumber(process.env.AUDIO_CHUNK_MS, 700)
@@ -82,6 +87,10 @@ export const getPublicConfig = () => ({
 });
 
 export const warnAboutMissingConfig = () => {
+  if (!env.mongoUri) {
+    console.warn("MONGO_URI is missing. Auth and user data require MongoDB Atlas in production.");
+  }
+
   if (!env.deepgramApiKey) {
     console.warn("Deepgram key is missing. STT will use demo fallback.");
   }
@@ -90,11 +99,15 @@ export const warnAboutMissingConfig = () => {
     console.warn("Gemini key is missing. Translation will use demo fallback.");
   }
 
-  if (!process.env.JWT_SECRET || env.jwtSecret === "interp-shield-local-dev-secret-change-me") {
-    console.warn("JWT_SECRET is missing. Using a local development secret.");
+  if (!env.hasJwtSecret) {
+    if (env.nodeEnv === "production") {
+      console.warn("JWT_SECRET is missing. Auth tokens are disabled until JWT_SECRET is set.");
+    } else {
+      console.warn("JWT_SECRET is missing. Using a local development secret.");
+    }
   }
 
   if (!env.googleClientId) {
-    console.warn("GOOGLE_CLIENT_ID is missing. Google Sign-In will run in local demo mode.");
+    console.warn("GOOGLE_CLIENT_ID is missing. Google Sign-In is disabled until it is configured.");
   }
 };

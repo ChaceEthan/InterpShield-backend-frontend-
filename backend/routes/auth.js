@@ -26,7 +26,12 @@ export const requireAuth = (env) => async (req, res, next) => {
 
     req.user = await getUserByToken(token, env);
     next();
-  } catch {
+  } catch (error) {
+    if (error?.statusCode === 503) {
+      res.status(503).json({ error: error.message });
+      return;
+    }
+
     res.status(401).json({ error: "Invalid or expired session." });
   }
 };

@@ -1,85 +1,72 @@
-import crypto from "node:crypto";
-import { withUserStore } from "./authService.js";
+import { requireDatabase } from "../config/database.js";
+import History from "../models/History.js";
+import User from "../models/User.js";
+import { httpError, safeUser } from "./authService.js";
 
 const safeHistoryItem = (item) => ({
-  id: item.id,
+  id: item._id?.toString?.() || item.id,
   title: item.title,
   sourceLang: item.sourceLang,
   targetLang: item.targetLang,
   originalText: item.originalText,
   translatedText: item.translatedText,
   durationSeconds: item.durationSeconds,
-  createdAt: item.createdAt
+  createdAt: item.createdAt?.toISOString?.() || item.createdAt
 });
 
+const findUserOrThrow = async (userId) => {
+  const user = await User.findById(userId);
+  if (!user) throw httpError("User not found", 404);
+  return user;
+};
+
 export const updateUserSettings = async (userId, settings, env) => {
-  return withUserStore(env, async (store) => {
-    const user = store.users.find((candidate) => candidate.id === userId);
-    if (!user) throw new Error("User not found");
+  requireDatabase(env);
 
-    user.settings = {
-      ...(user.settings || {}),
-      ...settings
-    };
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+    throw httpError("Settings payload must be an object.", 400);
+  }
 
-    return {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      picture: user.picture || "",
-      plan: user.plan || "free",
-      provider: user.provider || "password",
-      settings: user.settings,
-      createdAt: user.createdAt
-    };
-  });
+  const user = await findUserOrThrow(userId);
+  user.settings = {
+    ...(user.settings || {}),
+    ...settings
+  };
+  await user.save();
+
+  return safeUser(user);
 };
 
 export const upgradeUserPlan = async (userId, env) => {
-  return withUserStore(env, async (store) => {
-    const user = store.users.find((candidate) => candidate.id === userId);
-    if (!user) throw new Error("User not found");
+  requireDatabase(env);
 
-    user.plan = "pro";
-    user.upgradedAt = new Date().toISOString();
+  const user = await findUserOrThrow(userId);
+  user.plan = "pro";
+  user.upgradedAt = new Date();
+  await user.save();
 
-    return {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      picture: user.picture || "",
-      plan: user.plan,
-      provider: user.provider || "password",
-      settings: user.settings,
-      createdAt: user.createdAt
-    };
-  });
+  return safeUser(user);
 };
 
 export const listHistory = async (userId, env) => {
-  return withUserStore(env, async (store) => {
-    return store.history
-      .filter((item) => item.userId === userId)
-      .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime())
-      .map(safeHistoryItem);
-  });
+  requireDatabase(env);
+
+  const history = await History.find({ userId }).sort({ createdAt: -1 }).lean();
+  return history.map(safeHistoryItem);
 };
 
-export const saveHistoryItem = async (userId, payload, env) => {
-  return withUserStore(env, async (store) => {
-    const item = {
-      id: crypto.randomUUID(),
-      userId,
-      title: payload.title?.trim() || "Live interpreter session",
-      sourceLang: payload.sourceLang || "en",
-      targetLang: payload.targetLang || "es",
-      originalText: payload.originalText || "",
-      translatedText: payload.translatedText || "",
-      durationSeconds: Number(payload.durationSeconds || 0),
-      createdAt: new Date().toISOString()
-    };
+export const saveHistoryItem = async (userId, payload = {}, env) => {
+  requireDatabase(env);
 
-    store.history.push(item);
-    return safeHistoryItem(item);
+  const item = await History.create({
+    userId,
+    title: payload.title?.trim() || "Live interpreter session",
+    sourceLang: payload.sourceLang || "en",
+    targetLang: payload.targetLang || "es",
+    originalText: payload.originalText || "",
+    translatedText: payload.translatedText || "",
+    durationSeconds: Number(payload.durationSeconds || 0)
   });
+
+  return safeHistoryItem(item);
 };

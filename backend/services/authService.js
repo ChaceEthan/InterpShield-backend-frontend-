@@ -1,82 +1,46 @@
-import crypto from "node:crypto";
-import fs from "node:fs/promises";
-import path from "node:path";
+import bcrypt from "bcrypt";
 import { OAuth2Client } from "google-auth-library";
+import jwt from "jsonwebtoken";
+import { requireDatabase } from "../config/database.js";
+import User from "../models/User.js";
 
-const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7;
 const MIN_PASSWORD_LENGTH = 6;
+const BCRYPT_SALT_ROUNDS = 12;
 
-let storeLock = Promise.resolve();
 let googleClient = null;
-
-const base64Url = (input) => Buffer.from(input).toString("base64url");
-const fromBase64Url = (input) => Buffer.from(input, "base64url").toString("utf8");
 
 const normalizeEmail = (email) => email?.trim().toLowerCase();
 
-const httpError = (message, statusCode = 400) => {
+export const httpError = (message, statusCode = 400) => {
   const error = new Error(message);
   error.statusCode = statusCode;
   return error;
 };
 
-const ensureStore = async (env) => {
-  await fs.mkdir(env.dataDir, { recursive: true });
-  const filePath = path.join(env.dataDir, "users.json");
-
-  try {
-    await fs.access(filePath);
-  } catch {
-    await fs.writeFile(filePath, JSON.stringify({ users: [], history: [] }, null, 2));
+const requireJwtSecret = (env) => {
+  if (!env.jwtSecret) {
+    throw httpError("JWT_SECRET is not configured on the server.", 503);
   }
-
-  return filePath;
 };
 
-const readStore = async (env) => {
-  const filePath = await ensureStore(env);
-  const raw = await fs.readFile(filePath, "utf8");
-  return JSON.parse(raw || "{}");
+const hashPassword = (password) => bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+
+const isBcryptHash = (storedHash) => storedHash?.startsWith("$2a$") || storedHash?.startsWith("$2b$") || storedHash?.startsWith("$2y$");
+
+const verifyPassword = async (password, storedHash) => {
+  if (!storedHash) return false;
+  if (!isBcryptHash(storedHash)) return false;
+  return bcrypt.compare(password, storedHash);
 };
 
-const writeStore = async (env, store) => {
-  const filePath = await ensureStore(env);
-  await fs.writeFile(filePath, JSON.stringify(store, null, 2));
-};
+const toId = (value) => value?._id?.toString?.() || value?.id || value?.toString?.() || "";
 
-export const withUserStore = async (env, mutator) => {
-  const run = async () => {
-    const store = await readStore(env);
-    store.users ||= [];
-    store.history ||= [];
-    const result = await mutator(store);
-    await writeStore(env, store);
-    return result;
-  };
-
-  storeLock = storeLock.then(run, run);
-  return storeLock;
-};
-
-const hashPassword = (password, salt = crypto.randomBytes(16).toString("hex")) => {
-  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
-  return `${salt}:${hash}`;
-};
-
-const verifyPassword = (password, storedHash) => {
-  const [salt, hash] = storedHash.split(":");
-  if (!salt || !hash) return false;
-
-  const candidate = crypto.scryptSync(password, salt, 64);
-  const expected = Buffer.from(hash, "hex");
-  return expected.length === candidate.length && crypto.timingSafeEqual(candidate, expected);
-};
-
-const safeUser = (user) => ({
-  id: user.id,
+export const safeUser = (user) => ({
+  id: toId(user),
   name: user.name,
   email: user.email,
-  picture: user.picture || "",
+  avatar: user.avatar || user.picture || "",
+  picture: user.picture || user.avatar || "",
   plan: user.plan || "free",
   provider: user.provider || "password",
   settings: user.settings || {
@@ -85,47 +49,19 @@ const safeUser = (user) => ({
     preferredSourceLang: "en",
     preferredTargetLang: "es"
   },
-  createdAt: user.createdAt
+  createdAt: user.createdAt?.toISOString?.() || user.createdAt
 });
 
 export const signToken = (user, env) => {
-  const now = Math.floor(Date.now() / 1000);
-  const header = { alg: "HS256", typ: "JWT" };
-  const payload = {
-    sub: user.id,
-    email: user.email,
-    plan: user.plan || "free",
-    iss: env.jwtIssuer,
-    iat: now,
-    exp: now + TOKEN_TTL_SECONDS
-  };
+  requireJwtSecret(env);
 
-  const unsigned = `${base64Url(JSON.stringify(header))}.${base64Url(JSON.stringify(payload))}`;
-  const signature = crypto.createHmac("sha256", env.jwtSecret).update(unsigned).digest("base64url");
-  return `${unsigned}.${signature}`;
+  return jwt.sign({ userId: toId(user) }, env.jwtSecret, { expiresIn: "7d" });
 };
 
 export const verifyToken = (token, env) => {
-  const [encodedHeader, encodedPayload, signature] = token?.split(".") || [];
-  if (!encodedHeader || !encodedPayload || !signature) {
-    throw new Error("Invalid token");
-  }
+  requireJwtSecret(env);
 
-  const unsigned = `${encodedHeader}.${encodedPayload}`;
-  const expected = crypto.createHmac("sha256", env.jwtSecret).update(unsigned).digest("base64url");
-  const signatureBuffer = Buffer.from(signature);
-  const expectedBuffer = Buffer.from(expected);
-
-  if (signatureBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) {
-    throw new Error("Invalid token signature");
-  }
-
-  const payload = JSON.parse(fromBase64Url(encodedPayload));
-  if (payload.iss !== env.jwtIssuer || payload.exp < Math.floor(Date.now() / 1000)) {
-    throw new Error("Expired token");
-  }
-
-  return payload;
+  return jwt.verify(token, env.jwtSecret);
 };
 
 export const createSession = (user, env) => ({
@@ -145,30 +81,24 @@ export const registerUser = async ({ name, email, password } = {}, env) => {
     throw httpError("Password must be at least 6 characters.", 400);
   }
 
-  return withUserStore(env, async (store) => {
-    if (store.users.some((user) => user.email === normalizedEmail)) {
-      throw httpError("An account already exists for this email.", 409);
-    }
+  requireDatabase(env);
 
-    const user = {
-      id: crypto.randomUUID(),
+  try {
+    const user = await User.create({
       name: cleanName,
       email: normalizedEmail,
-      passwordHash: hashPassword(password),
-      provider: "password",
-      plan: "free",
-      createdAt: new Date().toISOString(),
-      settings: {
-        privateMode: true,
-        shareableMode: false,
-        preferredSourceLang: "en",
-        preferredTargetLang: "es"
-      }
-    };
+      password: await hashPassword(password),
+      provider: "password"
+    });
 
-    store.users.push(user);
     return createSession(user, env);
-  });
+  } catch (error) {
+    if (error?.code === 11000) {
+      throw httpError("An account already exists for this email", 409);
+    }
+
+    throw error;
+  }
 };
 
 export const loginUser = async ({ email, password } = {}, env) => {
@@ -182,125 +112,92 @@ export const loginUser = async ({ email, password } = {}, env) => {
     throw httpError("Password is required.", 400);
   }
 
-  return withUserStore(env, async (store) => {
-    const user = store.users.find((candidate) => candidate.email === normalizedEmail);
-    if (!user || !user.passwordHash || !verifyPassword(password, user.passwordHash)) {
-      throw httpError("Invalid email or password.", 401);
-    }
+  requireDatabase(env);
 
-    return createSession(user, env);
-  });
+  const user = await User.findOne({ email: normalizedEmail }).select("+password");
+  if (!user) {
+    throw httpError("User not found", 404);
+  }
+
+  if (!user.password || !(await verifyPassword(password, user.password))) {
+    throw httpError("Invalid email or password", 401);
+  }
+
+  return createSession(user, env);
 };
 
-const verifyGoogleAccessToken = async (accessToken) => {
-  const response = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
-    }
-  });
-
-  if (!response.ok) {
-    throw httpError("Google login failed. Please try again.", 401);
+const verifyGoogleCredential = async ({ credential }, env) => {
+  if (!credential) {
+    throw httpError("Missing Google credential", 400);
   }
 
-  const payload = await response.json();
-  if (payload.email_verified === false) {
-    throw httpError("Google account email is not verified.", 401);
-  }
-
-  return {
-    email: payload.email,
-    name: payload.name || payload.email?.split("@")[0],
-    picture: payload.picture || ""
-  };
-};
-
-const verifyGoogleCredential = async ({ credential, accessToken, profile }, env) => {
-  if (accessToken) {
-    return verifyGoogleAccessToken(accessToken);
-  }
-
-  if (credential && !env.googleClientId) {
+  if (!env.googleClientId) {
     throw httpError("Google login is not configured on the server.", 400);
   }
 
-  if (env.googleClientId && credential) {
-    try {
-      googleClient ||= new OAuth2Client(env.googleClientId);
-      const ticket = await googleClient.verifyIdToken({
-        idToken: credential,
-        audience: env.googleClientId
-      });
-      const payload = ticket.getPayload();
+  try {
+    googleClient ||= new OAuth2Client(env.googleClientId);
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: env.googleClientId
+    });
+    const payload = ticket.getPayload();
 
-      if (payload?.email_verified === false) {
-        throw httpError("Google account email is not verified.", 401);
-      }
-
-      return {
-        email: payload?.email,
-        name: payload?.name || payload?.email?.split("@")[0],
-        picture: payload?.picture || ""
-      };
-    } catch (error) {
-      if (error?.statusCode) throw error;
-      throw httpError("Invalid Google token.", 401);
+    if (payload?.email_verified === false) {
+      throw httpError("Google account email is not verified.", 401);
     }
-  }
 
-  if (env.googleClientId && !credential) {
-    throw httpError("Missing Google credential.", 400);
+    return {
+      googleId: payload?.sub,
+      email: payload?.email,
+      name: payload?.name || payload?.email?.split("@")[0],
+      picture: payload?.picture || ""
+    };
+  } catch (error) {
+    if (error?.statusCode) throw error;
+    throw httpError("Invalid Google token", 401);
   }
-
-  return {
-    email: normalizeEmail(profile?.email) || "google-demo@interpshield.local",
-    name: profile?.name || "Google Demo User",
-    picture: profile?.picture || ""
-  };
 };
 
-export const loginWithGoogle = async ({ credential, accessToken, profile } = {}, env) => {
-  const googleProfile = await verifyGoogleCredential({ credential, accessToken, profile }, env);
+export const loginWithGoogle = async ({ credential } = {}, env) => {
+  const googleProfile = await verifyGoogleCredential({ credential }, env);
   const normalizedEmail = normalizeEmail(googleProfile.email);
 
   if (!normalizedEmail || !normalizedEmail.includes("@")) {
     throw httpError("Google account did not return a valid email.", 400);
   }
 
-  return withUserStore(env, async (store) => {
-    let user = store.users.find((candidate) => candidate.email === normalizedEmail);
+  requireDatabase(env);
 
-    if (!user) {
-      user = {
-        id: crypto.randomUUID(),
-        name: googleProfile.name || normalizedEmail.split("@")[0],
-        email: normalizedEmail,
-        picture: googleProfile.picture || "",
-        provider: "google",
-        plan: "free",
-        createdAt: new Date().toISOString(),
-        settings: {
-          privateMode: true,
-          shareableMode: false,
-          preferredSourceLang: "en",
-          preferredTargetLang: "es"
-        }
-      };
-      store.users.push(user);
-    } else {
-      user.name = googleProfile.name || user.name;
-      user.picture = googleProfile.picture || user.picture;
-      user.provider = user.provider === "password" ? "password+google" : "google";
-    }
+  let user = googleProfile.googleId ? await User.findOne({ googleId: googleProfile.googleId }) : null;
+  user ||= await User.findOne({ email: normalizedEmail });
 
-    return createSession(user, env);
-  });
+  if (!user) {
+    user = await User.create({
+      name: googleProfile.name || normalizedEmail.split("@")[0],
+      email: normalizedEmail,
+      googleId: googleProfile.googleId || undefined,
+      avatar: googleProfile.picture || "",
+      picture: googleProfile.picture || "",
+      provider: "google"
+    });
+  } else {
+    user.name = googleProfile.name || user.name;
+    user.googleId = googleProfile.googleId || user.googleId;
+    user.avatar = googleProfile.picture || user.avatar;
+    user.picture = googleProfile.picture || user.picture;
+    user.provider = user.provider === "password" ? "password+google" : "google";
+    await user.save();
+  }
+
+  return createSession(user, env);
 };
 
 export const getUserByToken = async (token, env) => {
+  requireDatabase(env);
+
   const payload = verifyToken(token, env);
-  const store = await readStore(env);
-  const user = store.users.find((candidate) => candidate.id === payload.sub);
+  const user = await User.findById(payload.userId);
 
   if (!user) {
     throw new Error("User not found");
