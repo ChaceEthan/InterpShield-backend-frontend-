@@ -94,7 +94,6 @@ export const createInterpreterSession = async ({
   }
 
   const session = createDeepgramSession({
-    apiKey: env.deepgramApiKey,
     sourceLang,
     onOpen: onReady,
     onError: (message) => {
@@ -142,7 +141,6 @@ export const createInterpreterSession = async ({
       const translationInput = prepareTextForTranslation(displayText);
       const translatedText = shouldTranslate
         ? await translateWithGemini({
-            apiKey: env.geminiApiKey,
             text: translationInput,
             sourceLang: direction.source,
             targetLang: direction.target

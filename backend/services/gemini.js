@@ -4,6 +4,14 @@ import { GoogleGenAI } from "@google/genai";
 let client = null;
 let activeKey = null;
 
+const placeholderApiKeys = new Set(["", "null", "undefined", "your_gemini_api_key", "YOUR_GEMINI_API_KEY_HERE"]);
+
+const readGeminiKey = (value) => {
+  const trimmed = value?.trim() || "";
+  const unquoted = trimmed.match(/^(['"])(.*)\1$/)?.[2] || trimmed;
+  return placeholderApiKeys.has(unquoted) ? "" : unquoted;
+};
+
 export const demoTranslate = (text, targetLang = "es") => {
   const cleanText = text?.trim() || "Hello";
 
@@ -14,8 +22,9 @@ export const demoTranslate = (text, targetLang = "es") => {
   return `${cleanText} (${targetLang} demo)`;
 };
 
-export const translateWithGemini = async ({ apiKey, text, sourceLang, targetLang }) => {
+export const translateWithGemini = async ({ text, sourceLang, targetLang }) => {
   const cleanText = text?.trim();
+  const apiKey = readGeminiKey(process.env.GEMINI_API_KEY);
 
   if (!cleanText) {
     return "";
@@ -32,7 +41,7 @@ export const translateWithGemini = async ({ apiKey, text, sourceLang, targetLang
 
   try {
     const response = await client.models.generateContent({
-      model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+      model: "gemini-2.5-flash",
       contents: [
         {
           role: "user",

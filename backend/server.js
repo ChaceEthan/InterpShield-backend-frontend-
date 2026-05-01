@@ -13,15 +13,22 @@ warnAboutMissingConfig();
 
 const app = express();
 const server = http.createServer(app);
+const configuredClientOrigins = (process.env.CLIENT_URL || "")
+  .split(",")
+  .map((origin) => origin.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+const corsOrigins = [...new Set([...configuredClientOrigins, "http://localhost:5173", ...env.clientOrigins])];
 const corsOptions = {
-  origin: env.clientOrigins,
+  origin: corsOrigins,
   credentials: true
 };
 const io = new Server(server, {
   cors: {
-    ...corsOptions,
-    methods: ["GET", "POST"]
+    origin: corsOrigins,
+    methods: ["GET", "POST"],
+    credentials: true
   },
+  transports: ["websocket", "polling"],
   maxHttpBufferSize: 2e6,
   pingInterval: 15000,
   pingTimeout: 20000
@@ -48,6 +55,13 @@ app.get("/api/health", (_req, res) => {
     service: "interp-shield-backend",
     database: getDatabaseStatus(),
     ...getPublicConfig()
+  });
+});
+
+app.get("/api/debug/env", (_req, res) => {
+  res.json({
+    deepgram: Boolean(env.deepgramApiKey),
+    gemini: Boolean(env.geminiApiKey)
   });
 });
 

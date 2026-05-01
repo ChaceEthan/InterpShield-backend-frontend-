@@ -142,7 +142,7 @@ declare global {
 
 const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
-const AUDIO_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
 
@@ -798,8 +798,10 @@ export default function App() {
 
     const socket = io(API, {
       auth: { token },
-      transports: ["websocket", "polling"],
-      reconnectionAttempts: 10,
+      transports: ["websocket"],
+      withCredentials: true,
+      reconnection: true,
+      reconnectionAttempts: 5,
       reconnectionDelay: 650
     });
 
@@ -1088,7 +1090,7 @@ export default function App() {
         targetLang,
         translate: modeRef.current !== "transcribe",
         twoWay,
-        mimeType: recorder.mimeType || mimeType
+        mimeType: "audio/webm"
       };
       activeSessionPayloadRef.current = sessionPayload;
       shouldRestartSessionOnReconnectRef.current = false;

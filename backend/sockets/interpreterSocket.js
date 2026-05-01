@@ -14,7 +14,7 @@ const audioPayloadToBuffer = (audio) => {
 
 export const registerInterpreterSocket = (io, env, getPublicConfig) => {
   io.on("connection", (socket) => {
-    console.log("Socket connected");
+    console.log("Socket connected:", socket.id);
 
     let session = null;
     let sessionTimer = null;

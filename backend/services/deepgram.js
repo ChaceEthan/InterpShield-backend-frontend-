@@ -11,15 +11,22 @@ const readDeepgramKey = (value) => {
 
 const createClient = (apiKey) => new DeepgramClient({ apiKey });
 
+const isConnectionOpen = (connection) => {
+  const readyState = connection?.readyState ?? connection?.socket?.readyState;
+  return readyState === 1 || readyState === "OPEN";
+};
+
 export const createDeepgramSession = ({
-  apiKey,
   sourceLang,
   onOpen,
   onTranscript,
   onError,
   onClose
 }) => {
-  const runtimeApiKey = readDeepgramKey(apiKey || process.env.DEEPGRAM_API_KEY);
+  const envApiKey = readDeepgramKey(process.env.DEEPGRAM_API_KEY);
+  console.log("Deepgram key loaded:", Boolean(envApiKey));
+
+  const runtimeApiKey = envApiKey;
   console.log("Deepgram key exists:", Boolean(runtimeApiKey));
 
   if (!runtimeApiKey) {
@@ -50,7 +57,7 @@ export const createDeepgramSession = ({
   };
 
   const flushQueuedAudio = () => {
-    while (isOpen && queuedAudio.length > 0) {
+    while (isOpen && isConnectionOpen(connection) && queuedAudio.length > 0) {
       sendToDeepgram(queuedAudio.shift());
     }
   };
@@ -113,9 +120,8 @@ export const createDeepgramSession = ({
     });
 
     connection.on("error", (error) => {
-      const message = error?.message || "Deepgram streaming error";
-      console.error("Deepgram error:", message);
-      onError?.(message);
+      console.error("Deepgram error:", error);
+      onError?.(error?.message || "Deepgram streaming error");
     });
 
     connection.on("close", () => {
@@ -135,7 +141,7 @@ export const createDeepgramSession = ({
   const sendAudio = (buffer) => {
     if (!buffer?.length) return;
 
-    if (!isOpen) {
+    if (!isOpen || !isConnectionOpen(connection)) {
       queuedAudio.push(buffer);
       if (queuedAudio.length > maxQueuedChunks) queuedAudio.shift();
       return;
