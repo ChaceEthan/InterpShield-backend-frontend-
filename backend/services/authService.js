@@ -131,15 +131,10 @@ const verifyGoogleCredential = async ({ credential }, env) => {
     throw httpError("Missing Google credential", 400);
   }
 
-  if (!env.googleClientId) {
-    throw httpError("Google login is not configured on the server.", 400);
-  }
-
   try {
-    googleClient ||= new OAuth2Client(env.googleClientId);
+    googleClient ||= new OAuth2Client();
     const ticket = await googleClient.verifyIdToken({
-      idToken: credential,
-      audience: env.googleClientId
+      idToken: credential
     });
     const payload = ticket.getPayload();
 

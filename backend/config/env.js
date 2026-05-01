@@ -56,14 +56,13 @@ const readClientOrigins = (clientUrl) => {
 };
 
 export const env = {
-  port: readNumber(process.env.PORT, 5000),
+  port: readNumber(process.env.PORT, 10000),
   nodeEnv: process.env.NODE_ENV || "development",
   clientOrigins: readClientOrigins(process.env.CLIENT_URL),
   dataDir: readProjectPath(process.env.DATA_DIR, path.join(projectRoot, ".data")),
   mongoUri: readSecret(process.env.MONGO_URI),
   deepgramApiKey: readSecret(process.env.DEEPGRAM_API_KEY),
   geminiApiKey: readSecret(process.env.GEMINI_API_KEY),
-  googleClientId: readSecret(process.env.GOOGLE_CLIENT_ID),
   hasJwtSecret: Boolean(readSecret(process.env.JWT_SECRET)),
   jwtSecret: readSecret(process.env.JWT_SECRET) || (isProductionProcess ? "" : "interp-shield-local-dev-secret-change-me"),
   jwtIssuer: process.env.JWT_ISSUER || "interp-shield",
@@ -82,7 +81,6 @@ export const getPublicConfig = () => ({
   backend: true,
   hasDeepgramKey: Boolean(env.deepgramApiKey),
   hasGeminiKey: Boolean(env.geminiApiKey),
-  hasGoogleClientId: Boolean(env.googleClientId),
   mode: getMode(),
   maxSessionSeconds: env.maxSessionSeconds,
   audioChunkMs: env.audioChunkMs
@@ -109,7 +107,4 @@ export const warnAboutMissingConfig = () => {
     }
   }
 
-  if (!env.googleClientId) {
-    console.warn("GOOGLE_CLIENT_ID is missing. Google Sign-In is disabled until it is configured.");
-  }
 };

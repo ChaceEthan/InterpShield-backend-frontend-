@@ -30,6 +30,14 @@ const io = new Server(server, {
 app.use(cors(corsOptions));
 app.use(express.json({ limit: "2mb" }));
 
+app.get("/", (_req, res) => {
+  res.json({
+    status: "ok",
+    service: "interp-shield-backend",
+    message: "InterpShield backend is running"
+  });
+});
+
 app.get("/api/config", (_req, res) => {
   res.json(getPublicConfig());
 });
