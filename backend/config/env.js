@@ -40,23 +40,25 @@ const readProjectPath = (value, fallback) => {
   return path.isAbsolute(value) ? value : path.join(projectRoot, value);
 };
 
-const defaultClientOrigins = ["http://localhost:5173", "https://your-vercel-app.vercel.app"];
+const localClientOrigin = "http://localhost:5173";
+const productionClientOrigin = "https://interp-shield-backend-frontend-fron.vercel.app";
 
-const readOrigins = (...values) => {
-  const origins = values
-    .filter(Boolean)
-    .flatMap((value) => value.split(","))
-    .map((origin) => origin.trim().replace(/\/$/, "").toLowerCase())
+const normalizeOrigin = (origin) => origin.trim().replace(/\/$/, "").toLowerCase();
+
+const readClientOrigins = (clientUrl) => {
+  const configuredOrigins = (clientUrl || "")
+    .split(",")
+    .map(normalizeOrigin)
     .filter(Boolean);
 
-  if (origins.length === 0 || origins.includes("*")) return defaultClientOrigins;
+  const origins = [localClientOrigin, ...(configuredOrigins.length > 0 ? configuredOrigins : [productionClientOrigin])];
   return [...new Set(origins)];
 };
 
 export const env = {
   port: readNumber(process.env.PORT, 5000),
   nodeEnv: process.env.NODE_ENV || "development",
-  clientOrigins: readOrigins(process.env.CLIENT_ORIGINS, process.env.CLIENT_ORIGIN, process.env.FRONTEND_URL),
+  clientOrigins: readClientOrigins(process.env.CLIENT_URL),
   dataDir: readProjectPath(process.env.DATA_DIR, path.join(projectRoot, ".data")),
   mongoUri: readSecret(process.env.MONGO_URI),
   deepgramApiKey: readSecret(process.env.DEEPGRAM_API_KEY),

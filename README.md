@@ -36,30 +36,32 @@ interp-shield/
       index.css
   android/
   capacitor.config.ts
-  .env
-  .env.example
 ```
 
 ## Environment
 
-Create a root `.env` file:
+Use layer-specific env files. Do not use a root `.env`.
+
+Backend local file: `backend/.env`
 
 ```bash
+MONGO_URI=mongodb+srv://username:password@cluster.mongodb.net/interpshield
+JWT_SECRET=replace_with_a_long_random_secret
 DEEPGRAM_API_KEY=
 GEMINI_API_KEY=
 GOOGLE_CLIENT_ID=
-JWT_SECRET=replace_with_a_long_random_secret
-JWT_ISSUER=interp-shield
-CLIENT_ORIGIN=*
 PORT=5000
-MAX_SESSION_SECONDS=120
-AUDIO_CHUNK_MS=700
-DATA_DIR=.data
-VITE_API_URL=http://localhost:5000
+CLIENT_URL=https://interp-shield-backend-frontend-fron.vercel.app
+```
+
+Frontend local file: `frontend/.env`
+
+```bash
+VITE_API_URL=https://your-render-backend.onrender.com
 VITE_GOOGLE_CLIENT_ID=
 ```
 
-`.env` and the default local `.data/` auth store are ignored by Git. Keep real API keys and secrets in `.env` only.
+`.env` files are ignored by Git. Keep real API keys and secrets in layer-specific `.env` files or hosting provider env settings only.
 
 ## Run Locally
 
@@ -150,14 +152,15 @@ For a physical Android device, set `VITE_API_URL` to a reachable HTTPS productio
 
 ## Production Deployment
 
-1. Set all root `.env` values in your hosting provider.
+1. Set backend env values in Render.
 2. Use a strong `JWT_SECRET`.
-3. Set `CLIENT_ORIGIN` to the deployed frontend origin.
-4. Set `VITE_API_URL` to the deployed backend URL.
-5. Configure Google OAuth and set both Google client ID variables.
-6. Run `npm run build`.
-7. Serve `frontend/dist` from your frontend host.
-8. Run `npm run start` for the backend.
+3. Set `CLIENT_URL` to `https://interp-shield-backend-frontend-fron.vercel.app`.
+4. Set frontend env values in Vercel.
+5. Set `VITE_API_URL` to the deployed backend URL.
+6. Configure Google OAuth and set both Google client ID variables.
+7. Run `npm run build`.
+8. Serve `frontend/dist` from your frontend host.
+9. Run `npm run start` for the backend.
 
 ## Verification
 
