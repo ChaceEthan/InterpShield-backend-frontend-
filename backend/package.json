@@ -5,7 +5,7 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "dev": "node --watch server.js",
+    "dev": "nodemon server.js",
     "build": "node --check server.js && node --check config/env.js && node --check routes/auth.js && node --check routes/user.js && node --check services/authService.js && node --check services/userService.js && node --check services/deepgram.js && node --check services/gemini.js && node --check services/interpreter.js && node --check sockets/interpreterSocket.js",
     "start": "node server.js",
     "lint": "node --check server.js && node --check config/env.js && node --check routes/auth.js && node --check routes/user.js && node --check services/authService.js && node --check services/userService.js && node --check services/deepgram.js && node --check services/gemini.js && node --check services/interpreter.js && node --check sockets/interpreterSocket.js",
@@ -19,5 +19,8 @@
     "express": "^5.1.0",
     "google-auth-library": "^10.6.2",
     "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
   }
 }

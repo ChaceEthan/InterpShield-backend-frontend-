@@ -7,6 +7,15 @@ const readBearerToken = (req) => {
   return header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
 };
 
+const ensureJsonBody = (req, res) => {
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+    res.status(400).json({ error: "Request body must be JSON." });
+    return false;
+  }
+
+  return true;
+};
+
 export const requireAuth = (env) => async (req, res, next) => {
   try {
     const token = readBearerToken(req);
@@ -27,10 +36,7 @@ export const createAuthRouter = (env) => {
 
   router.post("/signup", async (req, res, next) => {
     try {
-      if (!req.body || typeof req.body !== "object") {
-        res.status(400).json({ error: "Request body must be JSON." });
-        return;
-      }
+      if (!ensureJsonBody(req, res)) return;
 
       res.status(201).json(await registerUser(req.body, env));
     } catch (error) {
@@ -40,10 +46,7 @@ export const createAuthRouter = (env) => {
 
   router.post("/login", async (req, res, next) => {
     try {
-      if (!req.body || typeof req.body !== "object") {
-        res.status(400).json({ error: "Request body must be JSON." });
-        return;
-      }
+      if (!ensureJsonBody(req, res)) return;
 
       res.json(await loginUser(req.body, env));
     } catch (error) {
@@ -53,6 +56,8 @@ export const createAuthRouter = (env) => {
 
   router.post("/google", async (req, res, next) => {
     try {
+      if (!ensureJsonBody(req, res)) return;
+
       res.json(await loginWithGoogle(req.body, env));
     } catch (error) {
       next(error);

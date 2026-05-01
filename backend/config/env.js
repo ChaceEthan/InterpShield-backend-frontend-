@@ -38,9 +38,22 @@ const readProjectPath = (value, fallback) => {
   return path.isAbsolute(value) ? value : path.join(projectRoot, value);
 };
 
+const defaultClientOrigins = ["http://localhost:5173", "https://your-vercel-app.vercel.app"];
+
+const readOrigins = (...values) => {
+  const origins = values
+    .filter(Boolean)
+    .flatMap((value) => value.split(","))
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+  if (origins.length === 0 || origins.includes("*")) return defaultClientOrigins;
+  return [...new Set(origins)];
+};
+
 export const env = {
   port: readNumber(process.env.PORT, 5000),
-  clientOrigin: process.env.CLIENT_ORIGIN || "*",
+  clientOrigins: readOrigins(process.env.CLIENT_ORIGINS, process.env.CLIENT_ORIGIN),
   dataDir: readProjectPath(process.env.DATA_DIR, path.join(projectRoot, ".data")),
   deepgramApiKey: readSecret(process.env.DEEPGRAM_API_KEY),
   geminiApiKey: readSecret(process.env.GEMINI_API_KEY),
@@ -54,6 +67,11 @@ export const env = {
 export const getMode = () => (env.deepgramApiKey && env.geminiApiKey ? "production" : "demo");
 
 export const getPublicConfig = () => ({
+  status: "ok",
+  services: {
+    deepgram: true,
+    gemini: true
+  },
   backend: true,
   hasDeepgramKey: Boolean(env.deepgramApiKey),
   hasGeminiKey: Boolean(env.geminiApiKey),

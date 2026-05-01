@@ -75,6 +75,11 @@ interface AppUser {
 }
 
 interface AppConfig {
+  status: "ok";
+  services: {
+    deepgram: boolean;
+    gemini: boolean;
+  };
   backend: boolean;
   hasDeepgramKey: boolean;
   hasGeminiKey: boolean;
@@ -134,7 +139,8 @@ declare global {
   }
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
+const API = import.meta.env.VITE_API_URL;
+const API_BASE_URL = API?.replace(/\/$/, "");
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const AUDIO_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
@@ -246,14 +252,24 @@ const initialView = (): View => {
 };
 
 const requestApi = async <T,>(path: string, options: RequestInit = {}, token?: string | null): Promise<T> => {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(options.headers || {})
-    }
-  });
+  if (!API_BASE_URL) {
+    throw new Error("Backend API URL is missing. Set VITE_API_URL and restart the frontend.");
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      ...options,
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(options.headers || {})
+      }
+    });
+  } catch {
+    throw new Error("Unable to reach InterpShield backend. Make sure it is running and VITE_API_URL is correct.");
+  }
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || "Request failed.");

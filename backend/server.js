@@ -12,9 +12,13 @@ warnAboutMissingConfig();
 
 const app = express();
 const server = http.createServer(app);
+const corsOptions = {
+  origin: env.clientOrigins,
+  credentials: true
+};
 const io = new Server(server, {
   cors: {
-    origin: env.clientOrigin,
+    ...corsOptions,
     methods: ["GET", "POST", "PATCH"]
   },
   maxHttpBufferSize: 2e6,
@@ -22,7 +26,7 @@ const io = new Server(server, {
   pingTimeout: 20000
 });
 
-app.use(cors({ origin: env.clientOrigin }));
+app.use(cors(corsOptions));
 app.use(express.json({ limit: "2mb" }));
 
 app.get("/api/config", (_req, res) => {
@@ -49,5 +53,6 @@ app.use((error, _req, res, _next) => {
 registerInterpreterSocket(io, env, getPublicConfig);
 
 server.listen(env.port, () => {
-  console.log(`InterpShield backend running on http://localhost:${env.port}`);
+  console.log(`InterpShield backend listening on port ${env.port}`);
+  console.log(`Local backend URL: http://localhost:${env.port}`);
 });
