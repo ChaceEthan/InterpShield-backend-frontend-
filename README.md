@@ -49,14 +49,13 @@ MONGO_URI=mongodb+srv://username:password@cluster.mongodb.net/interpshield
 JWT_SECRET=replace_with_a_long_random_secret
 DEEPGRAM_API_KEY=
 GEMINI_API_KEY=
-PORT=5000
 CLIENT_URL=https://interpshield.vercel.app
 ```
 
 Frontend local file: `frontend/.env`
 
 ```bash
-VITE_API_URL=https://your-render-backend.onrender.com
+VITE_API_URL=https://interpshield-backend.onrender.com
 VITE_GOOGLE_CLIENT_ID=
 ```
 
@@ -69,7 +68,7 @@ npm install
 npm run dev
 ```
 
-Backend: `http://localhost:5000`
+Backend: `http://localhost:10000` by default, or the value of `PORT` when one is provided by the host.
 
 Frontend: `http://localhost:5173`
 
@@ -84,6 +83,12 @@ Frontend: `http://localhost:5173`
 Sessions use JWT bearer tokens. Dashboard, history, settings, and the interpreter socket require auth.
 
 Google Sign-In uses Google Identity Services when `VITE_GOOGLE_CLIENT_ID` is set. The frontend opens the Google account picker, sends the Google credential JWT to `POST /api/auth/google`, and the backend verifies it before creating or updating the local JWT session.
+
+Authorized JavaScript origins in Google Cloud Console:
+
+- `http://localhost:5173`
+- `https://interpshield.vercel.app`
+- `https://interp-shield-backend-frontend-fron.vercel.app`
 
 ## Real-Time Interpreter
 
@@ -158,7 +163,7 @@ For a physical Android device, set `VITE_API_URL` to a reachable HTTPS productio
 2. Use a strong `JWT_SECRET`.
 3. Set `CLIENT_URL` to `https://interpshield.vercel.app`.
 4. Set frontend env values in Vercel.
-5. Set `VITE_API_URL` to the deployed backend URL.
+5. Set `VITE_API_URL` to `https://interpshield-backend.onrender.com`.
 6. Configure Google OAuth and set `VITE_GOOGLE_CLIENT_ID` in the frontend environment.
 7. Run `npm run build`.
 8. Serve `frontend/dist` from your frontend host.
