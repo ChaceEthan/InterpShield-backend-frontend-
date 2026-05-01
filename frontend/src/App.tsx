@@ -226,18 +226,6 @@ const buildAudioConstraints = ({
   return audio;
 };
 
-const blobToBase64 = (blob: Blob): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      if (typeof reader.result === "string") resolve(reader.result);
-      else reject(new Error("Unable to read microphone audio."));
-    };
-    reader.onerror = () => reject(new Error("Unable to read microphone audio."));
-    reader.readAsDataURL(blob);
-  });
-};
-
 const formatTime = (seconds: number) => {
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
@@ -786,7 +774,7 @@ export default function App() {
   const stopSession = useCallback(() => {
     setStatus("stopping");
     cleanupMedia();
-    socketRef.current?.emit("session:stop");
+    socketRef.current?.emit("end_session");
     setStatus("idle");
   }, [cleanupMedia]);
 
@@ -808,6 +796,7 @@ export default function App() {
     socketRef.current = socket;
 
     socket.on("connect", () => {
+      console.log("Socket connected");
       setAlert((current) => (current === "Unable to reach InterpShield. Please try again." ? null : current));
     });
 
@@ -824,61 +813,67 @@ export default function App() {
 
     socket.on("server-config", (serverConfig: AppConfig) => setConfig(serverConfig));
 
-    socket.on("session:ready", () => {
+    const markSessionReady = () => {
       const recorder = mediaRecorderRef.current;
       if (recorder?.state === "inactive") {
         const chunkMs = Math.max(500, Math.min(800, config?.audioChunkMs || 700));
         recorder.start(chunkMs);
+        console.log("Mic started");
         sessionStartedAtRef.current = Date.now();
         setSessionSeconds(0);
       }
       setStatus("listening");
-    });
+    };
 
+    socket.on("session_ready", markSessionReady);
+    socket.on("session:ready", markSessionReady);
     socket.on("session:closed", () => setStatus((current) => (current === "stopping" ? "idle" : current)));
     socket.on("warning", ({ message }: { message?: string }) => {
       const warning = message || "";
       if (warning.includes("session limit") || warning.includes("silence")) setAlert(warning);
     });
-    socket.on("app-error", ({ message }: { message?: string }) => {
+    const handleSessionError = ({ message }: { message?: string }) => {
       setStatus("error");
       setAlert(message || "Real-time processing failed.");
+    };
+
+    socket.on("session_error", handleSessionError);
+    socket.on("app-error", handleSessionError);
+
+    socket.on("transcript_partial", ({ text, detectedLanguage }: { text?: string; detectedLanguage?: string }) => {
+      const originalText = text?.trim() || "";
+      if (!originalText || originalText === lastInterimRef.current) return;
+      if (detectedLanguage) setDetectedLanguage(detectedLanguage);
+
+      lastInterimRef.current = originalText;
+      if (interimTimerRef.current) window.clearTimeout(interimTimerRef.current);
+      interimTimerRef.current = window.setTimeout(() => {
+        setInterimOriginal(originalText);
+        interimTimerRef.current = null;
+      }, 45);
+      setStatus("listening");
     });
 
-    socket.on("result", (result: InterpretationResult) => {
-      if (result.detectedLanguage) setDetectedLanguage(result.detectedLanguage);
-      if (typeof result.latencyMs === "number") setLastLatency(result.latencyMs);
-
-      const originalText = result.originalText?.trim() || "";
-      const translatedText = result.translatedText?.trim() || "";
-
-      if (!result.isFinal) {
-        if (!originalText || originalText === lastInterimRef.current) return;
-
-        lastInterimRef.current = originalText;
-        if (interimTimerRef.current) window.clearTimeout(interimTimerRef.current);
-        interimTimerRef.current = window.setTimeout(() => {
-          setInterimOriginal(originalText);
-          interimTimerRef.current = null;
-        }, 45);
-        setStatus("listening");
-        return;
-      }
-
+    socket.on("transcript_final", ({ text, detectedLanguage, latencyMs }: { text?: string; detectedLanguage?: string; latencyMs?: number }) => {
+      const originalText = text?.trim() || "";
       if (!originalText || originalText === lastFinalOriginalRef.current) return;
+      if (detectedLanguage) setDetectedLanguage(detectedLanguage);
+      if (typeof latencyMs === "number") setLastLatency(latencyMs);
 
       lastInterimRef.current = "";
       lastFinalOriginalRef.current = originalText;
       setInterimOriginal("");
       setOriginalSegments((current) => [...current, originalText].slice(-40));
+      setStatus("listening");
+    });
 
-      if (modeRef.current !== "transcribe") {
-        const nextTranslation = translatedText || "[Translation unavailable]";
-        if (nextTranslation !== lastFinalTranslationRef.current) {
-          lastFinalTranslationRef.current = nextTranslation;
-          setTranslatedSegments((current) => [...current, nextTranslation].slice(-40));
-        }
-      }
+    socket.on("translation_update", ({ text, latencyMs }: { text?: string; latencyMs?: number }) => {
+      const nextTranslation = text?.trim() || "";
+      if (!nextTranslation || nextTranslation === lastFinalTranslationRef.current) return;
+      if (typeof latencyMs === "number") setLastLatency(latencyMs);
+
+      lastFinalTranslationRef.current = nextTranslation;
+      setTranslatedSegments((current) => [...current, nextTranslation].slice(-40));
     });
 
     return () => {
@@ -1060,17 +1055,10 @@ export default function App() {
       recorder.ondataavailable = (event) => {
         if (event.data.size < 128 || !socketRef.current?.connected) return;
 
-        void blobToBase64(event.data)
-          .then((audioPayload) => {
-            socketRef.current?.emit("audio-chunk", {
-              audio: audioPayload,
-              mimeType: event.data.type || mimeType,
-              sequence: sequenceRef.current
-            });
-            sequenceRef.current += 1;
-            setChunkCount((current) => current + 1);
-          })
-          .catch(() => setAlert("Unable to stream microphone audio."));
+        socketRef.current.emit("audio_chunk", event.data);
+        console.log("Audio chunk sent");
+        sequenceRef.current += 1;
+        setChunkCount((current) => current + 1);
       };
 
       recorder.onerror = () => {
@@ -1080,7 +1068,7 @@ export default function App() {
       };
 
       socketRef.current?.timeout(8000).emit(
-        "session:start",
+        "start_session",
         {
           sourceLang,
           targetLang,

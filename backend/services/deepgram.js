@@ -21,7 +21,6 @@ export const createDeepgramSession = ({
     const deepgram = new DeepgramClient({ apiKey });
     const options = {
       model: "nova-3",
-      Authorization: `Token ${apiKey}`,
       interim_results: "true",
       punctuate: "true",
       smart_format: "true",
@@ -40,6 +39,7 @@ export const createDeepgramSession = ({
 
     connection.on("open", () => {
       isOpen = true;
+      console.log("Deepgram stream started");
       keepAliveTimer = setInterval(() => {
         if (isOpen && connection?.sendKeepAlive) {
           connection.sendKeepAlive({ type: "KeepAlive" });
@@ -60,6 +60,7 @@ export const createDeepgramSession = ({
         return;
       }
 
+      console.log("Transcript received");
       onTranscript?.({
         text: transcript,
         isFinal: Boolean(message.is_final),
@@ -83,7 +84,14 @@ export const createDeepgramSession = ({
   };
 
   const sendAudio = (buffer) => {
-    if (isOpen && connection?.sendMedia && buffer?.length) {
+    if (!isOpen || !buffer?.length) return;
+
+    if (connection?.socket?.send) {
+      connection.socket.send(buffer);
+      return;
+    }
+
+    if (connection?.sendMedia) {
       connection.sendMedia(buffer);
     }
   };

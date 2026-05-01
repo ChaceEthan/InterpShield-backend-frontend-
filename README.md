@@ -50,7 +50,7 @@ JWT_SECRET=replace_with_a_long_random_secret
 DEEPGRAM_API_KEY=
 GEMINI_API_KEY=
 PORT=5000
-CLIENT_URL=https://interp-shield-backend-frontend-fron.vercel.app
+CLIENT_URL=https://interpshield.vercel.app
 ```
 
 Frontend local file: `frontend/.env`
@@ -89,26 +89,29 @@ Google Sign-In uses Google Identity Services when `VITE_GOOGLE_CLIENT_ID` is set
 
 Frontend emits:
 
-- `session:start`
-- `audio-chunk`
-- `session:stop`
+- `start_session`
+- `audio_chunk`
+- `end_session`
 
 Backend emits:
 
 - `server-config`
-- `session:ready`
-- `result`
+- `session_ready`
+- `transcript_partial`
+- `transcript_final`
+- `translation_update`
 - `warning`
-- `app-error`
+- `session_error`
 - `session:closed`
 
-Audio chunks are streamed every `500ms` to `1000ms`. Final result payload:
+Audio chunks are streamed every `500ms` to `1000ms` using Socket.io binary payloads. Final transcript payload:
 
 ```json
 {
-  "originalText": "Hello",
-  "translatedText": "Hola",
-  "isFinal": true
+  "text": "Hello",
+  "sourceLang": "en",
+  "targetLang": "es",
+  "latencyMs": 120
 }
 ```
 
@@ -153,7 +156,7 @@ For a physical Android device, set `VITE_API_URL` to a reachable HTTPS productio
 
 1. Set backend env values in Render.
 2. Use a strong `JWT_SECRET`.
-3. Set `CLIENT_URL` to `https://interp-shield-backend-frontend-fron.vercel.app`.
+3. Set `CLIENT_URL` to `https://interpshield.vercel.app`.
 4. Set frontend env values in Vercel.
 5. Set `VITE_API_URL` to the deployed backend URL.
 6. Configure Google OAuth and set `VITE_GOOGLE_CLIENT_ID` in the frontend environment.

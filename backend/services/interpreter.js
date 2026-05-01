@@ -82,6 +82,7 @@ export const createInterpreterSession = async ({
   twoWay,
   onReady,
   onWarning,
+  onError,
   onResult,
   onClosed
 }) => {
@@ -96,8 +97,9 @@ export const createInterpreterSession = async ({
     apiKey: env.deepgramApiKey,
     sourceLang,
     onOpen: onReady,
-    onError: () => {
-      onWarning?.("Deepgram failed. Demo fallback is enabled.");
+    onError: (message) => {
+      onError?.(message || "Deepgram streaming error.");
+      onWarning?.("Deepgram streaming failed.");
     },
     onClose: onClosed,
     onTranscript: async ({ text, isFinal, detectedLanguage }) => {

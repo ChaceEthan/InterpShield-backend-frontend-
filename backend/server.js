@@ -20,7 +20,7 @@ const corsOptions = {
 const io = new Server(server, {
   cors: {
     ...corsOptions,
-    methods: ["GET", "POST", "PATCH"]
+    methods: ["GET", "POST"]
   },
   maxHttpBufferSize: 2e6,
   pingInterval: 15000,

@@ -41,7 +41,7 @@ const readProjectPath = (value, fallback) => {
 };
 
 const localClientOrigin = "http://localhost:5173";
-const productionClientOrigin = "https://interp-shield-backend-frontend-fron.vercel.app";
+const productionClientOrigin = "https://interpshield.vercel.app";
 
 const normalizeOrigin = (origin) => origin.trim().replace(/\/$/, "").toLowerCase();
 
@@ -51,7 +51,7 @@ const readClientOrigins = (clientUrl) => {
     .map(normalizeOrigin)
     .filter(Boolean);
 
-  const origins = [localClientOrigin, ...(configuredOrigins.length > 0 ? configuredOrigins : [productionClientOrigin])];
+  const origins = [localClientOrigin, productionClientOrigin, ...configuredOrigins];
   return [...new Set(origins)];
 };
 
