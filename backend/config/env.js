@@ -27,7 +27,8 @@ const placeholderValues = new Set([
 
 const readSecret = (value) => {
   const trimmed = value?.trim() || "";
-  return placeholderValues.has(trimmed) ? "" : trimmed;
+  const unquoted = trimmed.match(/^(['"])(.*)\1$/)?.[2] || trimmed;
+  return placeholderValues.has(unquoted) ? "" : unquoted;
 };
 
 const readNumber = (value, fallback) => {

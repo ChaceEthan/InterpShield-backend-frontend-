@@ -15,18 +15,47 @@ export const createDeepgramSession = ({
 
   let connection = null;
   let isOpen = false;
+  let stopped = false;
   let keepAliveTimer = null;
+  const queuedAudio = [];
+  const maxQueuedChunks = 8;
+
+  const clearKeepAlive = () => {
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  };
+
+  const sendToDeepgram = (buffer) => {
+    if (connection?.sendMedia) {
+      connection.sendMedia(buffer);
+      return;
+    }
+
+    if (connection?.socket?.send) {
+      connection.socket.send(buffer);
+    }
+  };
+
+  const flushQueuedAudio = () => {
+    while (isOpen && queuedAudio.length > 0) {
+      sendToDeepgram(queuedAudio.shift());
+    }
+  };
 
   const start = async () => {
     const deepgram = new DeepgramClient({ apiKey });
+    stopped = false;
     const options = {
       model: "nova-3",
+      Authorization: `Token ${apiKey}`,
       interim_results: "true",
       punctuate: "true",
       smart_format: "true",
       endpointing: "300",
       utterance_end_ms: "1000",
-      vad_events: "true"
+      vad_events: "true",
+      reconnectAttempts: 3,
+      connectionTimeoutInSeconds: 10
     };
 
     if (sourceLang === "auto") {
@@ -45,6 +74,7 @@ export const createDeepgramSession = ({
           connection.sendKeepAlive({ type: "KeepAlive" });
         }
       }, 8000);
+      flushQueuedAudio();
       onOpen?.();
     });
 
@@ -74,8 +104,11 @@ export const createDeepgramSession = ({
 
     connection.on("close", () => {
       isOpen = false;
-      if (keepAliveTimer) clearInterval(keepAliveTimer);
-      keepAliveTimer = null;
+      clearKeepAlive();
+      if (!stopped) {
+        onError?.("Deepgram stream closed. Reconnecting...");
+        return;
+      }
       onClose?.();
     });
 
@@ -84,25 +117,37 @@ export const createDeepgramSession = ({
   };
 
   const sendAudio = (buffer) => {
-    if (!isOpen || !buffer?.length) return;
+    if (!buffer?.length) return;
 
-    if (connection?.socket?.send) {
-      connection.socket.send(buffer);
+    if (!isOpen) {
+      queuedAudio.push(buffer);
+      if (queuedAudio.length > maxQueuedChunks) queuedAudio.shift();
       return;
     }
 
-    if (connection?.sendMedia) {
-      connection.sendMedia(buffer);
+    try {
+      sendToDeepgram(buffer);
+    } catch (error) {
+      queuedAudio.push(buffer);
+      if (queuedAudio.length > maxQueuedChunks) queuedAudio.shift();
+      onError?.(error?.message || "Unable to send audio to Deepgram.");
     }
   };
 
   const stop = () => {
+    const wasOpen = isOpen;
+    stopped = true;
     isOpen = false;
-    if (keepAliveTimer) clearInterval(keepAliveTimer);
-    keepAliveTimer = null;
+    clearKeepAlive();
+    queuedAudio.length = 0;
 
     try {
-      connection?.sendCloseStream?.({ type: "CloseStream" });
+      if (wasOpen) connection?.sendCloseStream?.({ type: "CloseStream" });
+    } catch {
+      // Ignore close errors. The socket may already be closed by the provider.
+    }
+
+    try {
       connection?.close?.();
     } catch {
       // Ignore close errors. The socket may already be closed by the provider.

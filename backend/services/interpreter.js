@@ -98,6 +98,10 @@ export const createInterpreterSession = async ({
     sourceLang,
     onOpen: onReady,
     onError: (message) => {
+      if (/reconnecting/i.test(message || "")) {
+        onWarning?.(message);
+        return;
+      }
       onError?.(message || "Deepgram streaming error.");
       onWarning?.("Deepgram streaming failed.");
     },

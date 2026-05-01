@@ -634,6 +634,14 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const recordingRef = useRef(false);
   const modeRef = useRef<Mode>("translate");
+  const activeSessionPayloadRef = useRef<{
+    sourceLang: string;
+    targetLang: string;
+    translate: boolean;
+    twoWay: boolean;
+    mimeType: string;
+  } | null>(null);
+  const shouldRestartSessionOnReconnectRef = useRef(false);
   const sequenceRef = useRef(0);
   const sessionStartedAtRef = useRef<number | null>(null);
   const lastInterimRef = useRef("");
@@ -768,6 +776,8 @@ export default function App() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     recordingRef.current = false;
+    activeSessionPayloadRef.current = null;
+    shouldRestartSessionOnReconnectRef.current = false;
     sessionStartedAtRef.current = null;
   }, []);
 
@@ -798,10 +808,16 @@ export default function App() {
     socket.on("connect", () => {
       console.log("Socket connected");
       setAlert((current) => (current === "Unable to reach InterpShield. Please try again." ? null : current));
+
+      if (shouldRestartSessionOnReconnectRef.current && activeSessionPayloadRef.current) {
+        shouldRestartSessionOnReconnectRef.current = false;
+        socket.emit("start_session", activeSessionPayloadRef.current);
+      }
     });
 
     socket.on("disconnect", () => {
       if (recordingRef.current) {
+        shouldRestartSessionOnReconnectRef.current = true;
         setStatus("error");
         setAlert("Connection lost. Your session was paused.");
       }
@@ -1067,15 +1083,19 @@ export default function App() {
         cleanupMedia();
       };
 
+      const sessionPayload = {
+        sourceLang,
+        targetLang,
+        translate: modeRef.current !== "transcribe",
+        twoWay,
+        mimeType: recorder.mimeType || mimeType
+      };
+      activeSessionPayloadRef.current = sessionPayload;
+      shouldRestartSessionOnReconnectRef.current = false;
+
       socketRef.current?.timeout(8000).emit(
         "start_session",
-        {
-          sourceLang,
-          targetLang,
-          translate: modeRef.current !== "transcribe",
-          twoWay,
-          mimeType: recorder.mimeType || mimeType
-        },
+        sessionPayload,
         (timeoutError: Error | null, response?: { ok?: boolean; error?: string }) => {
           if (timeoutError || response?.error) {
             cleanupMedia();

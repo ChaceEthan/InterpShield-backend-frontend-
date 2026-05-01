@@ -31,13 +31,25 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     }
 
     const stopSession = () => {
-      session?.stop?.();
+      const activeSession = socket.data.interpreterSession || session;
+      activeSession?.stop?.();
       session = null;
+      socket.data.interpreterSession = null;
+      socket.data.deepgramStream = null;
 
       if (sessionTimer) {
         clearTimeout(sessionTimer);
         sessionTimer = null;
       }
+    };
+
+    const startErrorMessage = (error) => {
+      const message = error?.message || "";
+      if (/forbidden|unauthorized|401|403/i.test(message)) {
+        return "Deepgram rejected the live stream. Check DEEPGRAM_API_KEY on Render.";
+      }
+
+      return "Unable to start interpreter session.";
     };
 
     socket.emit("server-config", getPublicConfig());
@@ -99,6 +111,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           onClosed: () => socket.emit("session:closed"),
           onResult: emitInterpreterResult
         });
+        socket.data.interpreterSession = session;
+        socket.data.deepgramStream = session;
 
         sessionTimer = setTimeout(() => {
           stopSession();
@@ -109,9 +123,10 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         ack?.({ ok: true, mode: env.deepgramApiKey && env.geminiApiKey ? "production" : "demo" });
       } catch (error) {
         console.error("Interpreter session start failed:", error?.message || error);
-        ack?.({ ok: false, error: "Unable to start interpreter session." });
-        socket.emit("session_error", { message: "Unable to start interpreter session." });
-        socket.emit("app-error", { message: "Unable to start interpreter session." });
+        const message = startErrorMessage(error);
+        ack?.({ ok: false, error: message });
+        socket.emit("session_error", { message });
+        socket.emit("app-error", { message });
       }
     };
 
