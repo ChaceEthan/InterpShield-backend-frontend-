@@ -111,6 +111,7 @@ export const createInterpreterSession = async ({
   env,
   sourceLang,
   targetLang,
+  mimeType,
   shouldTranslate,
   twoWay,
   onReady,
@@ -215,6 +216,11 @@ export const createInterpreterSession = async ({
       sourceLang: firstItem.sourceLang,
       targetLang: firstItem.targetLang
     });
+    console.log("AI pipeline translation request sent", {
+      chars: translationInput.length,
+      sourceLang: firstItem.sourceLang,
+      targetLang: firstItem.targetLang
+    });
 
     try {
       const result = await translateText({
@@ -233,6 +239,14 @@ export const createInterpreterSession = async ({
         lastSuccessfulTranslation = resolvedTranslation.translatedText;
       }
 
+      const latencyMs = Date.now() - startedAt;
+      console.log("AI pipeline translation response received", {
+        chars: resolvedTranslation.translatedText.length,
+        provider: resolvedTranslation.provider,
+        stale: resolvedTranslation.stale,
+        latencyMs
+      });
+
       onTranslation?.({
         originalText,
         translatedText: resolvedTranslation.translatedText,
@@ -240,7 +254,7 @@ export const createInterpreterSession = async ({
         sourceLang: firstItem.sourceLang,
         targetLang: firstItem.targetLang,
         detectedLanguage: firstItem.detectedLanguage,
-        latencyMs: Date.now() - startedAt,
+        latencyMs,
         provider: resolvedTranslation.provider,
         stale: resolvedTranslation.stale
       });
@@ -256,6 +270,12 @@ export const createInterpreterSession = async ({
       if (stopped) {
         return;
       }
+
+      console.warn("AI pipeline translation fallback used", {
+        provider: lastSuccessfulTranslation ? "cache" : "source",
+        sourceLang: firstItem.sourceLang,
+        targetLang: firstItem.targetLang
+      });
 
       onTranslation?.({
         originalText,
@@ -309,6 +329,7 @@ export const createInterpreterSession = async ({
 
   const session = createDeepgramSession({
     sourceLang,
+    mimeType,
     onOpen: onReady,
     onError: (message) => {
       if (/reconnecting/i.test(message || "")) {
@@ -352,6 +373,12 @@ export const createInterpreterSession = async ({
       lastInterimTranscript = "";
 
       const startedAt = Date.now();
+      console.log("AI pipeline final transcript received", {
+        chars: displayText.length,
+        sourceLang: direction.source,
+        targetLang: direction.target,
+        shouldTranslate
+      });
       if (shouldTranslate) enqueueTranslation({ text: displayText, direction, detectedLanguage });
 
       onResult?.({

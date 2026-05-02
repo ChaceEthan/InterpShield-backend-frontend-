@@ -13,25 +13,34 @@ warnAboutMissingConfig();
 
 const app = express();
 const server = http.createServer(app);
+const defaultClientOrigins = [
+  "http://localhost:5173",
+  "https://interpshield.vercel.app"
+];
 const configuredClientOrigins = (process.env.CLIENT_URL || "")
   .split(",")
   .map((origin) => origin.trim().replace(/\/$/, ""))
   .filter(Boolean);
-const corsOrigins = [...new Set([...configuredClientOrigins, "http://localhost:5173", ...env.clientOrigins])];
+const corsOrigins = [...new Set([...defaultClientOrigins, ...env.clientOrigins, ...configuredClientOrigins])];
 const corsOptions = {
   origin: corsOrigins,
-  credentials: true
+  credentials: true,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
 };
 const io = new Server(server, {
   cors: {
     origin: corsOrigins,
     methods: ["GET", "POST"],
-    credentials: true
+    credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"]
   },
   transports: ["websocket", "polling"],
+  allowUpgrades: true,
   maxHttpBufferSize: 2e6,
   pingInterval: 15000,
-  pingTimeout: 20000
+  pingTimeout: 20000,
+  connectTimeout: 20000
 });
 
 app.use(cors(corsOptions));

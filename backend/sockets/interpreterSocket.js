@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { verifyToken } from "../services/authService.js";
 import { createInterpreterSession } from "../services/interpreter.js";
+import { saveHistoryItem } from "../services/userService.js";
 
 const audioPayloadToBuffer = (audio) => {
   if (Buffer.isBuffer(audio)) return audio;
@@ -19,10 +20,14 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     let session = null;
     let sessionTimer = null;
     let lastSequence = -1;
+    let activeShouldTranslate = false;
+    let sessionStartedAt = null;
+    let userId = "";
 
     try {
       const token = socket.handshake.auth?.token;
-      verifyToken(token, env);
+      const payload = verifyToken(token, env);
+      userId = payload?.userId || "";
     } catch {
       socket.emit("session_error", { message: "Authentication required." });
       socket.emit("app-error", { message: "Authentication required." });
@@ -36,6 +41,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       session = null;
       socket.data.interpreterSession = null;
       socket.data.deepgramStream = null;
+      activeShouldTranslate = false;
+      sessionStartedAt = null;
 
       if (sessionTimer) {
         clearTimeout(sessionTimer);
@@ -53,6 +60,36 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     };
 
     socket.emit("server-config", getPublicConfig());
+
+    const saveFinalHistory = (payload = {}) => {
+      const originalText = payload.originalText?.trim() || "";
+      const translatedText = payload.translatedText?.trim() || originalText;
+
+      if (!userId || !originalText) return;
+
+      const durationSeconds = sessionStartedAt ? Math.max(0, Math.floor((Date.now() - sessionStartedAt) / 1000)) : 0;
+
+      void saveHistoryItem(userId, {
+        title: "Live interpreter session",
+        sourceLang: payload.sourceLang,
+        targetLang: payload.targetLang,
+        originalText,
+        translatedText,
+        durationSeconds
+      }, env)
+        .then(() => {
+          console.log("AI pipeline history saved", {
+            socketId: socket.id,
+            sourceLang: payload.sourceLang,
+            targetLang: payload.targetLang,
+            originalChars: originalText.length,
+            translatedChars: translatedText.length
+          });
+        })
+        .catch((error) => {
+          console.warn("AI pipeline history save skipped:", error?.message || error);
+        });
+    };
 
     const emitInterpreterResult = (result) => {
       if (!result?.isFinal) {
@@ -79,11 +116,22 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           text: result.translatedText,
           sourceLang: result.sourceLang,
           targetLang: result.targetLang,
-          latencyMs: result.latencyMs
+          latencyMs: result.latencyMs,
+          provider: result.provider,
+          stale: Boolean(result.stale)
         });
       }
 
       socket.emit("result", result);
+
+      if (!activeShouldTranslate) {
+        saveFinalHistory({
+          originalText: result.originalText,
+          translatedText: result.translatedText || result.originalText,
+          sourceLang: result.sourceLang,
+          targetLang: result.targetLang
+        });
+      }
     };
 
     const emitTranslationUpdate = (translation) => {
@@ -106,6 +154,12 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         translatedText: text,
         translationOnly: true
       });
+      saveFinalHistory({
+        originalText: translation.originalText,
+        translatedText: text,
+        sourceLang: translation.sourceLang,
+        targetLang: translation.targetLang
+      });
     };
 
     const handleStartSession = async (payload = {}, ack) => {
@@ -115,14 +169,18 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       const targetLang = payload.targetLang || "es";
       const shouldTranslate = payload.translate !== false;
       const twoWay = Boolean(payload.twoWay);
+      const mimeType = payload.mimeType || "audio/webm";
+      activeShouldTranslate = shouldTranslate;
+      sessionStartedAt = Date.now();
       lastSequence = -1;
-      console.log("Interpreter session starts", { socketId: socket.id, sourceLang, targetLang, shouldTranslate, twoWay });
+      console.log("Interpreter session starts", { socketId: socket.id, sourceLang, targetLang, shouldTranslate, twoWay, mimeType });
 
       try {
         session = await createInterpreterSession({
           env,
           sourceLang,
           targetLang,
+          mimeType,
           shouldTranslate,
           twoWay,
           onReady: () => {

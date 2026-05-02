@@ -18,6 +18,7 @@ const isConnectionOpen = (connection) => {
 
 export const createDeepgramSession = ({
   sourceLang,
+  mimeType,
   onOpen,
   onTranscript,
   onError,
@@ -58,7 +59,15 @@ export const createDeepgramSession = ({
 
   const flushQueuedAudio = () => {
     while (isOpen && isConnectionOpen(connection) && queuedAudio.length > 0) {
-      sendToDeepgram(queuedAudio.shift());
+      const nextChunk = queuedAudio.shift();
+
+      try {
+        sendToDeepgram(nextChunk);
+      } catch (error) {
+        queuedAudio.unshift(nextChunk);
+        onError?.(error?.message || "Unable to send queued audio to Deepgram.");
+        break;
+      }
     }
   };
 
@@ -71,11 +80,11 @@ export const createDeepgramSession = ({
       interim_results: "true",
       punctuate: "true",
       smart_format: "true",
-      endpointing: "300",
-      utterance_end_ms: "1000",
+      endpointing: process.env.DEEPGRAM_ENDPOINTING_MS || "180",
+      utterance_end_ms: process.env.DEEPGRAM_UTTERANCE_END_MS || "700",
       vad_events: "true",
-      reconnectAttempts: 3,
-      connectionTimeoutInSeconds: 10
+      reconnectAttempts: 5,
+      connectionTimeoutInSeconds: 20
     };
 
     if (sourceLang === "auto") {
@@ -90,9 +99,14 @@ export const createDeepgramSession = ({
       isOpen = true;
       console.log("Deepgram connected");
       console.log("Deepgram stream started");
+      clearKeepAlive();
       keepAliveTimer = setInterval(() => {
-        if (isOpen && connection?.sendKeepAlive) {
-          connection.sendKeepAlive({ type: "KeepAlive" });
+        if (isOpen && isConnectionOpen(connection) && connection?.sendKeepAlive) {
+          try {
+            connection.sendKeepAlive({ type: "KeepAlive" });
+          } catch (error) {
+            onError?.(error?.message || "Unable to keep Deepgram stream alive.");
+          }
         }
       }, 8000);
       flushQueuedAudio();

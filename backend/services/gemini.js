@@ -146,9 +146,16 @@ const isRetryableError = (error) => {
   return retryableStatuses.has(Number(error?.status));
 };
 
-const createGeminiRequest = (cleanText, sourceLang, targetLang) => {
+const createGeminiRequest = (cleanText, sourceLang, targetLang, { strictRetry = false } = {}) => {
   const targetLanguageName = getLanguageName(targetLang);
   const sourceLanguageName = sourceLang === "auto" ? "auto-detected source language" : getLanguageName(sourceLang);
+  const retryInstructions = strictRetry
+    ? [
+        "This is a retry because the previous response did not produce a valid translation.",
+        `You MUST output a different sentence in ${targetLanguageName}.`,
+        "If the source contains names, keep only the names unchanged; translate all translatable words."
+      ]
+    : [];
 
   return {
     contents: [
@@ -167,6 +174,7 @@ const createGeminiRequest = (cleanText, sourceLang, targetLang) => {
               "No explanations.",
               "Do not add commentary, labels, markdown, quotes, or pronunciation notes.",
               `The final answer must be written in ${targetLanguageName}, not in the source language.`,
+              ...retryInstructions,
               "",
               "Original text:",
               cleanText
@@ -261,7 +269,6 @@ export const translateWithGemini = async ({ text, sourceLang, targetLang, timeou
 
   try {
     const geminiModels = getGeminiModels();
-    const requestBody = createGeminiRequest(cleanText, sourceLang, targetLang);
     const deadline = Date.now() + geminiTimeoutMs;
     let lastError = null;
 
@@ -279,6 +286,7 @@ export const translateWithGemini = async ({ text, sourceLang, targetLang, timeou
       }
 
       try {
+        const requestBody = createGeminiRequest(cleanText, sourceLang, targetLang, { strictRetry: attempt > 1 });
         const translatedText = await fetchGeminiResponse({
           geminiEndpoint,
           apiKey,

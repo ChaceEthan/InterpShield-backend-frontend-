@@ -74,7 +74,7 @@ export const env = {
   jwtSecret: readSecret(process.env.JWT_SECRET) || (isProductionProcess ? "" : "interp-shield-local-dev-secret-change-me"),
   jwtIssuer: process.env.JWT_ISSUER || "interp-shield",
   maxSessionSeconds: readNumber(process.env.MAX_SESSION_SECONDS, 120),
-  audioChunkMs: readNumber(process.env.AUDIO_CHUNK_MS, 700)
+  audioChunkMs: readNumber(process.env.AUDIO_CHUNK_MS, 350)
 };
 
 export const getMode = () => (env.deepgramApiKey && (env.geminiApiKey || env.googleTranslateApiKey) ? "production" : "demo");
