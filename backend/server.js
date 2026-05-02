@@ -15,30 +15,36 @@ const app = express();
 const server = http.createServer(app);
 
 const normalizeOrigin = (origin = "") => origin.trim().replace(/\/$/, "").toLowerCase();
-const configuredClientOrigins = (process.env.CLIENT_URL || "")
-  .split(",")
-  .map(normalizeOrigin)
-  .filter(Boolean);
-const corsOrigins = configuredClientOrigins.length > 0 ? [...new Set(configuredClientOrigins)] : ["http://localhost:5173"];
+const corsOrigins = env.clientOrigins;
+const corsMethods = ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"];
+const corsAllowedHeaders = ["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"];
 const isAllowedOrigin = (origin) => {
   if (!origin) return true;
   return corsOrigins.includes(normalizeOrigin(origin));
+};
+const applyCorsHeaders = (req, res) => {
+  const origin = req.get("origin");
+
+  if (isAllowedOrigin(origin) && origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.vary("Origin");
+  }
+
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Methods", corsMethods.join(", "));
+  res.setHeader("Access-Control-Allow-Headers", corsAllowedHeaders.join(", "));
 };
 const corsOptions = {
   origin(origin, callback) {
     callback(null, isAllowedOrigin(origin));
   },
   credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  methods: corsMethods,
+  allowedHeaders: corsAllowedHeaders,
+  optionsSuccessStatus: 204
 };
 const io = new Server(server, {
-  cors: {
-    origin: corsOrigins,
-    methods: ["GET", "POST", "PUT", "DELETE"],
-    credentials: true,
-    allowedHeaders: ["Content-Type", "Authorization"]
-  },
+  cors: corsOptions,
   transports: ["websocket", "polling"],
   allowUpgrades: true,
   maxHttpBufferSize: 2e6,
@@ -47,8 +53,17 @@ const io = new Server(server, {
   connectTimeout: 20000
 });
 
+app.use((req, res, next) => {
+  applyCorsHeaders(req, res);
+
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
+
+  next();
+});
 app.use(cors(corsOptions));
-app.options(/.*/, cors(corsOptions));
 app.use((_req, res, next) => {
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
   res.removeHeader("Cross-Origin-Embedder-Policy");
@@ -64,8 +79,12 @@ app.get("/", (_req, res) => {
   });
 });
 
-app.get("/api/config", (_req, res) => {
-  res.json(getPublicConfig());
+app.get("/api/config", (_req, res, next) => {
+  try {
+    res.status(200).json(getPublicConfig());
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get("/api/health", (_req, res) => {

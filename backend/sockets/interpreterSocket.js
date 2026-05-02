@@ -211,7 +211,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           socket.emit("session:closed");
         }, env.maxSessionSeconds * 1000);
 
-        ack?.({ success: true, ok: true, mode: env.deepgramApiKey && (env.geminiApiKey || env.googleTranslateApiKey) ? "production" : "demo" });
+        ack?.({ success: true, ok: true, mode: env.deepgramApiKey && env.geminiApiKey ? "production" : "demo" });
       } catch (error) {
         console.error("Interpreter session start failed:", error?.message || error);
         sessionStarting = false;

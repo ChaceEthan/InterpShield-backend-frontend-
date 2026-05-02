@@ -87,7 +87,6 @@ interface AppConfig {
   hasDeepgramKey: boolean;
   hasGeminiKey: boolean;
   hasGoogleTranslateKey: boolean;
-  hasGoogleClientId: boolean;
   mode: "production" | "demo";
   maxSessionSeconds: number;
   audioChunkMs: number;
@@ -141,6 +140,7 @@ declare global {
             callback: (response: GoogleCredentialResponse) => void;
             auto_select?: boolean;
             cancel_on_tap_outside?: boolean;
+            error_callback?: (error: { type?: string; message?: string }) => void;
           }) => void;
           renderButton: (parent: HTMLElement, options: Record<string, string | boolean | number>) => void;
           prompt: (momentListener?: (notification: {
@@ -155,13 +155,14 @@ declare global {
   }
 }
 
-const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
-const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+const API = (import.meta.env.VITE_API_URL || "").trim().replace(/\/$/, "");
+const GOOGLE_CLIENT_ID = (import.meta.env.VITE_GOOGLE_CLIENT_ID || "").trim();
 const AUDIO_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
 const TRANSLATION_PENDING_TIMEOUT_MS = 7000;
 const SESSION_START_TIMEOUT_MS = 20000;
 const SOCKET_CONNECT_TIMEOUT_MS = 10000;
 const MAX_PENDING_AUDIO_CHUNKS = 16;
+const BACKEND_UNREACHABLE_MESSAGE = "Unable to reach InterpShield backend. Check that VITE_API_URL points to the Render backend and that this frontend origin is allowed by backend CORS.";
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
 
@@ -252,10 +253,41 @@ const formatTime = (seconds: number) => {
 };
 
 const languageName = (code: string) => LANGUAGES.find((language) => language.code === code)?.name || code;
+const translationProviderName = (provider: string) => {
+  if (provider === "gemini") return "Gemini";
+  if (provider === "google" || provider === "googleTranslate") return "Google Translate";
+  if (provider === "mymemory") return "MyMemory";
+  if (provider === "demo") return "Demo";
+  return provider;
+};
 
 const initialView = (): View => {
   const hashView = window.location.hash.replace("#", "") as View;
   return VIEWS.includes(hashView) ? hashView : "landing";
+};
+
+const apiFailureMessage = (path: string, status: number, statusText: string, serverMessage?: string) => {
+  if (serverMessage) return serverMessage;
+  const label = statusText ? `${status} ${statusText}` : String(status);
+  return `Backend request failed (${label}) while calling ${path}.`;
+};
+
+const socketConnectionMessage = (error?: Error) => {
+  const detail = error?.message ? ` (${error.message})` : "";
+  return `Unable to reach the live interpreter${detail}. Check that VITE_API_URL points to the Render backend and Socket.IO CORS allows this origin.`;
+};
+
+const googleAuthSetupMessage = (error?: unknown) => {
+  const detail =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : error && typeof error === "object" && "message" in error
+          ? String((error as { message?: unknown }).message || "")
+          : "";
+  const prefix = detail ? `Google Sign-In failed: ${detail}.` : "Google Sign-In could not start.";
+  return `${prefix} Add ${window.location.origin} to the Google OAuth Authorized JavaScript origins for the VITE_GOOGLE_CLIENT_ID client.`;
 };
 
 const requestApi = async <T,>(path: string, options: RequestInit = {}, token?: string | null): Promise<T> => {
@@ -263,23 +295,38 @@ const requestApi = async <T,>(path: string, options: RequestInit = {}, token?: s
     throw new Error("Backend API URL is missing. Set VITE_API_URL and restart the frontend.");
   }
 
+  const headers = new Headers(options.headers);
+  if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
   let response: Response;
   try {
     response = await fetch(`${API}${path}`, {
       ...options,
       credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...(options.headers || {})
-      }
+      headers
     });
-  } catch {
-    throw new Error("Unable to reach InterpShield backend. Make sure it is running and VITE_API_URL is correct.");
+  } catch (error) {
+    const detail = error instanceof Error && error.message ? ` (${error.message})` : "";
+    throw new Error(`${BACKEND_UNREACHABLE_MESSAGE}${detail}`);
   }
 
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || "Request failed.");
+  const text = await response.text().catch(() => "");
+  const data = text
+    ? (() => {
+        try {
+          return JSON.parse(text);
+        } catch {
+          return { error: text };
+        }
+      })()
+    : {};
+
+  if (!response.ok) {
+    const serverMessage = typeof data?.error === "string" ? data.error : typeof data?.message === "string" ? data.message : "";
+    throw new Error(apiFailureMessage(path, response.status, response.statusText, serverMessage));
+  }
+
   return data as T;
 };
 
@@ -656,38 +703,44 @@ const GoogleSignIn = ({
   useEffect(() => {
     if (!loaded || !GOOGLE_CLIENT_ID || !window.google) return;
 
-    window.google.accounts.id.initialize({
-      client_id: GOOGLE_CLIENT_ID,
-      auto_select: false,
-      cancel_on_tap_outside: true,
-      callback: (response) => {
-        if (!response.credential) {
-          onError("Google did not return a valid credential.");
-          return;
+    try {
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        auto_select: false,
+        cancel_on_tap_outside: true,
+        error_callback: (error) => onError(googleAuthSetupMessage(error)),
+        callback: (response) => {
+          if (!response.credential) {
+            onError("Google did not return a valid credential.");
+            return;
+          }
+
+          onCredential(response.credential);
         }
-
-        onCredential(response.credential);
-      }
-    });
-
-    if (buttonRef.current && !renderedRef.current) {
-      renderedRef.current = true;
-      const width = Math.max(240, Math.min(360, buttonRef.current.clientWidth || 360));
-
-      window.google.accounts.id.renderButton(buttonRef.current, {
-        theme: "outline",
-        size: "large",
-        text: "continue_with",
-        shape: "rectangular",
-        logo_alignment: "left",
-        width
       });
+
+      if (buttonRef.current && !renderedRef.current) {
+        renderedRef.current = true;
+        const width = Math.max(240, Math.min(360, buttonRef.current.clientWidth || 360));
+
+        window.google.accounts.id.renderButton(buttonRef.current, {
+          theme: "outline",
+          size: "large",
+          text: "continue_with",
+          shape: "rectangular",
+          logo_alignment: "left",
+          width
+        });
+      }
+    } catch (error) {
+      renderedRef.current = false;
+      onError(googleAuthSetupMessage(error));
     }
   }, [loaded, onCredential, onError]);
 
   if (!GOOGLE_CLIENT_ID) {
     return (
-      <button type="button" onClick={() => onError("Google Sign-In is not configured for this deployment.")} className="flex w-full items-center justify-center gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm font-black text-slate-800 shadow-lg shadow-slate-950/20 transition hover:-translate-y-0.5 hover:bg-slate-50">
+      <button type="button" onClick={() => onError("Google Sign-In is not configured. Set VITE_GOOGLE_CLIENT_ID in the frontend/Vercel environment.")} className="flex w-full items-center justify-center gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm font-black text-slate-800 shadow-lg shadow-slate-950/20 transition hover:-translate-y-0.5 hover:bg-slate-50">
         <GoogleIcon />
         Continue with Google
       </button>
@@ -945,7 +998,7 @@ export default function App() {
       };
 
       const handleConnect = () => finish();
-      const handleConnectError = () => finish(new Error("Unable to reach the live interpreter."));
+      const handleConnectError = (error?: Error) => finish(new Error(socketConnectionMessage(error)));
       timeoutId = window.setTimeout(() => finish(new Error("Live interpreter connection timed out.")), SOCKET_CONNECT_TIMEOUT_MS);
 
       socket.on("connect", handleConnect);
@@ -972,7 +1025,7 @@ export default function App() {
           ? "Translation providers are recovering. Showing original speech for continuity."
           : "Network is slow. Showing the last successful translation."
         : translationStatus === "live"
-          ? `Stable translation${translationProvider ? ` via ${translationProvider === "google" ? "Google Translate" : translationProvider === "gemini" ? "Gemini" : "fallback cache"}` : ""}.`
+          ? `Stable translation${translationProvider ? ` via ${translationProviderName(translationProvider)}` : ""}.`
           : "";
 
   const navigate = useCallback(
@@ -990,8 +1043,8 @@ export default function App() {
     try {
       const data = await requestApi<AppConfig>("/api/config");
       setConfig(data);
-    } catch {
-      setAlert("Unable to reach InterpShield. Please try again.");
+    } catch (error) {
+      setAlert(error instanceof Error ? error.message : BACKEND_UNREACHABLE_MESSAGE);
     }
   }, []);
 
@@ -1061,8 +1114,8 @@ export default function App() {
       }, token);
       setUser(data.user);
       localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
-    } catch {
-      setAlert("Unable to save settings.");
+    } catch (error) {
+      setAlert(error instanceof Error ? error.message : "Unable to save settings.");
     }
   };
 
@@ -1138,7 +1191,7 @@ export default function App() {
 
     socket.on("connect", () => {
       console.log("Socket connected");
-      setAlert((current) => (current === "Unable to reach InterpShield. Please try again." ? null : current));
+      setAlert((current) => (current?.startsWith("Unable to reach InterpShield backend") || current?.startsWith("Unable to reach the live interpreter") ? null : current));
 
       if (shouldRestartSessionOnReconnectRef.current && activeSessionPayloadRef.current) {
         const sessionPayload = activeSessionPayloadRef.current;
@@ -1166,11 +1219,11 @@ export default function App() {
       }
     });
 
-    socket.on("connect_error", () => {
+    socket.on("connect_error", (error) => {
       sessionReadyRef.current = false;
       if (recordingRef.current) {
         setStatus("connecting");
-        setAlert("Unable to reach the live interpreter. Reconnecting...");
+        setAlert(`${socketConnectionMessage(error)} Reconnecting...`);
       }
     });
 
@@ -1178,7 +1231,7 @@ export default function App() {
       if (!recordingRef.current) return;
       cleanupMedia();
       setStatus("error");
-      setAlert("Unable to reconnect to the live interpreter.");
+      setAlert("Unable to reconnect to the live interpreter. Check VITE_API_URL and backend Socket.IO CORS.");
     });
 
     socket.on("server-config", (serverConfig: AppConfig) => setConfig(serverConfig));
@@ -1384,8 +1437,8 @@ export default function App() {
     try {
       const data = await requestApi<{ history: HistoryItem[] }>("/api/user/history", {}, token);
       setHistory(data.history);
-    } catch {
-      setAlert("Unable to load history.");
+    } catch (error) {
+      setAlert(error instanceof Error ? error.message : "Unable to load history.");
     }
   }, [token]);
 

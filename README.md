@@ -49,7 +49,7 @@ MONGO_URI=mongodb+srv://username:password@cluster.mongodb.net/interpshield
 JWT_SECRET=replace_with_a_long_random_secret
 DEEPGRAM_API_KEY=
 GEMINI_API_KEY=
-CLIENT_URL=https://interpshield.vercel.app
+CLIENT_URL=http://localhost:5173,https://interpshield.vercel.app,https://interp-shield-backend-frontend-frontend-8akv4lq3k.vercel.app
 ```
 
 Frontend local file: `frontend/.env`
@@ -88,7 +88,7 @@ Authorized JavaScript origins in Google Cloud Console:
 
 - `http://localhost:5173`
 - `https://interpshield.vercel.app`
-- `https://interp-shield-backend-frontend-fron.vercel.app`
+- `https://interp-shield-backend-frontend-frontend-8akv4lq3k.vercel.app`
 
 ## Real-Time Interpreter
 
@@ -161,7 +161,7 @@ For a physical Android device, set `VITE_API_URL` to a reachable HTTPS productio
 
 1. Set backend env values in Render.
 2. Use a strong `JWT_SECRET`.
-3. Set `CLIENT_URL` to `https://interpshield.vercel.app`.
+3. Set `CLIENT_URL` to `http://localhost:5173,https://interpshield.vercel.app,https://interp-shield-backend-frontend-frontend-8akv4lq3k.vercel.app`.
 4. Set frontend env values in Vercel.
 5. Set `VITE_API_URL` to `https://interpshield-backend.onrender.com`.
 6. Configure Google OAuth and set `VITE_GOOGLE_CLIENT_ID` in the frontend environment.

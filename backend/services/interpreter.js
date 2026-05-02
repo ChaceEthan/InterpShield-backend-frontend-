@@ -1,5 +1,5 @@
 import { createDeepgramSession } from "./deepgram.js";
-import { translateText } from "./translation.js";
+import { TRANSLATION_UNAVAILABLE_TEXT, translateText } from "./translation.js";
 
 const DEMO_TRANSCRIPTS = ["Hello", "Welcome to InterpShield", "This is a real-time interpreter demo"];
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
@@ -54,7 +54,7 @@ const createDemoInterpreter = ({ sourceLang, targetLang, shouldTranslate, twoWay
 
     onTranslation?.({
       originalText,
-      translatedText: originalText,
+      translatedText: TRANSLATION_UNAVAILABLE_TEXT,
       isFinal: true,
       sourceLang: direction.source,
       targetLang: direction.target,
@@ -124,7 +124,6 @@ export const createInterpreterSession = async ({
 }) => {
   let lastFinalTranscript = "";
   let lastInterimTranscript = "";
-  let lastSuccessfulTranslation = "";
   let translationInFlight = false;
   let translationTimer = null;
   let stopped = false;
@@ -150,20 +149,20 @@ export const createInterpreterSession = async ({
     return a?.sourceLang === b?.sourceLang && a?.targetLang === b?.targetLang;
   };
 
-  const resolveTranslationResult = ({ result, originalText }) => {
+  const resolveTranslationResult = ({ result }) => {
     const translatedText = result?.text?.trim() || "";
 
-    if (translatedText && !result?.stale) {
+    if (translatedText) {
       return {
         translatedText,
         provider: result.provider || "unknown",
-        stale: false
+        stale: Boolean(result?.stale)
       };
     }
 
     return {
-      translatedText: lastSuccessfulTranslation || originalText,
-      provider: lastSuccessfulTranslation ? "cache" : "source",
+      translatedText: TRANSLATION_UNAVAILABLE_TEXT,
+      provider: "gemini",
       stale: true
     };
   };
@@ -233,11 +232,7 @@ export const createInterpreterSession = async ({
         return;
       }
 
-      const resolvedTranslation = resolveTranslationResult({ result, originalText });
-
-      if (!resolvedTranslation.stale) {
-        lastSuccessfulTranslation = resolvedTranslation.translatedText;
-      }
+      const resolvedTranslation = resolveTranslationResult({ result });
 
       const latencyMs = Date.now() - startedAt;
       console.log("AI pipeline translation response received", {
@@ -272,25 +267,25 @@ export const createInterpreterSession = async ({
       }
 
       console.warn("AI pipeline translation fallback used", {
-        provider: lastSuccessfulTranslation ? "cache" : "source",
+        provider: "gemini",
         sourceLang: firstItem.sourceLang,
         targetLang: firstItem.targetLang
       });
 
       onTranslation?.({
         originalText,
-        translatedText: lastSuccessfulTranslation || originalText,
+        translatedText: TRANSLATION_UNAVAILABLE_TEXT,
         isFinal: true,
         sourceLang: firstItem.sourceLang,
         targetLang: firstItem.targetLang,
         detectedLanguage: firstItem.detectedLanguage,
         latencyMs: Date.now() - startedAt,
-        provider: lastSuccessfulTranslation ? "cache" : "source",
+        provider: "gemini",
         stale: true
       });
       emitTranslationStatus({
         state: "stale",
-        provider: lastSuccessfulTranslation ? "cache" : "source",
+        provider: "gemini",
         sourceLang: firstItem.sourceLang,
         targetLang: firstItem.targetLang
       });
@@ -418,7 +413,7 @@ export const createInterpreterSession = async ({
         detectedLanguage,
         latencyMs: Date.now() - startedAt,
         translationPending: shouldTranslate,
-        mode: env.geminiApiKey || env.googleTranslateApiKey ? "production" : "demo"
+        mode: env.geminiApiKey ? "production" : "demo"
       });
 
       if (shouldTranslate) triggerFinalTranslation({ text: displayText, direction, detectedLanguage });

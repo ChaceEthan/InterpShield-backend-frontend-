@@ -9,8 +9,6 @@ const backendRoot = path.resolve(__dirname, "..");
 const projectRoot = path.resolve(backendRoot, "..");
 const isProductionProcess = process.env.NODE_ENV === "production";
 
-dotenv.config({ quiet: true });
-dotenv.config({ path: path.join(projectRoot, ".env"), quiet: true });
 dotenv.config({ path: path.join(backendRoot, ".env"), quiet: true, override: !isProductionProcess });
 
 const placeholderValues = new Set([
@@ -47,7 +45,8 @@ const readProjectPath = (value, fallback) => {
 
 const localClientOrigin = "http://localhost:5173";
 const productionClientOrigin = "https://interpshield.vercel.app";
-const legacyProductionClientOrigin = "https://interp-shield-backend-frontend-fron.vercel.app";
+// Also add production frontend origins here to Google Cloud Console Authorized JavaScript origins.
+const vercelPreviewClientOrigin = "https://interp-shield-backend-frontend-frontend-8akv4lq3k.vercel.app";
 
 const normalizeOrigin = (origin) => origin.trim().replace(/\/$/, "").toLowerCase();
 
@@ -57,7 +56,7 @@ const readClientOrigins = (clientUrl) => {
     .map(normalizeOrigin)
     .filter(Boolean);
 
-  const origins = [localClientOrigin, productionClientOrigin, legacyProductionClientOrigin, ...configuredOrigins];
+  const origins = [localClientOrigin, productionClientOrigin, vercelPreviewClientOrigin, ...configuredOrigins];
   return [...new Set(origins)];
 };
 
