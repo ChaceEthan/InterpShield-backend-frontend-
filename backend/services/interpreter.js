@@ -1,5 +1,5 @@
 import { createDeepgramSession } from "./deepgram.js";
-import { demoTranslate, translateWithGemini } from "./gemini.js";
+import { translateWithGemini } from "./gemini.js";
 
 const DEMO_TRANSCRIPTS = ["Hello", "Welcome to InterpShield", "This is a real-time interpreter demo"];
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
@@ -62,7 +62,7 @@ const createDemoInterpreter = ({ sourceLang, targetLang, shouldTranslate, twoWay
 
       onResult?.({
         originalText,
-        translatedText: shouldTranslate ? demoTranslate(originalText, direction.target) : "",
+        translatedText: "",
         isFinal: true,
         sourceLang: direction.source,
         targetLang: direction.target,
@@ -139,13 +139,20 @@ export const createInterpreterSession = async ({
 
       const startedAt = Date.now();
       const translationInput = prepareTextForTranslation(displayText);
-      const translatedText = shouldTranslate
-        ? await translateWithGemini({
+      let translatedText = "";
+
+      if (shouldTranslate) {
+        try {
+          translatedText = await translateWithGemini({
             text: translationInput,
             sourceLang: direction.source,
             targetLang: direction.target
-          })
-        : "";
+          });
+        } catch (error) {
+          console.error("Gemini translation failed:", error?.message || error);
+          onError?.("Gemini translation failed. Check GEMINI_API_KEY and Gemini API access.");
+        }
+      }
 
       onResult?.({
         originalText: displayText,

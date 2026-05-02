@@ -1,10 +1,16 @@
 // @ts-nocheck
-import { GoogleGenAI } from "@google/genai";
 
-let client = null;
-let activeKey = null;
+const GEMINI_API_VERSION = "v1";
+const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
 
-const placeholderApiKeys = new Set(["", "null", "undefined", "your_gemini_api_key", "YOUR_GEMINI_API_KEY_HERE"]);
+const placeholderApiKeys = new Set([
+  "",
+  "null",
+  "undefined",
+  "your_gemini_api_key",
+  "demo_gemini_key_replace_me",
+  "YOUR_GEMINI_API_KEY_HERE"
+]);
 
 const readGeminiKey = (value) => {
   const trimmed = value?.trim() || "";
@@ -12,61 +18,88 @@ const readGeminiKey = (value) => {
   return placeholderApiKeys.has(unquoted) ? "" : unquoted;
 };
 
-export const demoTranslate = (text, targetLang = "es") => {
-  const cleanText = text?.trim() || "Hello";
-
-  if (cleanText.toLowerCase() === "hello" && targetLang === "es") {
-    return "Hola (demo)";
-  }
-
-  return `${cleanText} (${targetLang} demo)`;
+const getGeminiEndpoint = () => {
+  const configuredModel = process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL;
+  const model = configuredModel.replace(/^models\//, "");
+  return `https://generativelanguage.googleapis.com/${GEMINI_API_VERSION}/models/${model}:generateContent`;
 };
 
 export const translateWithGemini = async ({ text, sourceLang, targetLang }) => {
   const cleanText = text?.trim();
   const apiKey = readGeminiKey(process.env.GEMINI_API_KEY);
 
+  console.log("Gemini API key present:", Boolean(apiKey));
+
   if (!cleanText) {
     return "";
   }
 
   if (!apiKey) {
-    return demoTranslate(cleanText, targetLang);
-  }
-
-  if (!client || activeKey !== apiKey) {
-    client = new GoogleGenAI({ apiKey });
-    activeKey = apiKey;
+    const error = new Error("Missing Gemini API key");
+    console.error("Gemini translation error:", error.message);
+    throw error;
   }
 
   try {
-    const response = await client.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text: [
-                "You are a professional real-time interpreter.",
-                `Translate from ${sourceLang || "auto"} to ${targetLang}.`,
-                "Preserve tone, intent, names, and numbers.",
-                "Return only the translated text. No commentary.",
-                "",
-                cleanText
-              ].join("\n")
-            }
-          ]
+    const geminiEndpoint = getGeminiEndpoint();
+    console.log("Gemini endpoint:", geminiEndpoint);
+
+    const response = await fetch(geminiEndpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: [
+                  "You are a professional real-time interpreter.",
+                  `Translate from ${sourceLang || "auto"} to ${targetLang}.`,
+                  "Preserve tone, intent, names, and numbers.",
+                  "Return only the translated text. No commentary.",
+                  "",
+                  cleanText
+                ].join("\n")
+              }
+            ]
+          }
+        ],
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 512
         }
-      ],
-      config: {
-        temperature: 0.2,
-        maxOutputTokens: 512
-      }
+      })
     });
 
-    return response.text?.trim() || demoTranslate(cleanText, targetLang);
-  } catch {
-    return demoTranslate(cleanText, targetLang);
+    const rawBody = await response.text();
+    let data = {};
+
+    try {
+      data = rawBody ? JSON.parse(rawBody) : {};
+    } catch (parseError) {
+      console.log("Gemini API response:", rawBody);
+      throw new Error(`Gemini API returned invalid JSON: ${parseError?.message || parseError}`);
+    }
+
+    console.log("Gemini API response:", JSON.stringify(data));
+
+    if (!response.ok) {
+      throw new Error(data?.error?.message || `Gemini API request failed with status ${response.status}`);
+    }
+
+    const translatedText = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+
+    if (!translatedText) {
+      throw new Error("Gemini API response did not include candidates[0].content.parts[0].text");
+    }
+
+    return translatedText;
+  } catch (error) {
+    console.error("Gemini translation error:", error);
+    throw error;
   }
 };

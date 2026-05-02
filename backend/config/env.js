@@ -101,7 +101,7 @@ export const warnAboutMissingConfig = () => {
   }
 
   if (!env.geminiApiKey) {
-    console.warn("Gemini key is missing. Translation will use demo fallback.");
+    console.warn("Gemini key is missing. Translation requires GEMINI_API_KEY.");
   }
 
   if (!env.hasJwtSecret) {
