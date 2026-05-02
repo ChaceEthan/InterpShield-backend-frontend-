@@ -2,7 +2,7 @@
 
 const GEMINI_API_VERSION = "v1";
 const DEFAULT_GEMINI_MODEL = "gemini-1.5-flash";
-const GEMINI_TIMEOUT_MS = 2000;
+const DEFAULT_GEMINI_TIMEOUT_MS = 900;
 const GEMINI_MAX_ATTEMPTS = 2;
 const GEMINI_RETRY_DELAY_MS = 150;
 const retryableStatuses = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
@@ -22,6 +22,15 @@ const readGeminiKey = (value) => {
   return placeholderApiKeys.has(unquoted) ? "" : unquoted;
 };
 
+const readNumber = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const getGeminiTimeoutMs = (timeoutMs) => {
+  return readNumber(timeoutMs || process.env.GEMINI_TRANSLATION_TIMEOUT_MS || process.env.TRANSLATION_PROVIDER_TIMEOUT_MS, DEFAULT_GEMINI_TIMEOUT_MS);
+};
+
 const normalizeModelName = (model) => model.replace(/^models\//, "");
 
 const getGeminiModels = () => {
@@ -37,30 +46,31 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const readText = (value) => {
   if (typeof value === "string") return value.trim();
+  if (Array.isArray(value)) return value.map(readText).filter(Boolean).join("").trim();
   if (typeof value?.text === "string") return value.text.trim();
+  if (typeof value?.content === "string") return value.content.trim();
+  if (typeof value?.message?.content === "string") return value.message.content.trim();
+  if (Array.isArray(value?.parts)) return readText(value.parts);
+  if (Array.isArray(value?.content?.parts)) return readText(value.content.parts);
   return "";
 };
 
 const extractGeminiText = (data) => {
-  const candidates = Array.isArray(data?.candidates) ? data.candidates : [];
+  const candidateGroups = [data?.candidates, data?.response?.candidates].filter(Array.isArray);
 
-  for (const candidate of candidates) {
-    const parts = candidate?.content?.parts;
+  for (const candidates of candidateGroups) {
+    for (const candidate of candidates) {
+      const text = readText(candidate);
 
-    if (Array.isArray(parts)) {
-      const text = parts.map(readText).filter(Boolean).join("").trim();
       if (text) return text;
     }
-
-    const directCandidateText = readText(candidate);
-    if (directCandidateText) return directCandidateText;
-
-    const contentText = readText(candidate?.content);
-    if (contentText) return contentText;
   }
 
-  const sdkResponseText = readText(data);
-  if (sdkResponseText) return sdkResponseText;
+  const choiceText = readText(data?.choices?.[0]?.message) || readText(data?.choices?.[0]);
+  if (choiceText) return choiceText;
+
+  const predictionText = readText(data?.predictions?.[0]);
+  if (predictionText) return predictionText;
 
   const outputText = readText(data?.outputText) || readText(data?.output_text);
   if (outputText) return outputText;
@@ -69,7 +79,7 @@ const extractGeminiText = (data) => {
   if (responseText) return responseText;
 
   const firstOutputText = data?.output?.[0]?.content?.[0]?.text;
-  return readText(firstOutputText);
+  return readText(firstOutputText) || readText(data);
 };
 
 const parseResponseBody = (rawBody) => {
@@ -157,9 +167,14 @@ const fetchGeminiResponse = async ({ geminiEndpoint, apiKey, body, attempt, time
   }
 };
 
-export const translateWithGemini = async ({ text, sourceLang, targetLang }) => {
+export const hasGeminiKey = () => {
+  return Boolean(readGeminiKey(process.env.GEMINI_API_KEY));
+};
+
+export const translateWithGemini = async ({ text, sourceLang, targetLang, timeoutMs }) => {
   const cleanText = text?.trim();
   const apiKey = readGeminiKey(process.env.GEMINI_API_KEY);
+  const geminiTimeoutMs = getGeminiTimeoutMs(timeoutMs);
 
   if (process.env.DEBUG_TRANSLATION === "true") {
     console.log("Gemini API key present:", Boolean(apiKey));
@@ -178,7 +193,7 @@ export const translateWithGemini = async ({ text, sourceLang, targetLang }) => {
   try {
     const geminiModels = getGeminiModels();
     const requestBody = createGeminiRequest(cleanText, sourceLang, targetLang);
-    const deadline = Date.now() + GEMINI_TIMEOUT_MS;
+    const deadline = Date.now() + geminiTimeoutMs;
     let lastError = null;
 
     for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt += 1) {
@@ -216,7 +231,7 @@ export const translateWithGemini = async ({ text, sourceLang, targetLang }) => {
       }
     }
 
-    throw lastError || new Error(`Gemini translation timed out after ${GEMINI_TIMEOUT_MS}ms`);
+    throw lastError || new Error(`Gemini translation timed out after ${geminiTimeoutMs}ms`);
   } catch (error) {
     console.error("Gemini translation error:", error);
     throw error;

@@ -1,7 +1,7 @@
 // @ts-nocheck
 
 const GOOGLE_TRANSLATE_ENDPOINT = "https://translation.googleapis.com/language/translate/v2";
-const GOOGLE_TRANSLATE_TIMEOUT_MS = 2000;
+const DEFAULT_GOOGLE_TRANSLATE_TIMEOUT_MS = 900;
 const GOOGLE_TRANSLATE_MAX_ATTEMPTS = 2;
 const GOOGLE_TRANSLATE_RETRY_DELAY_MS = 120;
 const retryableStatuses = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
@@ -19,6 +19,15 @@ const readGoogleTranslateKey = (value) => {
   const trimmed = value?.trim() || "";
   const unquoted = trimmed.match(/^(['"])(.*)\1$/)?.[2] || trimmed;
   return placeholderApiKeys.has(unquoted) ? "" : unquoted;
+};
+
+const readNumber = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const getGoogleTranslateTimeoutMs = (timeoutMs) => {
+  return readNumber(timeoutMs || process.env.GOOGLE_TRANSLATE_TIMEOUT_MS || process.env.TRANSLATION_PROVIDER_TIMEOUT_MS, DEFAULT_GOOGLE_TRANSLATE_TIMEOUT_MS);
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -112,9 +121,10 @@ export const hasGoogleTranslateKey = () => {
   return Boolean(readGoogleTranslateKey(process.env.GOOGLE_TRANSLATE_API_KEY || process.env.GOOGLE_API_KEY));
 };
 
-export const translateWithGoogleTranslate = async ({ text, sourceLang, targetLang }) => {
+export const translateWithGoogleTranslate = async ({ text, sourceLang, targetLang, timeoutMs }) => {
   const cleanText = text?.trim();
   const apiKey = readGoogleTranslateKey(process.env.GOOGLE_TRANSLATE_API_KEY || process.env.GOOGLE_API_KEY);
+  const googleTranslateTimeoutMs = getGoogleTranslateTimeoutMs(timeoutMs);
 
   if (!cleanText) {
     return "";
@@ -126,7 +136,7 @@ export const translateWithGoogleTranslate = async ({ text, sourceLang, targetLan
 
   const endpoint = `${GOOGLE_TRANSLATE_ENDPOINT}?key=${encodeURIComponent(apiKey)}`;
   const requestBody = createGoogleTranslateRequest(cleanText, sourceLang, targetLang);
-  const deadline = Date.now() + GOOGLE_TRANSLATE_TIMEOUT_MS;
+  const deadline = Date.now() + googleTranslateTimeoutMs;
   let lastError = null;
 
   for (let attempt = 1; attempt <= GOOGLE_TRANSLATE_MAX_ATTEMPTS; attempt += 1) {
@@ -156,5 +166,5 @@ export const translateWithGoogleTranslate = async ({ text, sourceLang, targetLan
     }
   }
 
-  throw lastError || new Error(`Google Translate timed out after ${GOOGLE_TRANSLATE_TIMEOUT_MS}ms`);
+  throw lastError || new Error(`Google Translate timed out after ${googleTranslateTimeoutMs}ms`);
 };

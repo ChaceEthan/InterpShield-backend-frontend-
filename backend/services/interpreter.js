@@ -3,8 +3,9 @@ import { translateText } from "./translation.js";
 
 const DEMO_TRANSCRIPTS = ["Hello", "Welcome to InterpShield", "This is a real-time interpreter demo"];
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
-const TRANSLATION_DEBOUNCE_MS = 350;
-const TRANSLATION_MAX_BATCH_CHARS = 640;
+const TRANSLATION_DEBOUNCE_MS = 160;
+const TRANSLATION_MAX_BATCH_CHARS = 420;
+const TRANSLATION_MAX_QUEUE_ITEMS = 8;
 
 const cleanTranscriptText = (text = "") => {
   return text
@@ -35,12 +36,41 @@ const resolveDirection = ({ sourceLang, targetLang, detectedLanguage, twoWay }) 
   return { source: detectedLanguage || sourceLang, target: targetLang };
 };
 
-const createDemoInterpreter = ({ sourceLang, targetLang, shouldTranslate, twoWay, onReady, onWarning, onResult }) => {
+const createDemoInterpreter = ({ sourceLang, targetLang, shouldTranslate, twoWay, onReady, onWarning, onTranslation, onTranslationStatus, onResult }) => {
   let chunkCount = 0;
   let phraseIndex = 0;
 
   onReady?.();
   onWarning?.("Deepgram key is missing. Demo mode is enabled.");
+
+  const emitDemoTranslation = ({ originalText, direction }) => {
+    if (!shouldTranslate) return;
+
+    onTranslationStatus?.({
+      state: "pending",
+      sourceLang: direction.source,
+      targetLang: direction.target
+    });
+
+    onTranslation?.({
+      originalText,
+      translatedText: originalText,
+      isFinal: true,
+      sourceLang: direction.source,
+      targetLang: direction.target,
+      detectedLanguage: direction.source,
+      latencyMs: 0,
+      provider: "demo",
+      stale: true
+    });
+
+    onTranslationStatus?.({
+      state: "stale",
+      provider: "demo",
+      sourceLang: direction.source,
+      targetLang: direction.target
+    });
+  };
 
   return {
     sendAudio: () => {
@@ -71,6 +101,7 @@ const createDemoInterpreter = ({ sourceLang, targetLang, shouldTranslate, twoWay
         latencyMs: 80,
         mode: "demo"
       });
+      emitDemoTranslation({ originalText, direction });
     },
     stop: () => undefined
   };
@@ -99,7 +130,7 @@ export const createInterpreterSession = async ({
   const pendingTranslations = [];
 
   if (!env.deepgramApiKey) {
-    return createDemoInterpreter({ sourceLang, targetLang, shouldTranslate, twoWay, onReady, onWarning, onResult });
+    return createDemoInterpreter({ sourceLang, targetLang, shouldTranslate, twoWay, onReady, onWarning, onTranslation, onTranslationStatus, onResult });
   }
 
   const clearTranslationTimer = () => {
@@ -116,6 +147,24 @@ export const createInterpreterSession = async ({
 
   const isSameTranslationDirection = (a, b) => {
     return a?.sourceLang === b?.sourceLang && a?.targetLang === b?.targetLang;
+  };
+
+  const resolveTranslationResult = ({ result, originalText }) => {
+    const translatedText = result?.text?.trim() || "";
+
+    if (translatedText && !result?.stale) {
+      return {
+        translatedText,
+        provider: result.provider || "unknown",
+        stale: false
+      };
+    }
+
+    return {
+      translatedText: lastSuccessfulTranslation || originalText,
+      provider: lastSuccessfulTranslation ? "cache" : "source",
+      stale: true
+    };
   };
 
   const scheduleTranslationFlush = (delay = TRANSLATION_DEBOUNCE_MS) => {
@@ -178,27 +227,26 @@ export const createInterpreterSession = async ({
         return;
       }
 
-      const translatedText = result.text?.trim() || "";
+      const resolvedTranslation = resolveTranslationResult({ result, originalText });
 
-      if (!translatedText) {
-        throw new Error("Translation provider returned empty text");
+      if (!resolvedTranslation.stale) {
+        lastSuccessfulTranslation = resolvedTranslation.translatedText;
       }
 
-      lastSuccessfulTranslation = translatedText;
       onTranslation?.({
         originalText,
-        translatedText,
+        translatedText: resolvedTranslation.translatedText,
         isFinal: true,
         sourceLang: firstItem.sourceLang,
         targetLang: firstItem.targetLang,
         detectedLanguage: firstItem.detectedLanguage,
         latencyMs: Date.now() - startedAt,
-        provider: result.provider,
-        stale: false
+        provider: resolvedTranslation.provider,
+        stale: resolvedTranslation.stale
       });
       emitTranslationStatus({
-        state: "live",
-        provider: result.provider,
+        state: resolvedTranslation.stale ? "stale" : "live",
+        provider: resolvedTranslation.provider,
         sourceLang: firstItem.sourceLang,
         targetLang: firstItem.targetLang
       });
@@ -209,30 +257,23 @@ export const createInterpreterSession = async ({
         return;
       }
 
-      if (lastSuccessfulTranslation) {
-        onTranslation?.({
-          originalText,
-          translatedText: lastSuccessfulTranslation,
-          isFinal: true,
-          sourceLang: firstItem.sourceLang,
-          targetLang: firstItem.targetLang,
-          detectedLanguage: firstItem.detectedLanguage,
-          latencyMs: Date.now() - startedAt,
-          provider: "cache",
-          stale: true
-        });
-        emitTranslationStatus({
-          state: "stale",
-          sourceLang: firstItem.sourceLang,
-          targetLang: firstItem.targetLang
-        });
-      } else {
-        emitTranslationStatus({
-          state: "stale",
-          sourceLang: firstItem.sourceLang,
-          targetLang: firstItem.targetLang
-        });
-      }
+      onTranslation?.({
+        originalText,
+        translatedText: lastSuccessfulTranslation || originalText,
+        isFinal: true,
+        sourceLang: firstItem.sourceLang,
+        targetLang: firstItem.targetLang,
+        detectedLanguage: firstItem.detectedLanguage,
+        latencyMs: Date.now() - startedAt,
+        provider: lastSuccessfulTranslation ? "cache" : "source",
+        stale: true
+      });
+      emitTranslationStatus({
+        state: "stale",
+        provider: lastSuccessfulTranslation ? "cache" : "source",
+        sourceLang: firstItem.sourceLang,
+        targetLang: firstItem.targetLang
+      });
     } finally {
       translationInFlight = false;
       if (!stopped && pendingTranslations.length > 0) {
@@ -248,12 +289,21 @@ export const createInterpreterSession = async ({
       return;
     }
 
-    pendingTranslations.push({
+    const item = {
       text: cleanText,
       sourceLang: direction.source,
       targetLang: direction.target,
       detectedLanguage
-    });
+    };
+
+    const lastQueued = pendingTranslations.at(-1);
+    if (pendingTranslations.length >= TRANSLATION_MAX_QUEUE_ITEMS && isSameTranslationDirection(lastQueued, item)) {
+      lastQueued.text = `${lastQueued.text} ${item.text}`.slice(-TRANSLATION_MAX_BATCH_CHARS);
+    } else {
+      if (pendingTranslations.length >= TRANSLATION_MAX_QUEUE_ITEMS) pendingTranslations.shift();
+      pendingTranslations.push(item);
+    }
+
     scheduleTranslationFlush();
   };
 
