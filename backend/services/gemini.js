@@ -23,6 +23,37 @@ const languageNames = {
   pl: "Polish",
   ru: "Russian"
 };
+const languageCodeAliases = {
+  "en-us": "en",
+  "en-gb": "en",
+  "es-es": "es",
+  "es-mx": "es",
+  "fr-fr": "fr",
+  "de-de": "de",
+  "it-it": "it",
+  "pt-br": "pt",
+  "pt-pt": "pt",
+  "nl-nl": "nl",
+  "ar-sa": "ar",
+  "zh-cn": "zh",
+  "zh-hans": "zh",
+  "zh-tw": "zh",
+  "zh-hant": "zh",
+  "ja-jp": "ja",
+  "ko-kr": "ko",
+  "hi-in": "hi",
+  "tr-tr": "tr",
+  "pl-pl": "pl",
+  "ru-ru": "ru"
+};
+const targetLanguageValidators = {
+  ar: /[\u0600-\u06ff]/u,
+  hi: /[\u0900-\u097f]/u,
+  ja: /[\u3040-\u30ff\u3400-\u9fff]/u,
+  ko: /[\uac00-\ud7af]/u,
+  ru: /[\u0400-\u04ff]/u,
+  zh: /[\u3400-\u9fff]/u
+};
 
 const placeholderApiKeys = new Set([
   "",
@@ -61,15 +92,38 @@ const getGeminiEndpoint = (model) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const normalizeLanguageCode = (languageCode = "") => languageCode.trim().toLowerCase();
+const normalizeLanguageCode = (languageCode = "") => String(languageCode || "").trim().toLowerCase().replace(/_/g, "-");
+
+export const normalizeTranslationLanguageCode = (languageCode = "", { allowAuto = false, fallback = "" } = {}) => {
+  const normalizedCode = normalizeLanguageCode(languageCode);
+
+  if (allowAuto && normalizedCode === "auto") {
+    return "auto";
+  }
+
+  if (languageNames[normalizedCode]) {
+    return normalizedCode;
+  }
+
+  if (languageCodeAliases[normalizedCode]) {
+    return languageCodeAliases[normalizedCode];
+  }
+
+  const baseCode = normalizedCode.split("-")[0];
+  if (languageNames[baseCode]) {
+    return baseCode;
+  }
+
+  return fallback;
+};
 
 const getLanguageName = (languageCode = "") => {
-  const normalizedCode = normalizeLanguageCode(languageCode);
+  const normalizedCode = normalizeTranslationLanguageCode(languageCode);
   const baseCode = normalizedCode.split("-")[0];
   const languageName = languageNames[normalizedCode] || languageNames[baseCode];
 
   if (languageName) {
-    return `${languageName}${languageCode ? ` (${languageCode})` : ""}`;
+    return `${languageName}${normalizedCode ? ` (${normalizedCode})` : ""}`;
   }
 
   return languageCode || "the selected target language";
@@ -80,17 +134,21 @@ const normalizeForEchoComparison = (value = "") => {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, " ")
+    .replace(/[\u201c\u201d]/g, "\"")
+    .replace(/[\u2018\u2019]/g, "'")
     .replace(/[“”]/g, "\"")
     .replace(/[‘’]/g, "'")
     .replace(/^[\s"'`]+|[\s"'`.!?]+$/g, "");
 };
 
-const isEchoedTranslation = ({ originalText, translatedText, sourceLang, targetLang }) => {
-  if (normalizeLanguageCode(sourceLang) && normalizeLanguageCode(sourceLang) === normalizeLanguageCode(targetLang)) {
-    return false;
-  }
-
+const isEchoedTranslation = ({ originalText, translatedText }) => {
   return normalizeForEchoComparison(originalText) === normalizeForEchoComparison(translatedText);
+};
+
+const usesRequiredTargetScript = ({ translatedText, targetLang }) => {
+  const normalizedTargetLang = normalizeTranslationLanguageCode(targetLang);
+  const validator = targetLanguageValidators[normalizedTargetLang];
+  return !validator || validator.test(translatedText);
 };
 
 const readText = (value) => {
@@ -147,13 +205,16 @@ const isRetryableError = (error) => {
 };
 
 const createGeminiRequest = (cleanText, sourceLang, targetLang, { strictRetry = false } = {}) => {
-  const targetLanguageName = getLanguageName(targetLang);
-  const sourceLanguageName = sourceLang === "auto" ? "auto-detected source language" : getLanguageName(sourceLang);
+  const targetLanguageCode = normalizeTranslationLanguageCode(targetLang);
+  const sourceLanguageCode = normalizeTranslationLanguageCode(sourceLang, { allowAuto: true, fallback: "auto" });
+  const targetLanguageName = getLanguageName(targetLanguageCode);
+  const sourceLanguageName = sourceLanguageCode === "auto" ? "auto-detected source language" : getLanguageName(sourceLanguageCode);
   const retryInstructions = strictRetry
     ? [
-        "This is a retry because the previous response did not produce a valid translation.",
-        `You MUST output a different sentence in ${targetLanguageName}.`,
-        "If the source contains names, keep only the names unchanged; translate all translatable words."
+        "STRICT RETRY: the previous response was invalid because it echoed the source text, was empty, or ignored the target language.",
+        `You are forbidden from returning the original ${sourceLanguageName} text.`,
+        `Every translatable word must be translated into ${targetLanguageName}.`,
+        "Only proper nouns, brand names, numbers, codes, and URLs may remain unchanged."
       ]
     : [];
 
@@ -165,15 +226,18 @@ const createGeminiRequest = (cleanText, sourceLang, targetLang, { strictRetry = 
           {
             text: [
               "You are a professional real-time interpreter.",
-              `Translate to ${targetLanguageName}.`,
+              `Translate the following text into ${targetLanguageName}.`,
+              `Source language code: ${sourceLanguageCode}.`,
               `Source language: ${sourceLanguageName}.`,
+              `Target language code: ${targetLanguageCode}.`,
               `Target language: ${targetLanguageName}.`,
               `You MUST translate the input into ${targetLanguageName}.`,
+              `The final answer MUST be written in ${targetLanguageName}.`,
               "Do NOT repeat original text.",
-              "Return only translated sentence.",
-              "No explanations.",
-              "Do not add commentary, labels, markdown, quotes, or pronunciation notes.",
-              `The final answer must be written in ${targetLanguageName}, not in the source language.`,
+              "Do NOT output the original source text.",
+              "Do NOT answer in the source language.",
+              "Return ONLY translated text.",
+              "Do NOT include explanations, labels, metadata, markdown, quotes, pronunciation notes, or extra words.",
               ...retryInstructions,
               "",
               "Original text:",
@@ -184,7 +248,8 @@ const createGeminiRequest = (cleanText, sourceLang, targetLang, { strictRetry = 
       }
     ],
     generationConfig: {
-      temperature: 0.1,
+      temperature: 0,
+      candidateCount: 1,
       maxOutputTokens: 512
     }
   };
@@ -222,12 +287,20 @@ const fetchGeminiResponse = async ({ geminiEndpoint, apiKey, body, attempt, time
 
     if (!translatedText) {
       const error = new Error("Gemini API response did not include translated text");
+      error.retryable = true;
       error.data = data;
       throw error;
     }
 
     if (isEchoedTranslation({ originalText, translatedText, sourceLang, targetLang })) {
       const error = new Error("Gemini echoed the original text instead of translating");
+      error.retryable = true;
+      error.data = data;
+      throw error;
+    }
+
+    if (!usesRequiredTargetScript({ translatedText, targetLang })) {
+      const error = new Error(`Gemini response was not written in target language ${normalizeTranslationLanguageCode(targetLang)}`);
       error.retryable = true;
       error.data = data;
       throw error;
@@ -252,6 +325,8 @@ export const translateWithGemini = async ({ text, sourceLang, targetLang, timeou
   const cleanText = text?.trim();
   const apiKey = readGeminiKey(process.env.GEMINI_API_KEY);
   const geminiTimeoutMs = getGeminiTimeoutMs(timeoutMs);
+  const normalizedSourceLang = normalizeTranslationLanguageCode(sourceLang, { allowAuto: true, fallback: "auto" });
+  const normalizedTargetLang = normalizeTranslationLanguageCode(targetLang);
 
   if (process.env.DEBUG_TRANSLATION === "true") {
     console.log("Gemini API key present:", Boolean(apiKey));
@@ -263,6 +338,12 @@ export const translateWithGemini = async ({ text, sourceLang, targetLang, timeou
 
   if (!apiKey) {
     const error = new Error("Missing Gemini API key");
+    console.error("Gemini translation error:", error.message);
+    throw error;
+  }
+
+  if (!normalizedTargetLang) {
+    const error = new Error(`Unsupported target language code: ${targetLang || "missing"}`);
     console.error("Gemini translation error:", error.message);
     throw error;
   }
@@ -286,7 +367,7 @@ export const translateWithGemini = async ({ text, sourceLang, targetLang, timeou
       }
 
       try {
-        const requestBody = createGeminiRequest(cleanText, sourceLang, targetLang, { strictRetry: attempt > 1 });
+        const requestBody = createGeminiRequest(cleanText, normalizedSourceLang, normalizedTargetLang, { strictRetry: attempt > 1 });
         const translatedText = await fetchGeminiResponse({
           geminiEndpoint,
           apiKey,
@@ -294,8 +375,8 @@ export const translateWithGemini = async ({ text, sourceLang, targetLang, timeou
           attempt,
           timeoutMs: remainingMs,
           originalText: cleanText,
-          sourceLang,
-          targetLang
+          sourceLang: normalizedSourceLang,
+          targetLang: normalizedTargetLang
         });
         return translatedText;
       } catch (error) {
