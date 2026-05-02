@@ -15,12 +15,15 @@ const app = express();
 const server = http.createServer(app);
 
 const normalizeOrigin = (origin = "") => origin.trim().replace(/\/$/, "").toLowerCase();
-const corsOrigins = env.clientOrigins;
-const corsMethods = ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"];
+const corsOrigins = new Set(env.clientOrigins.map(normalizeOrigin));
+const corsMethods = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"];
 const corsAllowedHeaders = ["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"];
 const isAllowedOrigin = (origin) => {
   if (!origin) return true;
-  return corsOrigins.includes(normalizeOrigin(origin));
+  return corsOrigins.has(normalizeOrigin(origin));
+};
+const corsOrigin = (origin, callback) => {
+  callback(null, isAllowedOrigin(origin));
 };
 const applyCorsHeaders = (req, res) => {
   const origin = req.get("origin");
@@ -35,9 +38,7 @@ const applyCorsHeaders = (req, res) => {
   res.setHeader("Access-Control-Allow-Headers", corsAllowedHeaders.join(", "));
 };
 const corsOptions = {
-  origin(origin, callback) {
-    callback(null, isAllowedOrigin(origin));
-  },
+  origin: corsOrigin,
   credentials: true,
   methods: corsMethods,
   allowedHeaders: corsAllowedHeaders,
