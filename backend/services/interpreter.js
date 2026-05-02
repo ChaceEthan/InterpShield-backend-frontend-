@@ -306,7 +306,7 @@ export const createInterpreterSession = async ({
     const cleanText = cleanTranscriptText(text);
 
     if (!cleanText) {
-      return;
+      return false;
     }
 
     const item = {
@@ -324,7 +324,36 @@ export const createInterpreterSession = async ({
       pendingTranslations.push(item);
     }
 
+    console.log("AI pipeline translation queued", {
+      chars: cleanText.length,
+      sourceLang: direction.source,
+      targetLang: direction.target
+    });
     scheduleTranslationFlush();
+    return true;
+  };
+
+  const triggerFinalTranslation = ({ text, direction, detectedLanguage }) => {
+    const queued = enqueueTranslation({ text, direction, detectedLanguage });
+
+    if (queued) return;
+
+    console.warn("AI pipeline translation trigger skipped; retrying once.", {
+      chars: text?.length || 0,
+      sourceLang: direction.source,
+      targetLang: direction.target
+    });
+
+    setTimeout(() => {
+      if (stopped) return;
+      const retryQueued = enqueueTranslation({ text, direction, detectedLanguage });
+      if (!retryQueued) {
+        console.warn("AI pipeline translation trigger retry failed.", {
+          sourceLang: direction.source,
+          targetLang: direction.target
+        });
+      }
+    }, 0);
   };
 
   const session = createDeepgramSession({
@@ -379,7 +408,6 @@ export const createInterpreterSession = async ({
         targetLang: direction.target,
         shouldTranslate
       });
-      if (shouldTranslate) enqueueTranslation({ text: displayText, direction, detectedLanguage });
 
       onResult?.({
         originalText: displayText,
@@ -392,6 +420,8 @@ export const createInterpreterSession = async ({
         translationPending: shouldTranslate,
         mode: env.geminiApiKey || env.googleTranslateApiKey ? "production" : "demo"
       });
+
+      if (shouldTranslate) triggerFinalTranslation({ text: displayText, direction, detectedLanguage });
     }
   });
 

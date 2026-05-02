@@ -15,6 +15,9 @@ const app = express();
 const server = http.createServer(app);
 const defaultClientOrigins = [
   "http://localhost:5173",
+  "http://localhost:4173",
+  "http://localhost:3000",
+  "http://127.0.0.1:5173",
   "https://interpshield.vercel.app"
 ];
 const configuredClientOrigins = (process.env.CLIENT_URL || "")
@@ -38,12 +41,17 @@ const io = new Server(server, {
   transports: ["websocket", "polling"],
   allowUpgrades: true,
   maxHttpBufferSize: 2e6,
-  pingInterval: 15000,
+  pingInterval: 10000,
   pingTimeout: 20000,
   connectTimeout: 20000
 });
 
 app.use(cors(corsOptions));
+app.use((_req, res, next) => {
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
+  res.removeHeader("Cross-Origin-Embedder-Policy");
+  next();
+});
 app.use(express.json({ limit: "2mb" }));
 
 app.get("/", (_req, res) => {

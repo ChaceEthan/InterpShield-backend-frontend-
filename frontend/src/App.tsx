@@ -119,6 +119,18 @@ interface GoogleCredentialResponse {
   select_by?: string;
 }
 
+interface SessionStartAck {
+  success?: boolean;
+  ok?: boolean;
+  error?: string;
+  mode?: string;
+}
+
+interface PendingAudioChunk {
+  audio: Blob;
+  sequence: number;
+}
+
 declare global {
   interface Window {
     google?: {
@@ -148,6 +160,8 @@ const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const AUDIO_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
 const TRANSLATION_PENDING_TIMEOUT_MS = 7000;
 const SESSION_START_TIMEOUT_MS = 20000;
+const SOCKET_CONNECT_TIMEOUT_MS = 10000;
+const MAX_PENDING_AUDIO_CHUNKS = 16;
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
 
@@ -874,14 +888,80 @@ export default function App() {
   const lastFinalTranslationRef = useRef("");
   const interimTimerRef = useRef<number | null>(null);
   const audioChunkMsRef = useRef(350);
+  const sessionReadyRef = useRef(false);
+  const pendingAudioChunksRef = useRef<PendingAudioChunk[]>([]);
+
+  const flushBufferedAudio = useCallback(() => {
+    const socket = socketRef.current;
+    if (!socket?.connected || !sessionReadyRef.current || pendingAudioChunksRef.current.length === 0) return;
+
+    const bufferedChunks = pendingAudioChunksRef.current.splice(0);
+    bufferedChunks.forEach((chunk) => socket.emit("audio_chunk", chunk));
+    setChunkCount((current) => current + bufferedChunks.length);
+  }, []);
+
+  const queueOrSendAudio = useCallback((audio: Blob) => {
+    if (audio.size < 128) return;
+
+    const sequence = sequenceRef.current;
+    sequenceRef.current = sequence + 1;
+    const payload = { audio, sequence };
+    const socket = socketRef.current;
+
+    if (socket?.connected && sessionReadyRef.current) {
+      socket.emit("audio_chunk", payload);
+      setChunkCount((current) => current + 1);
+      return;
+    }
+
+    pendingAudioChunksRef.current.push(payload);
+    if (pendingAudioChunksRef.current.length > MAX_PENDING_AUDIO_CHUNKS) {
+      pendingAudioChunksRef.current.shift();
+    }
+  }, []);
+
+  const waitForSocketConnection = useCallback((socket: Socket) => {
+    if (socket.connected) return Promise.resolve();
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timeoutId = 0;
+
+      const cleanup = () => {
+        window.clearTimeout(timeoutId);
+        socket.off("connect", handleConnect);
+        socket.off("connect_error", handleConnectError);
+      };
+
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      };
+
+      const handleConnect = () => finish();
+      const handleConnectError = () => finish(new Error("Unable to reach the live interpreter."));
+      timeoutId = window.setTimeout(() => finish(new Error("Live interpreter connection timed out.")), SOCKET_CONNECT_TIMEOUT_MS);
+
+      socket.on("connect", handleConnect);
+      socket.on("connect_error", handleConnectError);
+      socket.connect();
+    });
+  }, []);
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro";
   const isRecording = status === "connecting" || status === "listening";
+  const interpreterButtonDisabled = status === "connecting" || status === "stopping";
   const latestOriginal = interimOriginal || originalSegments.at(-1) || "";
   const latestTranslation = translatedSegments.at(-1) || "";
   const maxSessionSeconds = config?.maxSessionSeconds || 120;
-  const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
+  const statusLabel = status === "connecting" ? "Connecting..." : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
   const translationStatusLabel =
     translationStatus === "pending"
       ? latestTranslation
@@ -1018,6 +1098,8 @@ export default function App() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     recordingRef.current = false;
+    sessionReadyRef.current = false;
+    pendingAudioChunksRef.current = [];
     activeSessionPayloadRef.current = null;
     shouldRestartSessionOnReconnectRef.current = false;
     sessionStartedAtRef.current = null;
@@ -1064,11 +1146,11 @@ export default function App() {
         socket.timeout(SESSION_START_TIMEOUT_MS).emit(
           "start_session",
           sessionPayload,
-          (timeoutError: Error | null, response?: { ok?: boolean; error?: string }) => {
-            if (timeoutError || response?.error) {
+          (timeoutError: Error | null, response?: SessionStartAck) => {
+            if (timeoutError || response?.error || response?.success === false || response?.ok === false) {
               cleanupMedia();
               setStatus("error");
-              setAlert(response?.error || "Unable to restart the live interpreter.");
+              setAlert(response?.error || "Interpreter session did not confirm startup. Please try again.");
             }
           }
         );
@@ -1076,6 +1158,7 @@ export default function App() {
     });
 
     socket.on("disconnect", () => {
+      sessionReadyRef.current = false;
       if (recordingRef.current) {
         shouldRestartSessionOnReconnectRef.current = true;
         setStatus("connecting");
@@ -1084,6 +1167,7 @@ export default function App() {
     });
 
     socket.on("connect_error", () => {
+      sessionReadyRef.current = false;
       if (recordingRef.current) {
         setStatus("connecting");
         setAlert("Unable to reach the live interpreter. Reconnecting...");
@@ -1100,6 +1184,7 @@ export default function App() {
     socket.on("server-config", (serverConfig: AppConfig) => setConfig(serverConfig));
 
     const markSessionReady = () => {
+      sessionReadyRef.current = true;
       const recorder = mediaRecorderRef.current;
       if (recorder?.state === "inactive") {
         const chunkMs = audioChunkMsRef.current;
@@ -1108,12 +1193,16 @@ export default function App() {
         sessionStartedAtRef.current = Date.now();
         setSessionSeconds(0);
       }
+      flushBufferedAudio();
       setStatus("listening");
     };
 
     socket.on("session_ready", markSessionReady);
     socket.on("session:ready", markSessionReady);
-    socket.on("session:closed", () => setStatus((current) => (current === "stopping" ? "idle" : current)));
+    socket.on("session:closed", () => {
+      sessionReadyRef.current = false;
+      setStatus((current) => (current === "stopping" ? "idle" : current));
+    });
     socket.on("warning", ({ message }: { message?: string }) => {
       const warning = message || "";
       if (warning.includes("session limit") || warning.includes("silence")) setAlert(warning);
@@ -1126,6 +1215,9 @@ export default function App() {
       if (provider) setTranslationProvider(provider);
     });
     const handleSessionError = ({ message }: { message?: string }) => {
+      sessionReadyRef.current = false;
+      pendingAudioChunksRef.current = [];
+      cleanupMedia();
       setStatus("error");
       setAlert(message || "Real-time processing failed.");
     };
@@ -1178,10 +1270,12 @@ export default function App() {
     return () => {
       if (interimTimerRef.current) window.clearTimeout(interimTimerRef.current);
       clearTranslationPendingTimer();
+      sessionReadyRef.current = false;
+      pendingAudioChunksRef.current = [];
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [cleanupMedia, clearTranslationPendingTimer, setTranslationStatusSafely, token, user?.id]);
+  }, [cleanupMedia, clearTranslationPendingTimer, flushBufferedAudio, setTranslationStatusSafely, token, user?.id]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1326,6 +1420,8 @@ export default function App() {
     setTranslationStatusSafely("idle");
     setTranslationProvider(null);
     sequenceRef.current = 0;
+    sessionReadyRef.current = false;
+    pendingAudioChunksRef.current = [];
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
     lastFinalTranslationRef.current = "";
@@ -1347,13 +1443,15 @@ export default function App() {
     }
 
     try {
-      if (!socketRef.current) {
+      const socket = socketRef.current;
+
+      if (!socket) {
         setStatus("error");
         setAlert("Live interpreter connection is not ready. Please refresh and try again.");
         return;
       }
 
-      if (socketRef.current.disconnected) socketRef.current.connect();
+      await waitForSocketConnection(socket);
 
       const audio = buildAudioConstraints({
         microphoneId,
@@ -1374,12 +1472,8 @@ export default function App() {
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (event) => {
-        if (event.data.size < 128 || !socketRef.current?.connected) return;
-
-        const sequence = sequenceRef.current;
-        socketRef.current.emit("audio_chunk", { audio: event.data, sequence });
-        sequenceRef.current = sequence + 1;
-        setChunkCount((current) => current + 1);
+        if (!recordingRef.current) return;
+        queueOrSendAudio(event.data);
       };
 
       recorder.onerror = () => {
@@ -1398,14 +1492,14 @@ export default function App() {
       activeSessionPayloadRef.current = sessionPayload;
       shouldRestartSessionOnReconnectRef.current = false;
 
-      socketRef.current?.timeout(SESSION_START_TIMEOUT_MS).emit(
+      socket.timeout(SESSION_START_TIMEOUT_MS).emit(
         "start_session",
         sessionPayload,
-        (timeoutError: Error | null, response?: { ok?: boolean; error?: string }) => {
-          if (timeoutError || response?.error) {
+        (timeoutError: Error | null, response?: SessionStartAck) => {
+          if (timeoutError || response?.error || response?.success === false || response?.ok === false) {
             cleanupMedia();
             setStatus("error");
-            setAlert(response?.error || "Unable to reach the live interpreter.");
+            setAlert(response?.error || "Interpreter session did not confirm startup. Please try again.");
           }
         }
       );
@@ -1423,9 +1517,9 @@ export default function App() {
         return;
       }
 
-      setAlert("Microphone not detected");
+      setAlert(error instanceof Error ? error.message : "Microphone not detected");
     }
-  }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, refreshMicrophones, setTranslationStatusSafely, sourceLang, targetLang, twoWay]);
+  }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, queueOrSendAudio, refreshMicrophones, setTranslationStatusSafely, sourceLang, targetLang, twoWay, waitForSocketConnection]);
 
   const selectMode = (nextMode: Mode) => {
     setMode(nextMode);
@@ -1631,7 +1725,7 @@ export default function App() {
             </div>
 
             <div className="mt-8 flex flex-col items-center gap-3">
-              <button onClick={!isRecording ? () => void startSession() : stopSession} disabled={status === "stopping"} className={`relative flex h-20 w-20 items-center justify-center rounded-full text-white shadow-2xl transition hover:scale-105 disabled:cursor-wait disabled:opacity-70 ${isRecording ? "bg-red-500 shadow-red-500/25" : "bg-blue-500 text-white shadow-blue-500/25"}`} aria-label={isRecording ? "Stop recording" : "Start recording"}>
+              <button onClick={!isRecording ? () => void startSession() : stopSession} disabled={interpreterButtonDisabled} className={`relative flex h-20 w-20 items-center justify-center rounded-full text-white shadow-2xl transition hover:scale-105 disabled:cursor-wait disabled:opacity-70 ${isRecording ? "bg-red-500 shadow-red-500/25" : "bg-blue-500 text-white shadow-blue-500/25"}`} aria-label={isRecording ? "Stop recording" : "Start recording"}>
                 {isRecording && <span className="pulse-ring absolute inset-0 rounded-full border border-white/70" />}
                 {isRecording ? <CircleStop className="h-8 w-8" /> : <Mic className="h-8 w-8" />}
               </button>

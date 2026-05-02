@@ -23,6 +23,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     let activeShouldTranslate = false;
     let sessionStartedAt = null;
     let userId = "";
+    let sessionStarting = false;
 
     try {
       const token = socket.handshake.auth?.token;
@@ -43,6 +44,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       socket.data.deepgramStream = null;
       activeShouldTranslate = false;
       sessionStartedAt = null;
+      sessionStarting = false;
 
       if (sessionTimer) {
         clearTimeout(sessionTimer);
@@ -56,7 +58,11 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         return "Deepgram rejected the live stream. Check DEEPGRAM_API_KEY on Render.";
       }
 
-      return "Unable to start interpreter session.";
+      if (/deepgram/i.test(message)) {
+        return message.startsWith("Deepgram") ? message : `Deepgram connection failed: ${message}`;
+      }
+
+      return message || "Unable to start interpreter session.";
     };
 
     socket.emit("server-config", getPublicConfig());
@@ -164,6 +170,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
     const handleStartSession = async (payload = {}, ack) => {
       stopSession();
+      sessionStarting = true;
 
       const sourceLang = payload.sourceLang || "en";
       const targetLang = payload.targetLang || "es";
@@ -196,6 +203,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         });
         socket.data.interpreterSession = session;
         socket.data.deepgramStream = session;
+        sessionStarting = false;
 
         sessionTimer = setTimeout(() => {
           stopSession();
@@ -203,18 +211,23 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           socket.emit("session:closed");
         }, env.maxSessionSeconds * 1000);
 
-        ack?.({ ok: true, mode: env.deepgramApiKey && (env.geminiApiKey || env.googleTranslateApiKey) ? "production" : "demo" });
+        ack?.({ success: true, ok: true, mode: env.deepgramApiKey && (env.geminiApiKey || env.googleTranslateApiKey) ? "production" : "demo" });
       } catch (error) {
         console.error("Interpreter session start failed:", error?.message || error);
+        sessionStarting = false;
         const message = startErrorMessage(error);
-        ack?.({ ok: false, error: message });
+        stopSession();
+        ack?.({ success: false, ok: false, error: message });
         socket.emit("session_error", { message });
         socket.emit("app-error", { message });
       }
     };
 
     const handleAudioChunk = (payload = {}) => {
-      if (!session) return;
+      if (!session) {
+        if (!sessionStarting) socket.emit("warning", { message: "Audio received before interpreter session was ready." });
+        return;
+      }
 
       try {
         const sequence = Number(payload?.sequence);
