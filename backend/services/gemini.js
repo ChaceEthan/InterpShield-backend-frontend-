@@ -2,12 +2,10 @@
 
 const GEMINI_API_VERSION = "v1";
 const DEFAULT_GEMINI_MODEL = "gemini-1.5-flash";
-const GEMINI_MODEL_FALLBACKS = ["gemini-2.0-flash", "gemini-2.5-flash"];
-const GEMINI_TIMEOUT_MS = 3000;
-const GEMINI_MAX_RETRIES = 2;
+const GEMINI_TIMEOUT_MS = 2000;
+const GEMINI_MAX_ATTEMPTS = 2;
 const GEMINI_RETRY_DELAY_MS = 150;
 const retryableStatuses = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
-let activeGeminiModel = null;
 
 const placeholderApiKeys = new Set([
   "",
@@ -28,14 +26,7 @@ const normalizeModelName = (model) => model.replace(/^models\//, "");
 
 const getGeminiModels = () => {
   const configuredModel = process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL;
-  const preferredModels = [configuredModel, ...GEMINI_MODEL_FALLBACKS].map(normalizeModelName).filter(Boolean);
-  const models = [...new Set(preferredModels)];
-
-  if (activeGeminiModel && models.includes(activeGeminiModel)) {
-    return [activeGeminiModel, ...models.filter((model) => model !== activeGeminiModel)];
-  }
-
-  return models;
+  return [...new Set([configuredModel].map(normalizeModelName).filter(Boolean))];
 };
 
 const getGeminiEndpoint = (model) => {
@@ -95,11 +86,6 @@ const isRetryableError = (error) => {
   return retryableStatuses.has(Number(error?.status));
 };
 
-const isUnavailableModelError = (error) => {
-  const message = error?.message || "";
-  return Number(error?.status) === 404 && /not found|not supported/i.test(message);
-};
-
 const createGeminiRequest = (cleanText, sourceLang, targetLang) => ({
   contents: [
     {
@@ -141,7 +127,9 @@ const fetchGeminiResponse = async ({ geminiEndpoint, apiKey, body, attempt, time
 
     const rawBody = await response.text();
     const data = parseResponseBody(rawBody);
-    console.log("Gemini API response:", JSON.stringify(data));
+    if (process.env.DEBUG_TRANSLATION === "true") {
+      console.log("Gemini API response:", JSON.stringify(data));
+    }
 
     if (!response.ok) {
       const error = new Error(data?.error?.message || `Gemini API request failed with status ${response.status}`);
@@ -173,7 +161,9 @@ export const translateWithGemini = async ({ text, sourceLang, targetLang }) => {
   const cleanText = text?.trim();
   const apiKey = readGeminiKey(process.env.GEMINI_API_KEY);
 
-  console.log("Gemini API key present:", Boolean(apiKey));
+  if (process.env.DEBUG_TRANSLATION === "true") {
+    console.log("Gemini API key present:", Boolean(apiKey));
+  }
 
   if (!cleanText) {
     return "";
@@ -190,34 +180,27 @@ export const translateWithGemini = async ({ text, sourceLang, targetLang }) => {
     const requestBody = createGeminiRequest(cleanText, sourceLang, targetLang);
     const deadline = Date.now() + GEMINI_TIMEOUT_MS;
     let lastError = null;
-    let modelIndex = 0;
 
-    for (let attempt = 1; attempt <= GEMINI_MAX_RETRIES + 1; attempt += 1) {
+    for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt += 1) {
       const remainingMs = deadline - Date.now();
 
       if (remainingMs <= 0) {
         break;
       }
 
-      const currentModel = geminiModels[modelIndex];
+      const currentModel = geminiModels[0];
       const geminiEndpoint = getGeminiEndpoint(currentModel);
-      console.log("Gemini model:", currentModel);
-      console.log("Gemini endpoint:", geminiEndpoint);
+      if (process.env.DEBUG_TRANSLATION === "true") {
+        console.log("Gemini model:", currentModel);
+      }
 
       try {
         const translatedText = await fetchGeminiResponse({ geminiEndpoint, apiKey, body: requestBody, attempt, timeoutMs: remainingMs });
-        activeGeminiModel = currentModel;
         return translatedText;
       } catch (error) {
         lastError = error;
 
-        if (isUnavailableModelError(error) && modelIndex < geminiModels.length - 1) {
-          modelIndex += 1;
-          console.warn(`Gemini model unavailable, switching to ${geminiModels[modelIndex]}`);
-          continue;
-        }
-
-        if (attempt > GEMINI_MAX_RETRIES || !isRetryableError(error)) {
+        if (attempt >= GEMINI_MAX_ATTEMPTS || !isRetryableError(error)) {
           break;
         }
 

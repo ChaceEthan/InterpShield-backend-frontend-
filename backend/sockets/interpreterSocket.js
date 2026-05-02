@@ -86,6 +86,28 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       socket.emit("result", result);
     };
 
+    const emitTranslationUpdate = (translation) => {
+      const text = translation?.translatedText?.trim() || "";
+      if (!text) return;
+
+      const payload = {
+        text,
+        sourceLang: translation.sourceLang,
+        targetLang: translation.targetLang,
+        detectedLanguage: translation.detectedLanguage,
+        latencyMs: translation.latencyMs,
+        provider: translation.provider,
+        stale: Boolean(translation.stale)
+      };
+
+      socket.emit("translation_update", payload);
+      socket.emit("result", {
+        ...translation,
+        translatedText: text,
+        translationOnly: true
+      });
+    };
+
     const handleStartSession = async (payload = {}, ack) => {
       stopSession();
 
@@ -110,6 +132,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           onWarning: (message) => socket.emit("warning", { message }),
           onError: (message) => socket.emit("session_error", { message }),
           onClosed: () => socket.emit("session:closed"),
+          onTranslation: emitTranslationUpdate,
+          onTranslationStatus: (payload) => socket.emit("translation_status", payload),
           onResult: emitInterpreterResult
         });
         socket.data.interpreterSession = session;
@@ -121,7 +145,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           socket.emit("session:closed");
         }, env.maxSessionSeconds * 1000);
 
-        ack?.({ ok: true, mode: env.deepgramApiKey && env.geminiApiKey ? "production" : "demo" });
+        ack?.({ ok: true, mode: env.deepgramApiKey && (env.geminiApiKey || env.googleTranslateApiKey) ? "production" : "demo" });
       } catch (error) {
         console.error("Interpreter session start failed:", error?.message || error);
         const message = startErrorMessage(error);

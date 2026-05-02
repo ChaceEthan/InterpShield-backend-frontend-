@@ -61,7 +61,8 @@ app.get("/api/health", (_req, res) => {
 app.get("/api/debug/env", (_req, res) => {
   res.json({
     deepgram: Boolean(env.deepgramApiKey),
-    gemini: Boolean(env.geminiApiKey)
+    gemini: Boolean(env.geminiApiKey),
+    googleTranslate: Boolean(env.googleTranslateApiKey)
   });
 });
 

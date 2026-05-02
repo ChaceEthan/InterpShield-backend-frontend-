@@ -31,6 +31,7 @@ import { io, type Socket } from "socket.io-client";
 type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings";
 type Mode = "transcribe" | "translate" | "dubbing";
 type SessionStatus = "idle" | "connecting" | "listening" | "stopping" | "error";
+type TranslationStatus = "idle" | "pending" | "live" | "stale";
 type Plan = "free" | "pro";
 type SummaryLength = "short" | "standard" | "long";
 
@@ -80,10 +81,12 @@ interface AppConfig {
   services: {
     deepgram: boolean;
     gemini: boolean;
+    googleTranslate: boolean;
   };
   backend: boolean;
   hasDeepgramKey: boolean;
   hasGeminiKey: boolean;
+  hasGoogleTranslateKey: boolean;
   hasGoogleClientId: boolean;
   mode: "production" | "demo";
   maxSessionSeconds: number;
@@ -609,6 +612,8 @@ export default function App() {
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [chunkCount, setChunkCount] = useState(0);
   const [lastLatency, setLastLatency] = useState<number | null>(null);
+  const [translationStatus, setTranslationStatus] = useState<TranslationStatus>("idle");
+  const [translationProvider, setTranslationProvider] = useState<string | null>(null);
   const [detectedLanguage, setDetectedLanguage] = useState<string | null>(null);
 
   const [saveTranscript, setSaveTranscript] = useState(true);
@@ -656,6 +661,18 @@ export default function App() {
   const latestTranslation = translatedSegments.at(-1) || "";
   const maxSessionSeconds = config?.maxSessionSeconds || 120;
   const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
+  const translationStatusLabel =
+    translationStatus === "pending"
+      ? latestTranslation
+        ? "Translating new speech. Keeping the last stable line on screen."
+        : "Translating speech..."
+      : translationStatus === "stale"
+        ? latestTranslation
+          ? "Network is slow. Showing the last successful translation."
+          : "Translation is catching up. Waiting for the first stable line."
+        : translationStatus === "live"
+          ? `Stable translation${translationProvider ? ` via ${translationProvider === "google" ? "Google Translate" : "Gemini"}` : ""}.`
+          : "";
 
   const navigate = useCallback(
     (nextView: View) => {
@@ -850,6 +867,13 @@ export default function App() {
       const warning = message || "";
       if (warning.includes("session limit") || warning.includes("silence")) setAlert(warning);
     });
+    socket.on("translation_status", ({ state, provider }: { state?: TranslationStatus; provider?: string }) => {
+      if (modeRef.current === "transcribe") return;
+      if (state === "idle" || state === "pending" || state === "live" || state === "stale") {
+        setTranslationStatus(state);
+      }
+      if (provider) setTranslationProvider(provider);
+    });
     const handleSessionError = ({ message }: { message?: string }) => {
       setStatus("error");
       setAlert(message || "Real-time processing failed.");
@@ -882,13 +906,19 @@ export default function App() {
       lastFinalOriginalRef.current = originalText;
       setInterimOriginal("");
       setOriginalSegments((current) => [...current, originalText].slice(-40));
+      if (modeRef.current !== "transcribe") setTranslationStatus("pending");
       setStatus("listening");
     });
 
-    socket.on("translation_update", ({ text, latencyMs }: { text?: string; latencyMs?: number }) => {
+    socket.on("translation_update", ({ text, latencyMs, provider, stale }: { text?: string; latencyMs?: number; provider?: string; stale?: boolean }) => {
       const nextTranslation = text?.trim() || "";
-      if (!nextTranslation || nextTranslation === lastFinalTranslationRef.current) return;
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
+      if (provider) setTranslationProvider(provider);
+
+      if (!nextTranslation) return;
+
+      setTranslationStatus(stale ? "stale" : "live");
+      if (nextTranslation === lastFinalTranslationRef.current) return;
 
       lastFinalTranslationRef.current = nextTranslation;
       setTranslatedSegments((current) => [...current, nextTranslation].slice(-40));
@@ -1028,6 +1058,8 @@ export default function App() {
     setDetectedLanguage(null);
     setChunkCount(0);
     setLastLatency(null);
+    setTranslationStatus("idle");
+    setTranslationProvider(null);
     sequenceRef.current = 0;
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
@@ -1141,6 +1173,8 @@ export default function App() {
     setSessionSeconds(0);
     setChunkCount(0);
     setLastLatency(null);
+    setTranslationStatus("idle");
+    setTranslationProvider(null);
     setDetectedLanguage(null);
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
@@ -1317,6 +1351,11 @@ export default function App() {
                 <p className="min-h-24 text-2xl font-black leading-snug tracking-normal text-white sm:text-3xl md:text-4xl">
                   <TypingSubtitle text={mode === "transcribe" ? latestOriginal : latestTranslation} empty="Translated subtitles appear here." />
                 </p>
+                {mode !== "transcribe" && translationStatusLabel && (
+                  <p className={`mt-4 text-xs font-bold uppercase tracking-widest ${translationStatus === "stale" ? "text-amber-200" : translationStatus === "pending" ? "text-blue-100/70" : "text-emerald-200"}`}>
+                    {translationStatusLabel}
+                  </p>
+                )}
               </div>
             </div>
 

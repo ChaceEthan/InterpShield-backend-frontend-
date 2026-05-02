@@ -19,11 +19,14 @@ const placeholderValues = new Set([
   "undefined",
   "your_deepgram_api_key",
   "your_gemini_api_key",
+  "your_google_translate_api_key",
   "your_mongo_uri",
   "demo_deepgram_key_replace_me",
   "demo_gemini_key_replace_me",
+  "demo_google_translate_key_replace_me",
   "YOUR_DEEPGRAM_API_KEY_HERE",
-  "YOUR_GEMINI_API_KEY_HERE"
+  "YOUR_GEMINI_API_KEY_HERE",
+  "YOUR_GOOGLE_TRANSLATE_API_KEY_HERE"
 ]);
 
 const readSecret = (value) => {
@@ -66,6 +69,7 @@ export const env = {
   mongoUri: readSecret(process.env.MONGO_URI),
   deepgramApiKey: readSecret(process.env.DEEPGRAM_API_KEY),
   geminiApiKey: readSecret(process.env.GEMINI_API_KEY),
+  googleTranslateApiKey: readSecret(process.env.GOOGLE_TRANSLATE_API_KEY || process.env.GOOGLE_API_KEY),
   hasJwtSecret: Boolean(readSecret(process.env.JWT_SECRET)),
   jwtSecret: readSecret(process.env.JWT_SECRET) || (isProductionProcess ? "" : "interp-shield-local-dev-secret-change-me"),
   jwtIssuer: process.env.JWT_ISSUER || "interp-shield",
@@ -73,17 +77,19 @@ export const env = {
   audioChunkMs: readNumber(process.env.AUDIO_CHUNK_MS, 700)
 };
 
-export const getMode = () => (env.deepgramApiKey && env.geminiApiKey ? "production" : "demo");
+export const getMode = () => (env.deepgramApiKey && (env.geminiApiKey || env.googleTranslateApiKey) ? "production" : "demo");
 
 export const getPublicConfig = () => ({
   status: "ok",
   services: {
     deepgram: true,
-    gemini: true
+    gemini: true,
+    googleTranslate: true
   },
   backend: true,
   hasDeepgramKey: Boolean(env.deepgramApiKey),
   hasGeminiKey: Boolean(env.geminiApiKey),
+  hasGoogleTranslateKey: Boolean(env.googleTranslateApiKey),
   mode: getMode(),
   maxSessionSeconds: env.maxSessionSeconds,
   audioChunkMs: env.audioChunkMs
@@ -101,7 +107,11 @@ export const warnAboutMissingConfig = () => {
   }
 
   if (!env.geminiApiKey) {
-    console.warn("Gemini key is missing. Translation requires GEMINI_API_KEY.");
+    console.warn("Gemini key is missing. Primary translation requires GEMINI_API_KEY.");
+  }
+
+  if (!env.googleTranslateApiKey) {
+    console.warn("Google Translate key is missing. Fallback translation requires GOOGLE_TRANSLATE_API_KEY.");
   }
 
   if (!env.hasJwtSecret) {
