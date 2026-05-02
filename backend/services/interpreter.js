@@ -3,6 +3,7 @@ import { translateWithGemini } from "./gemini.js";
 
 const DEMO_TRANSCRIPTS = ["Hello", "Welcome to InterpShield", "This is a real-time interpreter demo"];
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
+const TRANSLATION_FALLBACK_MESSAGE = "Translation temporarily unavailable.";
 
 const cleanTranscriptText = (text = "") => {
   return text
@@ -150,7 +151,8 @@ export const createInterpreterSession = async ({
           });
         } catch (error) {
           console.error("Gemini translation failed:", error?.message || error);
-          onError?.("Gemini translation failed. Check GEMINI_API_KEY and Gemini API access.");
+          translatedText = TRANSLATION_FALLBACK_MESSAGE;
+          onWarning?.("Translation temporarily unavailable. Retrying on the next phrase.");
         }
       }
 
