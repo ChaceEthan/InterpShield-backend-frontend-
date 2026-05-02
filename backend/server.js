@@ -13,28 +13,29 @@ warnAboutMissingConfig();
 
 const app = express();
 const server = http.createServer(app);
-const defaultClientOrigins = [
-  "http://localhost:5173",
-  "http://localhost:4173",
-  "http://localhost:3000",
-  "http://127.0.0.1:5173",
-  "https://interpshield.vercel.app"
-];
+
+const normalizeOrigin = (origin = "") => origin.trim().replace(/\/$/, "").toLowerCase();
 const configuredClientOrigins = (process.env.CLIENT_URL || "")
   .split(",")
-  .map((origin) => origin.trim().replace(/\/$/, ""))
+  .map(normalizeOrigin)
   .filter(Boolean);
-const corsOrigins = [...new Set([...defaultClientOrigins, ...env.clientOrigins, ...configuredClientOrigins])];
+const corsOrigins = configuredClientOrigins.length > 0 ? [...new Set(configuredClientOrigins)] : ["http://localhost:5173"];
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  return corsOrigins.includes(normalizeOrigin(origin));
+};
 const corsOptions = {
-  origin: corsOrigins,
+  origin(origin, callback) {
+    callback(null, isAllowedOrigin(origin));
+  },
   credentials: true,
-  methods: ["GET", "POST", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 };
 const io = new Server(server, {
   cors: {
     origin: corsOrigins,
-    methods: ["GET", "POST"],
+    methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true,
     allowedHeaders: ["Content-Type", "Authorization"]
   },
@@ -47,6 +48,7 @@ const io = new Server(server, {
 });
 
 app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 app.use((_req, res, next) => {
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
   res.removeHeader("Cross-Origin-Embedder-Policy");
