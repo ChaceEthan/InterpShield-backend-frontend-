@@ -1,7 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<resources>
-    <string name="app_name">InterpShield</string>
-    <string name="title_activity_main">InterpShield</string>
-    <string name="package_name">com.interpshield.app</string>
-    <string name="custom_url_scheme">com.interpshield.app</string>
-</resources>

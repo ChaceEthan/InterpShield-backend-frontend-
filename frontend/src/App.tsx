@@ -31,7 +31,6 @@ import { io, type Socket } from "socket.io-client";
 type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings";
 type Mode = "transcribe" | "translate" | "dubbing";
 type SessionStatus = "idle" | "connecting" | "listening" | "stopping" | "error";
-type TranslationStatus = "idle" | "pending" | "live" | "stale";
 type Plan = "free" | "pro";
 type SummaryLength = "short" | "standard" | "long";
 
@@ -81,13 +80,12 @@ interface AppConfig {
   services: {
     deepgram: boolean;
     gemini: boolean;
-    googleTranslate: boolean;
   };
   backend: boolean;
   hasDeepgramKey: boolean;
   hasGeminiKey: boolean;
-  hasGoogleTranslateKey: boolean;
-  mode: "production" | "demo";
+  hasGoogleClientId: boolean;
+  mode: "production" | "unavailable";
   maxSessionSeconds: number;
   audioChunkMs: number;
 }
@@ -118,18 +116,6 @@ interface GoogleCredentialResponse {
   select_by?: string;
 }
 
-interface SessionStartAck {
-  success?: boolean;
-  ok?: boolean;
-  error?: string;
-  mode?: string;
-}
-
-interface PendingAudioChunk {
-  audio: Blob;
-  sequence: number;
-}
-
 declare global {
   interface Window {
     google?: {
@@ -140,7 +126,6 @@ declare global {
             callback: (response: GoogleCredentialResponse) => void;
             auto_select?: boolean;
             cancel_on_tap_outside?: boolean;
-            error_callback?: (error: { type?: string; message?: string }) => void;
           }) => void;
           renderButton: (parent: HTMLElement, options: Record<string, string | boolean | number>) => void;
           prompt: (momentListener?: (notification: {
@@ -155,14 +140,9 @@ declare global {
   }
 }
 
-const API = (import.meta.env.VITE_API_URL || "").trim().replace(/\/$/, "");
-const GOOGLE_CLIENT_ID = (import.meta.env.VITE_GOOGLE_CLIENT_ID || "").trim();
-const AUDIO_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
-const TRANSLATION_PENDING_TIMEOUT_MS = 7000;
-const SESSION_START_TIMEOUT_MS = 20000;
-const SOCKET_CONNECT_TIMEOUT_MS = 10000;
-const MAX_PENDING_AUDIO_CHUNKS = 16;
-const BACKEND_UNREACHABLE_MESSAGE = "Unable to reach InterpShield backend. Check that VITE_API_URL points to the Render backend and that this frontend origin is allowed by backend CORS.";
+const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
 
@@ -253,41 +233,10 @@ const formatTime = (seconds: number) => {
 };
 
 const languageName = (code: string) => LANGUAGES.find((language) => language.code === code)?.name || code;
-const translationProviderName = (provider: string) => {
-  if (provider === "gemini") return "Gemini";
-  if (provider === "google" || provider === "googleTranslate") return "Google Translate";
-  if (provider === "mymemory") return "MyMemory";
-  if (provider === "demo") return "Demo";
-  return provider;
-};
 
 const initialView = (): View => {
   const hashView = window.location.hash.replace("#", "") as View;
   return VIEWS.includes(hashView) ? hashView : "landing";
-};
-
-const apiFailureMessage = (path: string, status: number, statusText: string, serverMessage?: string) => {
-  if (serverMessage) return serverMessage;
-  const label = statusText ? `${status} ${statusText}` : String(status);
-  return `Backend request failed (${label}) while calling ${path}.`;
-};
-
-const socketConnectionMessage = (error?: Error) => {
-  const detail = error?.message ? ` (${error.message})` : "";
-  return `Unable to reach the live interpreter${detail}. Check that VITE_API_URL points to the Render backend and Socket.IO CORS allows this origin.`;
-};
-
-const googleAuthSetupMessage = (error?: unknown) => {
-  const detail =
-    error instanceof Error
-      ? error.message
-      : typeof error === "string"
-        ? error
-        : error && typeof error === "object" && "message" in error
-          ? String((error as { message?: unknown }).message || "")
-          : "";
-  const prefix = detail ? `Google Sign-In failed: ${detail}.` : "Google Sign-In could not start.";
-  return `${prefix} Add ${window.location.origin} to the Google OAuth Authorized JavaScript origins for the VITE_GOOGLE_CLIENT_ID client.`;
 };
 
 const requestApi = async <T,>(path: string, options: RequestInit = {}, token?: string | null): Promise<T> => {
@@ -295,236 +244,24 @@ const requestApi = async <T,>(path: string, options: RequestInit = {}, token?: s
     throw new Error("Backend API URL is missing. Set VITE_API_URL and restart the frontend.");
   }
 
-  const headers = new Headers(options.headers);
-  if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  if (token) headers.set("Authorization", `Bearer ${token}`);
-
   let response: Response;
   try {
     response = await fetch(`${API}${path}`, {
       ...options,
       credentials: "include",
-      headers
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(options.headers || {})
+      }
     });
-  } catch (error) {
-    const detail = error instanceof Error && error.message ? ` (${error.message})` : "";
-    throw new Error(`${BACKEND_UNREACHABLE_MESSAGE}${detail}`);
+  } catch {
+    throw new Error("Unable to reach InterpShield backend. Make sure it is running and VITE_API_URL is correct.");
   }
 
-  const text = await response.text().catch(() => "");
-  const data = text
-    ? (() => {
-        try {
-          return JSON.parse(text);
-        } catch {
-          return { error: text };
-        }
-      })()
-    : {};
-
-  if (!response.ok) {
-    const serverMessage = typeof data?.error === "string" ? data.error : typeof data?.message === "string" ? data.message : "";
-    throw new Error(apiFailureMessage(path, response.status, response.statusText, serverMessage));
-  }
-
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Request failed.");
   return data as T;
-};
-
-const wrapCanvasText = (ctx: CanvasRenderingContext2D, text: string, maxWidth: number) => {
-  const paragraphs = (text || "").split(/\r?\n/);
-  const lines: string[] = [];
-
-  for (const paragraph of paragraphs) {
-    const cleanParagraph = paragraph.trim();
-    if (!cleanParagraph) {
-      lines.push("");
-      continue;
-    }
-
-    const words = cleanParagraph.split(/\s+/);
-    let line = "";
-
-    for (const word of words) {
-      const nextLine = line ? `${line} ${word}` : word;
-
-      if (ctx.measureText(nextLine).width <= maxWidth) {
-        line = nextLine;
-        continue;
-      }
-
-      if (line) lines.push(line);
-
-      if (ctx.measureText(word).width <= maxWidth) {
-        line = word;
-        continue;
-      }
-
-      let chunk = "";
-      for (const char of Array.from(word)) {
-        const nextChunk = `${chunk}${char}`;
-        if (ctx.measureText(nextChunk).width <= maxWidth) {
-          chunk = nextChunk;
-        } else {
-          if (chunk) lines.push(chunk);
-          chunk = char;
-        }
-      }
-      line = chunk;
-    }
-
-    if (line) lines.push(line);
-  }
-
-  return lines;
-};
-
-const canvasToJpegBlob = (canvas: HTMLCanvasElement) => {
-  return new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) {
-        resolve(blob);
-      } else {
-        reject(new Error("Unable to render PDF page."));
-      }
-    }, "image/jpeg", 0.92);
-  });
-};
-
-const createPdfFromJpegs = async (jpegBlobs: Blob[]) => {
-  const encoder = new TextEncoder();
-  const chunks: Uint8Array[] = [];
-  const offsets: number[] = [];
-  let offset = 0;
-
-  const push = (value: string | Uint8Array) => {
-    const bytes = typeof value === "string" ? encoder.encode(value) : value;
-    chunks.push(bytes);
-    offset += bytes.length;
-  };
-
-  const startObject = (id: number) => {
-    offsets[id] = offset;
-    push(`${id} 0 obj\n`);
-  };
-
-  const imageBytes = await Promise.all(jpegBlobs.map(async (blob) => new Uint8Array(await blob.arrayBuffer())));
-  const pageCount = imageBytes.length;
-  const catalogId = 1;
-  const pagesId = 2;
-  const pageEntries = imageBytes.map((_, index) => ({
-    pageId: 3 + index * 3,
-    contentId: 4 + index * 3,
-    imageId: 5 + index * 3,
-    name: `Im${index + 1}`
-  }));
-  const objectCount = 2 + pageEntries.length * 3;
-
-  push("%PDF-1.4\n%\n");
-  startObject(catalogId);
-  push(`<< /Type /Catalog /Pages ${pagesId} 0 R >>\nendobj\n`);
-
-  startObject(pagesId);
-  push(`<< /Type /Pages /Kids [${pageEntries.map((entry) => `${entry.pageId} 0 R`).join(" ")}] /Count ${pageCount} >>\nendobj\n`);
-
-  pageEntries.forEach((entry, index) => {
-    const content = `q\n612 0 0 792 0 0 cm\n/${entry.name} Do\nQ\n`;
-
-    startObject(entry.pageId);
-    push(`<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /${entry.name} ${entry.imageId} 0 R >> >> >> /Contents ${entry.contentId} 0 R >>\nendobj\n`);
-
-    startObject(entry.contentId);
-    push(`<< /Length ${encoder.encode(content).length} >>\nstream\n${content}endstream\nendobj\n`);
-
-    startObject(entry.imageId);
-    push(`<< /Type /XObject /Subtype /Image /Width 1224 /Height 1584 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${imageBytes[index].length} >>\nstream\n`);
-    push(imageBytes[index]);
-    push("\nendstream\nendobj\n");
-  });
-
-  const xrefOffset = offset;
-  push(`xref\n0 ${objectCount + 1}\n0000000000 65535 f \n`);
-  for (let id = 1; id <= objectCount; id += 1) {
-    push(`${String(offsets[id]).padStart(10, "0")} 00000 n \n`);
-  }
-  push(`trailer\n<< /Size ${objectCount + 1} /Root ${catalogId} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`);
-
-  return new Blob(chunks, { type: "application/pdf" });
-};
-
-const createHistoryPdfBlob = async (item: HistoryItem) => {
-  const width = 1224;
-  const height = 1584;
-  const margin = 96;
-  const maxWidth = width - margin * 2;
-  const bottom = height - margin;
-  const pages: HTMLCanvasElement[] = [];
-
-  const getCanvasContext = (targetCanvas: HTMLCanvasElement) => {
-    const targetContext = targetCanvas.getContext("2d");
-    if (!targetContext) throw new Error("PDF rendering is not supported in this browser.");
-    return targetContext;
-  };
-
-  let canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  let ctx = getCanvasContext(canvas);
-
-  let y = margin;
-  const resetPage = () => {
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, width, height);
-    ctx.fillStyle = "#0f172a";
-    ctx.font = "24px Arial";
-    ctx.fillText("InterpShield", margin, height - 42);
-  };
-  const newPage = () => {
-    pages.push(canvas);
-    canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    ctx = getCanvasContext(canvas);
-    y = margin;
-    resetPage();
-  };
-  const addText = (text: string, font: string, color: string, lineHeight: number, spacing = 10) => {
-    ctx.font = font;
-    ctx.fillStyle = color;
-
-    for (const line of wrapCanvasText(ctx, text, maxWidth)) {
-      if (y + lineHeight > bottom) newPage();
-      if (line) ctx.fillText(line, margin, y);
-      y += lineHeight;
-    }
-    y += spacing;
-  };
-
-  resetPage();
-  addText("Session Export", "bold 48px Arial", "#0f172a", 56, 24);
-  addText(`Timestamp: ${new Date(item.createdAt).toLocaleString()}`, "26px Arial", "#334155", 34, 4);
-  addText(`Languages: ${languageName(item.sourceLang)} to ${languageName(item.targetLang)}`, "26px Arial", "#334155", 34, 28);
-  addText("Original", "bold 30px Arial", "#0f172a", 40, 8);
-  addText(item.originalText || "No transcript text", "28px Arial", "#334155", 38, 28);
-  addText("Translation", "bold 30px Arial", "#0f172a", 40, 8);
-  addText(item.translatedText || "No translation text", "28px Arial", "#1e40af", 38, 28);
-
-  pages.push(canvas);
-
-  const jpegBlobs = await Promise.all(pages.map(canvasToJpegBlob));
-  return createPdfFromJpegs(jpegBlobs);
-};
-
-const downloadHistoryPdf = async (item: HistoryItem) => {
-  const blob = await createHistoryPdfBlob(item);
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  const timestamp = new Date(item.createdAt).toISOString().slice(0, 10);
-  link.href = url;
-  link.download = `interpshield-session-${timestamp}-${item.id}.pdf`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
 };
 
 const saveSession = (token: string, user: AppUser) => {
@@ -703,44 +440,38 @@ const GoogleSignIn = ({
   useEffect(() => {
     if (!loaded || !GOOGLE_CLIENT_ID || !window.google) return;
 
-    try {
-      window.google.accounts.id.initialize({
-        client_id: GOOGLE_CLIENT_ID,
-        auto_select: false,
-        cancel_on_tap_outside: true,
-        error_callback: (error) => onError(googleAuthSetupMessage(error)),
-        callback: (response) => {
-          if (!response.credential) {
-            onError("Google did not return a valid credential.");
-            return;
-          }
-
-          onCredential(response.credential);
+    window.google.accounts.id.initialize({
+      client_id: GOOGLE_CLIENT_ID,
+      auto_select: false,
+      cancel_on_tap_outside: true,
+      callback: (response) => {
+        if (!response.credential) {
+          onError("Google did not return a valid credential.");
+          return;
         }
-      });
 
-      if (buttonRef.current && !renderedRef.current) {
-        renderedRef.current = true;
-        const width = Math.max(240, Math.min(360, buttonRef.current.clientWidth || 360));
-
-        window.google.accounts.id.renderButton(buttonRef.current, {
-          theme: "outline",
-          size: "large",
-          text: "continue_with",
-          shape: "rectangular",
-          logo_alignment: "left",
-          width
-        });
+        onCredential(response.credential);
       }
-    } catch (error) {
-      renderedRef.current = false;
-      onError(googleAuthSetupMessage(error));
+    });
+
+    if (buttonRef.current && !renderedRef.current) {
+      renderedRef.current = true;
+      const width = Math.max(240, Math.min(360, buttonRef.current.clientWidth || 360));
+
+      window.google.accounts.id.renderButton(buttonRef.current, {
+        theme: "outline",
+        size: "large",
+        text: "continue_with",
+        shape: "rectangular",
+        logo_alignment: "left",
+        width
+      });
     }
   }, [loaded, onCredential, onError]);
 
   if (!GOOGLE_CLIENT_ID) {
     return (
-      <button type="button" onClick={() => onError("Google Sign-In is not configured. Set VITE_GOOGLE_CLIENT_ID in the frontend/Vercel environment.")} className="flex w-full items-center justify-center gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm font-black text-slate-800 shadow-lg shadow-slate-950/20 transition hover:-translate-y-0.5 hover:bg-slate-50">
+      <button type="button" onClick={() => onError("Google Sign-In is not configured for this deployment.")} className="flex w-full items-center justify-center gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm font-black text-slate-800 shadow-lg shadow-slate-950/20 transition hover:-translate-y-0.5 hover:bg-slate-50">
         <GoogleIcon />
         Continue with Google
       </button>
@@ -878,8 +609,6 @@ export default function App() {
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [chunkCount, setChunkCount] = useState(0);
   const [lastLatency, setLastLatency] = useState<number | null>(null);
-  const [translationStatus, setTranslationStatus] = useState<TranslationStatus>("idle");
-  const [translationProvider, setTranslationProvider] = useState<string | null>(null);
   const [detectedLanguage, setDetectedLanguage] = useState<string | null>(null);
 
   const [saveTranscript, setSaveTranscript] = useState(true);
@@ -904,7 +633,6 @@ export default function App() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recordingRef = useRef(false);
-  const translationPendingTimerRef = useRef<number | null>(null);
   const modeRef = useRef<Mode>("translate");
   const activeSessionPayloadRef = useRef<{
     sourceLang: string;
@@ -913,120 +641,22 @@ export default function App() {
     twoWay: boolean;
     mimeType: string;
   } | null>(null);
-
-  const clearTranslationPendingTimer = useCallback(() => {
-    if (translationPendingTimerRef.current) {
-      window.clearTimeout(translationPendingTimerRef.current);
-      translationPendingTimerRef.current = null;
-    }
-  }, []);
-
-  const setTranslationStatusSafely = useCallback((nextStatus: TranslationStatus) => {
-    clearTranslationPendingTimer();
-    setTranslationStatus(nextStatus);
-
-    if (nextStatus !== "pending") return;
-
-    translationPendingTimerRef.current = window.setTimeout(() => {
-      translationPendingTimerRef.current = null;
-      setTranslationStatus((current) => (current === "pending" ? "stale" : current));
-      setTranslationProvider((current) => current || "source");
-    }, TRANSLATION_PENDING_TIMEOUT_MS);
-  }, [clearTranslationPendingTimer]);
   const shouldRestartSessionOnReconnectRef = useRef(false);
   const sequenceRef = useRef(0);
   const sessionStartedAtRef = useRef<number | null>(null);
   const lastInterimRef = useRef("");
   const lastFinalOriginalRef = useRef("");
   const lastFinalTranslationRef = useRef("");
+  const audioChunkMsRef = useRef(700);
   const interimTimerRef = useRef<number | null>(null);
-  const audioChunkMsRef = useRef(350);
-  const sessionReadyRef = useRef(false);
-  const pendingAudioChunksRef = useRef<PendingAudioChunk[]>([]);
-
-  const flushBufferedAudio = useCallback(() => {
-    const socket = socketRef.current;
-    if (!socket?.connected || !sessionReadyRef.current || pendingAudioChunksRef.current.length === 0) return;
-
-    const bufferedChunks = pendingAudioChunksRef.current.splice(0);
-    bufferedChunks.forEach((chunk) => socket.emit("audio_chunk", chunk));
-    setChunkCount((current) => current + bufferedChunks.length);
-  }, []);
-
-  const queueOrSendAudio = useCallback((audio: Blob) => {
-    if (audio.size < 128) return;
-
-    const sequence = sequenceRef.current;
-    sequenceRef.current = sequence + 1;
-    const payload = { audio, sequence };
-    const socket = socketRef.current;
-
-    if (socket?.connected && sessionReadyRef.current) {
-      socket.emit("audio_chunk", payload);
-      setChunkCount((current) => current + 1);
-      return;
-    }
-
-    pendingAudioChunksRef.current.push(payload);
-    if (pendingAudioChunksRef.current.length > MAX_PENDING_AUDIO_CHUNKS) {
-      pendingAudioChunksRef.current.shift();
-    }
-  }, []);
-
-  const waitForSocketConnection = useCallback((socket: Socket) => {
-    if (socket.connected) return Promise.resolve();
-
-    return new Promise<void>((resolve, reject) => {
-      let settled = false;
-      let timeoutId = 0;
-
-      const cleanup = () => {
-        window.clearTimeout(timeoutId);
-        socket.off("connect", handleConnect);
-        socket.off("connect_error", handleConnectError);
-      };
-
-      const finish = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve();
-      };
-
-      const handleConnect = () => finish();
-      const handleConnectError = (error?: Error) => finish(new Error(socketConnectionMessage(error)));
-      timeoutId = window.setTimeout(() => finish(new Error("Live interpreter connection timed out.")), SOCKET_CONNECT_TIMEOUT_MS);
-
-      socket.on("connect", handleConnect);
-      socket.on("connect_error", handleConnectError);
-      socket.connect();
-    });
-  }, []);
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro";
   const isRecording = status === "connecting" || status === "listening";
-  const interpreterButtonDisabled = status === "connecting" || status === "stopping";
   const latestOriginal = interimOriginal || originalSegments.at(-1) || "";
   const latestTranslation = translatedSegments.at(-1) || "";
   const maxSessionSeconds = config?.maxSessionSeconds || 120;
-  const statusLabel = status === "connecting" ? "Connecting..." : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
-  const translationStatusLabel =
-    translationStatus === "pending"
-      ? latestTranslation
-        ? "Translating new speech. Keeping the last stable line on screen."
-        : "Preparing first translation..."
-      : translationStatus === "stale"
-        ? translationProvider === "source"
-          ? "Translation providers are recovering. Showing original speech for continuity."
-          : "Network is slow. Showing the last successful translation."
-        : translationStatus === "live"
-          ? `Stable translation${translationProvider ? ` via ${translationProviderName(translationProvider)}` : ""}.`
-          : "";
+  const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
 
   const navigate = useCallback(
     (nextView: View) => {
@@ -1043,8 +673,8 @@ export default function App() {
     try {
       const data = await requestApi<AppConfig>("/api/config");
       setConfig(data);
-    } catch (error) {
-      setAlert(error instanceof Error ? error.message : BACKEND_UNREACHABLE_MESSAGE);
+    } catch {
+      setAlert("Unable to reach InterpShield. Please try again.");
     }
   }, []);
 
@@ -1114,8 +744,8 @@ export default function App() {
       }, token);
       setUser(data.user);
       localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
-    } catch (error) {
-      setAlert(error instanceof Error ? error.message : "Unable to save settings.");
+    } catch {
+      setAlert("Unable to save settings.");
     }
   };
 
@@ -1141,7 +771,7 @@ export default function App() {
   }, [isRecording]);
 
   useEffect(() => {
-    audioChunkMsRef.current = Math.max(250, Math.min(600, config?.audioChunkMs || 350));
+    audioChunkMsRef.current = Math.max(500, Math.min(800, config?.audioChunkMs || 700));
   }, [config?.audioChunkMs]);
 
   const cleanupMedia = useCallback(() => {
@@ -1151,8 +781,6 @@ export default function App() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     recordingRef.current = false;
-    sessionReadyRef.current = false;
-    pendingAudioChunksRef.current = [];
     activeSessionPayloadRef.current = null;
     shouldRestartSessionOnReconnectRef.current = false;
     sessionStartedAtRef.current = null;
@@ -1176,101 +804,57 @@ export default function App() {
     const socket = io(API, {
       auth: { token },
       transports: ["websocket", "polling"],
-      upgrade: true,
-      rememberUpgrade: false,
       withCredentials: true,
-      autoConnect: false,
-      timeout: 20000,
       reconnection: true,
       reconnectionAttempts: 5,
-      reconnectionDelay: 650,
-      reconnectionDelayMax: 2500
+      reconnectionDelay: 650
     });
 
     socketRef.current = socket;
 
     socket.on("connect", () => {
       console.log("Socket connected");
-      setAlert((current) => (current?.startsWith("Unable to reach InterpShield backend") || current?.startsWith("Unable to reach the live interpreter") ? null : current));
+      setAlert((current) => (current === "Unable to reach InterpShield. Please try again." ? null : current));
 
       if (shouldRestartSessionOnReconnectRef.current && activeSessionPayloadRef.current) {
-        const sessionPayload = activeSessionPayloadRef.current;
         shouldRestartSessionOnReconnectRef.current = false;
-        socket.timeout(SESSION_START_TIMEOUT_MS).emit(
-          "start_session",
-          sessionPayload,
-          (timeoutError: Error | null, response?: SessionStartAck) => {
-            if (timeoutError || response?.error || response?.success === false || response?.ok === false) {
-              cleanupMedia();
-              setStatus("error");
-              setAlert(response?.error || "Interpreter session did not confirm startup. Please try again.");
-            }
-          }
-        );
+        socket.emit("start_session", activeSessionPayloadRef.current);
       }
     });
 
     socket.on("disconnect", () => {
-      sessionReadyRef.current = false;
       if (recordingRef.current) {
         shouldRestartSessionOnReconnectRef.current = true;
-        setStatus("connecting");
-        setAlert("Connection lost. Reconnecting to the live interpreter.");
+        setStatus("error");
+        setAlert("Connection lost. Your session was paused.");
       }
     });
 
-    socket.on("connect_error", (error) => {
-      sessionReadyRef.current = false;
-      if (recordingRef.current) {
-        setStatus("connecting");
-        setAlert(`${socketConnectionMessage(error)} Reconnecting...`);
-      }
-    });
-
-    socket.io.on("reconnect_failed", () => {
-      if (!recordingRef.current) return;
-      cleanupMedia();
-      setStatus("error");
-      setAlert("Unable to reconnect to the live interpreter. Check VITE_API_URL and backend Socket.IO CORS.");
+    socket.on("connect_error", () => {
+      if (recordingRef.current) setAlert("Unable to reach the live interpreter.");
     });
 
     socket.on("server-config", (serverConfig: AppConfig) => setConfig(serverConfig));
 
     const markSessionReady = () => {
-      sessionReadyRef.current = true;
       const recorder = mediaRecorderRef.current;
       if (recorder?.state === "inactive") {
-        const chunkMs = audioChunkMsRef.current;
-        recorder.start(chunkMs);
+        recorder.start(audioChunkMsRef.current);
         console.log("Mic started");
         sessionStartedAtRef.current = Date.now();
         setSessionSeconds(0);
       }
-      flushBufferedAudio();
       setStatus("listening");
     };
 
     socket.on("session_ready", markSessionReady);
     socket.on("session:ready", markSessionReady);
-    socket.on("session:closed", () => {
-      sessionReadyRef.current = false;
-      setStatus((current) => (current === "stopping" ? "idle" : current));
-    });
+    socket.on("session:closed", () => setStatus((current) => (current === "stopping" ? "idle" : current)));
     socket.on("warning", ({ message }: { message?: string }) => {
       const warning = message || "";
       if (warning.includes("session limit") || warning.includes("silence")) setAlert(warning);
     });
-    socket.on("translation_status", ({ state, provider }: { state?: TranslationStatus; provider?: string }) => {
-      if (modeRef.current === "transcribe") return;
-      if (state === "idle" || state === "pending" || state === "live" || state === "stale") {
-        setTranslationStatusSafely(state);
-      }
-      if (provider) setTranslationProvider(provider);
-    });
     const handleSessionError = ({ message }: { message?: string }) => {
-      sessionReadyRef.current = false;
-      pendingAudioChunksRef.current = [];
-      cleanupMedia();
       setStatus("error");
       setAlert(message || "Real-time processing failed.");
     };
@@ -1302,19 +886,13 @@ export default function App() {
       lastFinalOriginalRef.current = originalText;
       setInterimOriginal("");
       setOriginalSegments((current) => [...current, originalText].slice(-40));
-      if (modeRef.current !== "transcribe") setTranslationStatusSafely("pending");
       setStatus("listening");
     });
 
-    socket.on("translation_update", ({ text, latencyMs, provider, stale }: { text?: string; latencyMs?: number; provider?: string; stale?: boolean }) => {
+    socket.on("translation_update", ({ text, latencyMs }: { text?: string; latencyMs?: number }) => {
       const nextTranslation = text?.trim() || "";
+      if (!nextTranslation || nextTranslation === lastFinalTranslationRef.current) return;
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
-      if (provider) setTranslationProvider(provider);
-
-      if (!nextTranslation) return;
-
-      setTranslationStatusSafely(stale ? "stale" : "live");
-      if (nextTranslation === lastFinalTranslationRef.current) return;
 
       lastFinalTranslationRef.current = nextTranslation;
       setTranslatedSegments((current) => [...current, nextTranslation].slice(-40));
@@ -1322,13 +900,10 @@ export default function App() {
 
     return () => {
       if (interimTimerRef.current) window.clearTimeout(interimTimerRef.current);
-      clearTranslationPendingTimer();
-      sessionReadyRef.current = false;
-      pendingAudioChunksRef.current = [];
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [cleanupMedia, clearTranslationPendingTimer, flushBufferedAudio, setTranslationStatusSafely, token, user?.id]);
+  }, [token, user]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1437,27 +1012,14 @@ export default function App() {
     try {
       const data = await requestApi<{ history: HistoryItem[] }>("/api/user/history", {}, token);
       setHistory(data.history);
-    } catch (error) {
-      setAlert(error instanceof Error ? error.message : "Unable to load history.");
+    } catch {
+      setAlert("Unable to load history.");
     }
   }, [token]);
 
   useEffect(() => {
     if (view === "history") void fetchHistory();
   }, [fetchHistory, view]);
-
-  const exportHistoryPdf = useCallback(async (item: HistoryItem) => {
-    if (!isPro) {
-      navigate("pricing");
-      return;
-    }
-
-    try {
-      await downloadHistoryPdf(item);
-    } catch {
-      setAlert("Unable to export history PDF.");
-    }
-  }, [isPro, navigate]);
 
   const startSession = useCallback(async () => {
     if (!isAuthed) {
@@ -1470,11 +1032,7 @@ export default function App() {
     setDetectedLanguage(null);
     setChunkCount(0);
     setLastLatency(null);
-    setTranslationStatusSafely("idle");
-    setTranslationProvider(null);
     sequenceRef.current = 0;
-    sessionReadyRef.current = false;
-    pendingAudioChunksRef.current = [];
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
     lastFinalTranslationRef.current = "";
@@ -1496,15 +1054,7 @@ export default function App() {
     }
 
     try {
-      const socket = socketRef.current;
-
-      if (!socket) {
-        setStatus("error");
-        setAlert("Live interpreter connection is not ready. Please refresh and try again.");
-        return;
-      }
-
-      await waitForSocketConnection(socket);
+      if (!socketRef.current?.connected) socketRef.current?.connect();
 
       const audio = buildAudioConstraints({
         microphoneId,
@@ -1525,8 +1075,12 @@ export default function App() {
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (event) => {
-        if (!recordingRef.current) return;
-        queueOrSendAudio(event.data);
+        if (event.data.size < 128 || !socketRef.current?.connected) return;
+
+        socketRef.current.emit("audio_chunk", event.data);
+        console.log("Audio chunk sent");
+        sequenceRef.current += 1;
+        setChunkCount((current) => current + 1);
       };
 
       recorder.onerror = () => {
@@ -1540,19 +1094,19 @@ export default function App() {
         targetLang,
         translate: modeRef.current !== "transcribe",
         twoWay,
-        mimeType: mimeType || "audio/webm"
+        mimeType: "audio/webm"
       };
       activeSessionPayloadRef.current = sessionPayload;
       shouldRestartSessionOnReconnectRef.current = false;
 
-      socket.timeout(SESSION_START_TIMEOUT_MS).emit(
+      socketRef.current?.timeout(8000).emit(
         "start_session",
         sessionPayload,
-        (timeoutError: Error | null, response?: SessionStartAck) => {
-          if (timeoutError || response?.error || response?.success === false || response?.ok === false) {
+        (timeoutError: Error | null, response?: { ok?: boolean; error?: string }) => {
+          if (timeoutError || response?.error) {
             cleanupMedia();
             setStatus("error");
-            setAlert(response?.error || "Interpreter session did not confirm startup. Please try again.");
+            setAlert(response?.error || "Unable to reach the live interpreter.");
           }
         }
       );
@@ -1570,9 +1124,9 @@ export default function App() {
         return;
       }
 
-      setAlert(error instanceof Error ? error.message : "Microphone not detected");
+      setAlert("Microphone not detected");
     }
-  }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, queueOrSendAudio, refreshMicrophones, setTranslationStatusSafely, sourceLang, targetLang, twoWay, waitForSocketConnection]);
+  }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, refreshMicrophones, sourceLang, targetLang, twoWay]);
 
   const selectMode = (nextMode: Mode) => {
     setMode(nextMode);
@@ -1591,8 +1145,6 @@ export default function App() {
     setSessionSeconds(0);
     setChunkCount(0);
     setLastLatency(null);
-    setTranslationStatusSafely("idle");
-    setTranslationProvider(null);
     setDetectedLanguage(null);
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
@@ -1769,16 +1321,11 @@ export default function App() {
                 <p className="min-h-24 text-2xl font-black leading-snug tracking-normal text-white sm:text-3xl md:text-4xl">
                   <TypingSubtitle text={mode === "transcribe" ? latestOriginal : latestTranslation} empty="Translated subtitles appear here." />
                 </p>
-                {mode !== "transcribe" && translationStatusLabel && (
-                  <p className={`mt-4 text-xs font-bold uppercase tracking-widest ${translationStatus === "stale" ? "text-amber-200" : translationStatus === "pending" ? "text-blue-100/70" : "text-emerald-200"}`}>
-                    {translationStatusLabel}
-                  </p>
-                )}
               </div>
             </div>
 
             <div className="mt-8 flex flex-col items-center gap-3">
-              <button onClick={!isRecording ? () => void startSession() : stopSession} disabled={interpreterButtonDisabled} className={`relative flex h-20 w-20 items-center justify-center rounded-full text-white shadow-2xl transition hover:scale-105 disabled:cursor-wait disabled:opacity-70 ${isRecording ? "bg-red-500 shadow-red-500/25" : "bg-blue-500 text-white shadow-blue-500/25"}`} aria-label={isRecording ? "Stop recording" : "Start recording"}>
+              <button onClick={!isRecording ? () => void startSession() : stopSession} disabled={status === "stopping"} className={`relative flex h-20 w-20 items-center justify-center rounded-full text-white shadow-2xl transition hover:scale-105 disabled:cursor-wait disabled:opacity-70 ${isRecording ? "bg-red-500 shadow-red-500/25" : "bg-blue-500 text-white shadow-blue-500/25"}`} aria-label={isRecording ? "Stop recording" : "Start recording"}>
                 {isRecording && <span className="pulse-ring absolute inset-0 rounded-full border border-white/70" />}
                 {isRecording ? <CircleStop className="h-8 w-8" /> : <Mic className="h-8 w-8" />}
               </button>
@@ -1885,9 +1432,9 @@ export default function App() {
                 <p className="font-black text-white">{item.title}</p>
                 <p className="mt-1 text-xs font-bold uppercase tracking-widest text-slate-500">{languageName(item.sourceLang)} to {languageName(item.targetLang)} - {new Date(item.createdAt).toLocaleString()}</p>
               </div>
-              <button onClick={() => void exportHistoryPdf(item)} className="flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm font-bold text-slate-300 hover:bg-white/5">
+              <button onClick={() => (isPro ? setAlert("History export prepared.") : navigate("pricing"))} className="flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm font-bold text-slate-300 hover:bg-white/5">
                 <Download className="h-4 w-4" />
-                Export PDF
+                Export
                 {!isPro && <Lock className="h-3.5 w-3.5 text-amber-300" />}
               </button>
             </div>

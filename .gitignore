@@ -13,6 +13,3 @@ coverage/
 !.env.example
 !**/.env.example
 backend/data/*.json
-android/.gradle/
-android/app/build/
-android/build/

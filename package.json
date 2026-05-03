@@ -12,18 +12,9 @@
     "build": "npm run build --workspace backend && npm run build --workspace frontend",
     "lint": "npm run lint --workspace backend && npm run lint --workspace frontend",
     "start": "npm run start --workspace backend",
-    "clean": "npm run clean --workspace backend && npm run clean --workspace frontend",
-    "android:add": "npx cap add android",
-    "android:sync": "npm run build && npx cap sync android",
-    "android:open": "npx cap open android",
-    "android:build": "npm run build && npx cap sync android && npx cap build android"
+    "clean": "npm run clean --workspace backend && npm run clean --workspace frontend"
   },
   "devDependencies": {
-    "@capacitor/cli": "^8.3.1",
     "concurrently": "^9.1.2"
-  },
-  "dependencies": {
-    "@capacitor/android": "^8.3.1",
-    "@capacitor/core": "^8.3.1"
   }
 }

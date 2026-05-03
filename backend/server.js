@@ -14,62 +14,48 @@ warnAboutMissingConfig();
 const app = express();
 const server = http.createServer(app);
 
-const normalizeOrigin = (origin = "") => origin.trim().replace(/\/$/, "").toLowerCase();
-const corsOrigins = new Set(env.clientOrigins.map(normalizeOrigin));
-const corsMethods = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"];
-const corsAllowedHeaders = ["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"];
-const isAllowedOrigin = (origin) => {
+const isAllowedCorsOrigin = (origin) => {
   if (!origin) return true;
-  return corsOrigins.has(normalizeOrigin(origin));
-};
-const corsOrigin = (origin, callback) => {
-  callback(null, isAllowedOrigin(origin));
-};
-const applyCorsHeaders = (req, res) => {
-  const origin = req.get("origin");
 
-  if (isAllowedOrigin(origin) && origin) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.vary("Origin");
+  let parsed;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
   }
 
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Allow-Methods", corsMethods.join(", "));
-  res.setHeader("Access-Control-Allow-Headers", corsAllowedHeaders.join(", "));
+  const hostname = parsed.hostname.toLowerCase();
+  const normalizedOrigin = parsed.origin.toLowerCase();
+
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname.endsWith(".vercel.app") ||
+    env.clientOrigins.includes(normalizedOrigin)
+  );
 };
+
+const corsOrigin = (origin, callback) => {
+  callback(null, isAllowedCorsOrigin(origin));
+};
+
 const corsOptions = {
   origin: corsOrigin,
-  credentials: true,
-  methods: corsMethods,
-  allowedHeaders: corsAllowedHeaders,
-  optionsSuccessStatus: 204
+  credentials: true
 };
 const io = new Server(server, {
-  cors: corsOptions,
+  cors: {
+    origin: corsOrigin,
+    methods: ["GET", "POST"],
+    credentials: true
+  },
   transports: ["websocket", "polling"],
-  allowUpgrades: true,
   maxHttpBufferSize: 2e6,
-  pingInterval: 10000,
-  pingTimeout: 20000,
-  connectTimeout: 20000
+  pingInterval: 15000,
+  pingTimeout: 20000
 });
 
-app.use((req, res, next) => {
-  applyCorsHeaders(req, res);
-
-  if (req.method === "OPTIONS") {
-    res.sendStatus(204);
-    return;
-  }
-
-  next();
-});
 app.use(cors(corsOptions));
-app.use((_req, res, next) => {
-  res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
-  res.removeHeader("Cross-Origin-Embedder-Policy");
-  next();
-});
 app.use(express.json({ limit: "2mb" }));
 
 app.get("/", (_req, res) => {
@@ -80,12 +66,8 @@ app.get("/", (_req, res) => {
   });
 });
 
-app.get("/api/config", (_req, res, next) => {
-  try {
-    res.status(200).json(getPublicConfig());
-  } catch (error) {
-    next(error);
-  }
+app.get("/api/config", (_req, res) => {
+  res.json(getPublicConfig());
 });
 
 app.get("/api/health", (_req, res) => {
@@ -100,8 +82,7 @@ app.get("/api/health", (_req, res) => {
 app.get("/api/debug/env", (_req, res) => {
   res.json({
     deepgram: Boolean(env.deepgramApiKey),
-    gemini: Boolean(env.geminiApiKey),
-    googleTranslate: Boolean(env.googleTranslateApiKey)
+    gemini: Boolean(env.geminiApiKey)
   });
 });
 
@@ -120,9 +101,26 @@ app.use((error, _req, res, _next) => {
 
 registerInterpreterSocket(io, env, getPublicConfig);
 
-const startServer = async () => {
+const connectDatabaseSafely = async () => {
   try {
     await connectDatabase(env);
+  } catch (error) {
+    console.warn("MongoDB connection unavailable:", error?.message || error);
+  }
+};
+
+const startServer = async () => {
+  try {
+    await connectDatabaseSafely();
+
+    if (env.mongoUri) {
+      const retryDatabaseConnection = setInterval(() => {
+        if (getDatabaseStatus() !== "connected") {
+          void connectDatabaseSafely();
+        }
+      }, 30000);
+      retryDatabaseConnection.unref?.();
+    }
 
     server.listen(env.port, () => {
       console.log(`Server running on port ${env.port}`);

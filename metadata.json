@@ -1,7 +1,0 @@
-{
-  "name": "InterpShield",
-  "description": "InterpShield: Real-time AI interpretation and translation with Deepgram and Gemini.",
-  "requestFramePermissions": [
-    "microphone"
-  ]
-}

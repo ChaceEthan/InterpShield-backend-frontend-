@@ -1,54 +1,22 @@
 // @ts-nocheck
 import { DeepgramClient } from "@deepgram/sdk";
 
-const placeholderApiKeys = new Set(["", "null", "undefined", "your_deepgram_api_key", "YOUR_DEEPGRAM_API_KEY_HERE"]);
-
-const readDeepgramKey = (value) => {
-  const trimmed = value?.trim() || "";
-  const unquoted = trimmed.match(/^(['"])(.*)\1$/)?.[2] || trimmed;
-  return placeholderApiKeys.has(unquoted) ? "" : unquoted;
-};
-
 const createClient = (apiKey) => new DeepgramClient({ apiKey });
-const DEEPGRAM_OPEN_TIMEOUT_MS = 12000;
 
 const isConnectionOpen = (connection) => {
   const readyState = connection?.readyState ?? connection?.socket?.readyState;
   return readyState === 1 || readyState === "OPEN";
 };
 
-const waitForDeepgramOpen = async (connection) => {
-  const openPromise = typeof connection?.waitForOpen === "function"
-    ? connection.waitForOpen()
-    : Promise.resolve();
-
-  let timeoutId = null;
-  const timeoutPromise = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => reject(new Error("Deepgram connection failed: open timeout.")), DEEPGRAM_OPEN_TIMEOUT_MS);
-  });
-
-  try {
-    await Promise.race([openPromise, timeoutPromise]);
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
-  }
-};
-
 export const createDeepgramSession = ({
+  apiKey,
   sourceLang,
-  mimeType,
   onOpen,
   onTranscript,
   onError,
   onClose
 }) => {
-  const envApiKey = readDeepgramKey(process.env.DEEPGRAM_API_KEY);
-  console.log("Deepgram key loaded:", Boolean(envApiKey));
-
-  const runtimeApiKey = envApiKey;
-  console.log("Deepgram key exists:", Boolean(runtimeApiKey));
-
-  if (!runtimeApiKey) {
+  if (!apiKey) {
     throw new Error("Missing Deepgram API key");
   }
 
@@ -56,7 +24,6 @@ export const createDeepgramSession = ({
   let isOpen = false;
   let stopped = false;
   let keepAliveTimer = null;
-  let startupError = null;
   const queuedAudio = [];
   const maxQueuedChunks = 8;
 
@@ -78,53 +45,24 @@ export const createDeepgramSession = ({
 
   const flushQueuedAudio = () => {
     while (isOpen && isConnectionOpen(connection) && queuedAudio.length > 0) {
-      const nextChunk = queuedAudio.shift();
-
-      try {
-        sendToDeepgram(nextChunk);
-      } catch (error) {
-        queuedAudio.unshift(nextChunk);
-        onError?.(error?.message || "Unable to send queued audio to Deepgram.");
-        break;
-      }
+      sendToDeepgram(queuedAudio.shift());
     }
   };
 
-  const markOpen = () => {
-    if (isOpen) return;
-
-    isOpen = true;
-    startupError = null;
-    console.log("Deepgram connected");
-    console.log("Deepgram stream started");
-    clearKeepAlive();
-    keepAliveTimer = setInterval(() => {
-      if (isOpen && isConnectionOpen(connection) && connection?.sendKeepAlive) {
-        try {
-          connection.sendKeepAlive({ type: "KeepAlive" });
-        } catch (error) {
-          onError?.(error?.message || "Unable to keep Deepgram stream alive.");
-        }
-      }
-    }, 8000);
-    flushQueuedAudio();
-    onOpen?.();
-  };
-
   const start = async () => {
-    const deepgram = createClient(runtimeApiKey);
+    const deepgram = createClient(apiKey);
     stopped = false;
     const options = {
       model: "nova-3",
-      Authorization: `Token ${runtimeApiKey}`,
+      Authorization: `Token ${apiKey}`,
       interim_results: "true",
       punctuate: "true",
       smart_format: "true",
-      endpointing: process.env.DEEPGRAM_ENDPOINTING_MS || "180",
-      utterance_end_ms: process.env.DEEPGRAM_UTTERANCE_END_MS || "700",
+      endpointing: "300",
+      utterance_end_ms: "1000",
       vad_events: "true",
-      reconnectAttempts: 5,
-      connectionTimeoutInSeconds: 20
+      reconnectAttempts: 3,
+      connectionTimeoutInSeconds: 10
     };
 
     if (sourceLang === "auto") {
@@ -135,7 +73,18 @@ export const createDeepgramSession = ({
 
     connection = await deepgram.listen.v1.connect(options);
 
-    connection.on("open", markOpen);
+    connection.on("open", () => {
+      isOpen = true;
+      console.log("Deepgram connected");
+      console.log("Deepgram stream started");
+      keepAliveTimer = setInterval(() => {
+        if (isOpen && isConnectionOpen(connection) && connection?.sendKeepAlive) {
+          connection.sendKeepAlive();
+        }
+      }, 8000);
+      flushQueuedAudio();
+      onOpen?.();
+    });
 
     connection.on("message", (message) => {
       if (message?.type !== "Results") {
@@ -159,7 +108,6 @@ export const createDeepgramSession = ({
 
     connection.on("error", (error) => {
       console.error("Deepgram error:", error);
-      if (!isOpen) startupError = error;
       onError?.(error?.message || "Deepgram streaming error");
     });
 
@@ -167,24 +115,14 @@ export const createDeepgramSession = ({
       isOpen = false;
       clearKeepAlive();
       if (!stopped) {
-        onError?.("Deepgram stream closed. Reconnecting...");
+        onError?.("Deepgram stream closed unexpectedly.");
         return;
       }
       onClose?.();
     });
 
     connection.connect();
-    await waitForDeepgramOpen(connection);
-
-    if (startupError) {
-      throw new Error(startupError?.message || "Deepgram connection failed.");
-    }
-
-    if (!isConnectionOpen(connection)) {
-      throw new Error("Deepgram connection failed: stream did not open.");
-    }
-
-    markOpen();
+    await connection.waitForOpen();
   };
 
   const sendAudio = (buffer) => {
