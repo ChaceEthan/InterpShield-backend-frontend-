@@ -1,8 +1,6 @@
 // @ts-nocheck
 import { GoogleGenAI } from "@google/genai";
 
-const TEMPORARILY_UNAVAILABLE = "Translation temporarily unavailable";
-
 let client = null;
 let activeKey = null;
 
@@ -60,7 +58,7 @@ export const translateWithGemini = async ({ apiKey, text, sourceLang, targetLang
   }
 
   if (!apiKey) {
-    return TEMPORARILY_UNAVAILABLE;
+    return "";
   }
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -78,5 +76,5 @@ export const translateWithGemini = async ({ apiKey, text, sourceLang, targetLang
     }
   }
 
-  return TEMPORARILY_UNAVAILABLE;
+  return "";
 };

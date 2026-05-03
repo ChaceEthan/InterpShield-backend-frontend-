@@ -283,14 +283,6 @@ const formatHistoryTimestamp = (timestamp: string) => {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
 
-const escapeHtml = (value: string) =>
-  value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-
 const initialView = (): View => {
   const hashView = window.location.hash.replace("#", "") as View;
   return VIEWS.includes(hashView) ? hashView : "landing";
@@ -400,6 +392,11 @@ const SelectControl = ({
 
 const TypingSubtitle = ({ text, muted = false, empty = "Waiting for speech..." }: { text: string; muted?: boolean; empty?: string }) => {
   const [visibleText, setVisibleText] = useState("");
+  const visibleTextRef = useRef("");
+
+  useEffect(() => {
+    visibleTextRef.current = visibleText;
+  }, [visibleText]);
 
   useEffect(() => {
     const cleanText = text.trim();
@@ -408,9 +405,12 @@ const TypingSubtitle = ({ text, muted = false, empty = "Waiting for speech..." }
       return;
     }
 
-    let index = 0;
-    const step = Math.max(1, Math.ceil(cleanText.length / 80));
-    setVisibleText("");
+    const initialText = cleanText.startsWith(visibleTextRef.current) ? visibleTextRef.current : "";
+    let index = initialText.length;
+    const step = Math.max(1, Math.ceil((cleanText.length - initialText.length) / 80));
+    setVisibleText(initialText);
+
+    if (initialText === cleanText) return;
 
     const timer = window.setInterval(() => {
       index += step;
@@ -663,6 +663,9 @@ export default function App() {
   const [originalSegments, setOriginalSegments] = useState<string[]>([]);
   const [translatedSegments, setTranslatedSegments] = useState<string[]>([]);
   const [history, setHistory] = useState<TranscriptHistoryEntry[]>(readStoredTranscriptHistory);
+  const [liveText, setLiveText] = useState("");
+  const [finalText, setFinalText] = useState("");
+  const [finalTranslationText, setFinalTranslationText] = useState("");
   const [interimOriginal, setInterimOriginal] = useState("");
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [chunkCount, setChunkCount] = useState(0);
@@ -715,8 +718,8 @@ export default function App() {
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro";
   const isRecording = status === "connecting" || status === "listening";
-  const latestOriginal = interimOriginal || originalSegments.at(-1) || "";
-  const latestTranslation = translatedSegments.at(-1) || "";
+  const latestOriginal = [finalText, liveText].filter(Boolean).join(" ").trim();
+  const latestTranslation = finalTranslationText;
   const maxSessionSeconds = config?.maxSessionSeconds || 3600;
   const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
 
@@ -853,7 +856,7 @@ export default function App() {
     const original = entry.original.trim();
     const translated = entry.translated.trim();
 
-    if (!original && !translated) return;
+    if (!original || !translated || /unavailable/i.test(translated)) return;
 
     setHistory((current) => {
       const nextEntry: TranscriptHistoryEntry = {
@@ -961,6 +964,7 @@ export default function App() {
       if (detectedLanguage) setDetectedLanguage(detectedLanguage);
 
       lastInterimRef.current = originalText;
+      setLiveText(originalText);
       if (interimTimerRef.current) window.clearTimeout(interimTimerRef.current);
       interimTimerRef.current = window.setTimeout(() => {
         setInterimOriginal(originalText);
@@ -985,16 +989,11 @@ export default function App() {
       };
       pendingFinalTranscriptRef.current = pendingEntry;
       setInterimOriginal("");
+      setLiveText("");
+      setFinalText((current) => [current, originalText].filter(Boolean).join(" ").trim());
       setOriginalSegments((current) => [...current, originalText].slice(-40));
 
       if (modeRef.current === "transcribe") {
-        appendTranscriptHistory({
-          original: originalText,
-          translated: "",
-          timestamp: pendingEntry.timestamp,
-          sourceLang: pendingEntry.sourceLang,
-          targetLang: pendingEntry.targetLang
-        });
         pendingFinalTranscriptRef.current = null;
       }
 
@@ -1008,6 +1007,7 @@ export default function App() {
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
 
       lastFinalTranslationRef.current = nextTranslation;
+      setFinalTranslationText((current) => [current, nextTranslation].filter(Boolean).join(" ").trim());
       setTranslatedSegments((current) => [...current, nextTranslation].slice(-40));
       appendTranscriptHistory({
         original: pendingTranscript?.original || lastFinalOriginalRef.current,
@@ -1263,6 +1263,9 @@ export default function App() {
   const clearLiveSession = () => {
     setOriginalSegments([]);
     setTranslatedSegments([]);
+    setLiveText("");
+    setFinalText("");
+    setFinalTranslationText("");
     setInterimOriginal("");
     setSessionSeconds(0);
     setChunkCount(0);
@@ -1271,6 +1274,7 @@ export default function App() {
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
     lastFinalTranslationRef.current = "";
+    pendingFinalTranscriptRef.current = null;
     if (interimTimerRef.current) {
       window.clearTimeout(interimTimerRef.current);
       interimTimerRef.current = null;
@@ -1278,65 +1282,37 @@ export default function App() {
   };
 
   const saveHistoryAsPdf = () => {
-    if (history.length === 0) {
+    const stableHistory = history.filter((entry) => entry.original.trim() && entry.translated.trim() && !/unavailable/i.test(entry.translated));
+
+    if (stableHistory.length === 0) {
       setAlert("No transcript history to export.");
       return;
     }
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const filename = `interp-history-${timestamp}.pdf`;
-    const rows = history
+    const formattedText = stableHistory
       .map((entry) => {
         const sourceLabel = entry.sourceLang.toUpperCase();
         const targetLabel = entry.targetLang.toUpperCase();
 
-        return `
-          <section class="entry">
-            <p class="time">[${escapeHtml(formatHistoryTimestamp(entry.timestamp))}]</p>
-            <p><strong>${escapeHtml(sourceLabel)}:</strong> ${escapeHtml(entry.original || "")}</p>
-            <p><strong>${escapeHtml(targetLabel)}:</strong> ${escapeHtml(entry.translated || "")}</p>
-          </section>
-        `;
+        return [
+          `[${formatHistoryTimestamp(entry.timestamp)}]`,
+          `${sourceLabel}: ${entry.original}`,
+          `${targetLabel}: ${entry.translated}`
+        ].join("\n");
       })
-      .join("");
-    const printableHtml = `
-      <!doctype html>
-      <html>
-        <head>
-          <meta charset="utf-8" />
-          <title>${escapeHtml(filename)}</title>
-          <style>
-            body { font-family: Inter, Arial, sans-serif; color: #111827; margin: 32px; line-height: 1.55; }
-            h1 { font-size: 22px; margin: 0 0 20px; }
-            .entry { border-bottom: 1px solid #e5e7eb; padding: 14px 0; break-inside: avoid; }
-            .time { color: #64748b; font-size: 12px; margin: 0 0 8px; }
-            p { margin: 4px 0; white-space: pre-wrap; }
-          </style>
-        </head>
-        <body>
-          <h1>InterpShield Conversation History</h1>
-          ${rows}
-        </body>
-      </html>
-    `;
-    const printWindow = window.open("", "_blank");
+      .join("\n\n");
+    const blob = new Blob([formattedText], { type: "application/pdf" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
 
-    if (!printWindow) {
-      const previousTitle = document.title;
-      document.title = filename;
-      window.print();
-      window.setTimeout(() => {
-        document.title = previousTitle;
-      }, 500);
-      return;
-    }
-
-    printWindow.document.open();
-    printWindow.document.write(printableHtml);
-    printWindow.document.close();
-    printWindow.focus();
-    printWindow.print();
-    window.setTimeout(() => printWindow.close(), 500);
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 500);
   };
 
   const persistSetting = <K extends keyof UserSettings>(key: K, value: UserSettings[K]) => {
