@@ -7,6 +7,7 @@ import { connectDatabase, getDatabaseStatus } from "./config/database.js";
 import { env, getPublicConfig, warnAboutMissingConfig } from "./config/env.js";
 import { createAuthRouter } from "./routes/auth.js";
 import { createUserRouter } from "./routes/user.js";
+import { getInterpreterSessionHistory } from "./services/interpreter.js";
 import { registerInterpreterSocket } from "./sockets/interpreterSocket.js";
 
 warnAboutMissingConfig();
@@ -83,6 +84,12 @@ app.get("/api/debug/env", (_req, res) => {
   res.json({
     deepgram: Boolean(env.deepgramApiKey),
     gemini: Boolean(env.geminiApiKey)
+  });
+});
+
+app.get("/api/history/:sessionId", (req, res) => {
+  res.json({
+    history: getInterpreterSessionHistory(req.params.sessionId)
   });
 });
 

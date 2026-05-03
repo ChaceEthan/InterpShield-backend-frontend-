@@ -63,7 +63,7 @@ export const env = {
   geminiApiKey: readSecret(process.env.GEMINI_API_KEY),
   hasJwtSecret: Boolean(readSecret(process.env.JWT_SECRET)),
   jwtSecret: readSecret(process.env.JWT_SECRET),
-  maxSessionSeconds: 120,
+  maxSessionSeconds: 3600,
   audioChunkMs: 700
 };
 

@@ -111,6 +111,15 @@ interface HistoryItem {
   createdAt: string;
 }
 
+interface TranscriptHistoryEntry {
+  id: string;
+  original: string;
+  translated: string;
+  timestamp: string;
+  sourceLang: string;
+  targetLang: string;
+}
+
 interface GoogleCredentialResponse {
   credential?: string;
   select_by?: string;
@@ -142,6 +151,8 @@ declare global {
 
 const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+const TRANSCRIPT_HISTORY_STORAGE_KEY = "interp_history";
+const MAX_TRANSCRIPT_HISTORY_ENTRIES = 500;
 const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
@@ -197,6 +208,31 @@ const PRICING_PLANS = [
 const readStoredToken = () => sessionStorage.getItem("interp_shield_token") || localStorage.getItem("interp_shield_token");
 const readStoredUser = () => sessionStorage.getItem("interp_shield_user") || localStorage.getItem("interp_shield_user");
 
+const readStoredTranscriptHistory = (): TranscriptHistoryEntry[] => {
+  try {
+    const stored = localStorage.getItem(TRANSCRIPT_HISTORY_STORAGE_KEY);
+    const parsed = stored ? JSON.parse(stored) : [];
+
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter((entry): entry is TranscriptHistoryEntry => {
+        return Boolean(entry && typeof entry === "object" && "original" in entry && "translated" in entry && "timestamp" in entry);
+      })
+      .map((entry) => ({
+        id: entry.id || `${entry.timestamp}-${entry.original}`,
+        original: String(entry.original || ""),
+        translated: String(entry.translated || ""),
+        timestamp: String(entry.timestamp || new Date().toISOString()),
+        sourceLang: String(entry.sourceLang || "auto"),
+        targetLang: String(entry.targetLang || "")
+      }))
+      .slice(-MAX_TRANSCRIPT_HISTORY_ENTRIES);
+  } catch {
+    return [];
+  }
+};
+
 const getSupportedMimeType = () => {
   if (typeof window === "undefined" || !("MediaRecorder" in window)) return "";
   return AUDIO_MIME_TYPES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) || "";
@@ -227,12 +263,33 @@ const buildAudioConstraints = ({
 };
 
 const formatTime = (seconds: number) => {
+  if (seconds >= 3600) {
+    const hours = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    return `${hours.toString().padStart(2, "0")}:${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+  }
+
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
   return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
 };
 
 const languageName = (code: string) => LANGUAGES.find((language) => language.code === code)?.name || code;
+
+const formatHistoryTimestamp = (timestamp: string) => {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "--:--";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+};
+
+const escapeHtml = (value: string) =>
+  value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 
 const initialView = (): View => {
   const hashView = window.location.hash.replace("#", "") as View;
@@ -592,7 +649,7 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [alert, setAlert] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [savedHistory, setSavedHistory] = useState<HistoryItem[]>([]);
   const [billingCycle, setBillingCycle] = useState<"monthly" | "yearly">("monthly");
   const [microphones, setMicrophones] = useState<MediaDeviceInfo[]>([]);
 
@@ -605,6 +662,7 @@ export default function App() {
   const [status, setStatus] = useState<SessionStatus>("idle");
   const [originalSegments, setOriginalSegments] = useState<string[]>([]);
   const [translatedSegments, setTranslatedSegments] = useState<string[]>([]);
+  const [history, setHistory] = useState<TranscriptHistoryEntry[]>(readStoredTranscriptHistory);
   const [interimOriginal, setInterimOriginal] = useState("");
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [chunkCount, setChunkCount] = useState(0);
@@ -634,6 +692,8 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const recordingRef = useRef(false);
   const modeRef = useRef<Mode>("translate");
+  const sourceLangRef = useRef(sourceLang);
+  const targetLangRef = useRef(targetLang);
   const activeSessionPayloadRef = useRef<{
     sourceLang: string;
     targetLang: string;
@@ -647,15 +707,17 @@ export default function App() {
   const lastInterimRef = useRef("");
   const lastFinalOriginalRef = useRef("");
   const lastFinalTranslationRef = useRef("");
+  const pendingFinalTranscriptRef = useRef<Pick<TranscriptHistoryEntry, "original" | "timestamp" | "sourceLang" | "targetLang"> | null>(null);
   const audioChunkMsRef = useRef(700);
   const interimTimerRef = useRef<number | null>(null);
+  const historyEndRef = useRef<HTMLDivElement | null>(null);
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro";
   const isRecording = status === "connecting" || status === "listening";
   const latestOriginal = interimOriginal || originalSegments.at(-1) || "";
   const latestTranslation = translatedSegments.at(-1) || "";
-  const maxSessionSeconds = config?.maxSessionSeconds || 120;
+  const maxSessionSeconds = config?.maxSessionSeconds || 3600;
   const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
 
   const navigate = useCallback(
@@ -767,12 +829,43 @@ export default function App() {
   }, [mode]);
 
   useEffect(() => {
+    sourceLangRef.current = sourceLang;
+    targetLangRef.current = targetLang;
+  }, [sourceLang, targetLang]);
+
+  useEffect(() => {
     recordingRef.current = isRecording;
   }, [isRecording]);
 
   useEffect(() => {
     audioChunkMsRef.current = Math.max(500, Math.min(800, config?.audioChunkMs || 700));
   }, [config?.audioChunkMs]);
+
+  useEffect(() => {
+    localStorage.setItem(TRANSCRIPT_HISTORY_STORAGE_KEY, JSON.stringify(history));
+  }, [history]);
+
+  useEffect(() => {
+    historyEndRef.current?.scrollIntoView({ block: "end" });
+  }, [history.length]);
+
+  const appendTranscriptHistory = useCallback((entry: Omit<TranscriptHistoryEntry, "id">) => {
+    const original = entry.original.trim();
+    const translated = entry.translated.trim();
+
+    if (!original && !translated) return;
+
+    setHistory((current) => {
+      const nextEntry: TranscriptHistoryEntry = {
+        ...entry,
+        id: `${entry.timestamp}-${current.length}-${Math.random().toString(36).slice(2, 8)}`,
+        original,
+        translated
+      };
+
+      return [...current, nextEntry].slice(-MAX_TRANSCRIPT_HISTORY_ENTRIES);
+    });
+  }, []);
 
   const cleanupMedia = useCallback(() => {
     const recorder = mediaRecorderRef.current;
@@ -876,7 +969,7 @@ export default function App() {
       setStatus("listening");
     });
 
-    socket.on("transcript_final", ({ text, detectedLanguage, latencyMs }: { text?: string; detectedLanguage?: string; latencyMs?: number }) => {
+    socket.on("transcript_final", ({ text, detectedLanguage, latencyMs, sourceLang: eventSourceLang, targetLang: eventTargetLang }: { text?: string; detectedLanguage?: string; latencyMs?: number; sourceLang?: string; targetLang?: string }) => {
       const originalText = text?.trim() || "";
       if (!originalText || originalText === lastFinalOriginalRef.current) return;
       if (detectedLanguage) setDetectedLanguage(detectedLanguage);
@@ -884,18 +977,46 @@ export default function App() {
 
       lastInterimRef.current = "";
       lastFinalOriginalRef.current = originalText;
+      const pendingEntry = {
+        original: originalText,
+        timestamp: new Date().toISOString(),
+        sourceLang: detectedLanguage || eventSourceLang || sourceLangRef.current,
+        targetLang: eventTargetLang || targetLangRef.current
+      };
+      pendingFinalTranscriptRef.current = pendingEntry;
       setInterimOriginal("");
       setOriginalSegments((current) => [...current, originalText].slice(-40));
+
+      if (modeRef.current === "transcribe") {
+        appendTranscriptHistory({
+          original: originalText,
+          translated: "",
+          timestamp: pendingEntry.timestamp,
+          sourceLang: pendingEntry.sourceLang,
+          targetLang: pendingEntry.targetLang
+        });
+        pendingFinalTranscriptRef.current = null;
+      }
+
       setStatus("listening");
     });
 
-    socket.on("translation_update", ({ text, latencyMs }: { text?: string; latencyMs?: number }) => {
+    socket.on("translation_update", ({ text, latencyMs, sourceLang: eventSourceLang, targetLang: eventTargetLang }: { text?: string; latencyMs?: number; sourceLang?: string; targetLang?: string }) => {
       const nextTranslation = text?.trim() || "";
-      if (!nextTranslation || nextTranslation === lastFinalTranslationRef.current) return;
+      const pendingTranscript = pendingFinalTranscriptRef.current;
+      if (!nextTranslation || (!pendingTranscript && nextTranslation === lastFinalTranslationRef.current)) return;
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
 
       lastFinalTranslationRef.current = nextTranslation;
       setTranslatedSegments((current) => [...current, nextTranslation].slice(-40));
+      appendTranscriptHistory({
+        original: pendingTranscript?.original || lastFinalOriginalRef.current,
+        translated: nextTranslation,
+        timestamp: pendingTranscript?.timestamp || new Date().toISOString(),
+        sourceLang: eventSourceLang || pendingTranscript?.sourceLang || sourceLangRef.current,
+        targetLang: eventTargetLang || pendingTranscript?.targetLang || targetLangRef.current
+      });
+      pendingFinalTranscriptRef.current = null;
     });
 
     return () => {
@@ -1011,7 +1132,7 @@ export default function App() {
 
     try {
       const data = await requestApi<{ history: HistoryItem[] }>("/api/user/history", {}, token);
-      setHistory(data.history);
+      setSavedHistory(data.history);
     } catch {
       setAlert("Unable to load history.");
     }
@@ -1036,6 +1157,7 @@ export default function App() {
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
     lastFinalTranslationRef.current = "";
+    pendingFinalTranscriptRef.current = null;
     if (interimTimerRef.current) {
       window.clearTimeout(interimTimerRef.current);
       interimTimerRef.current = null;
@@ -1153,6 +1275,68 @@ export default function App() {
       window.clearTimeout(interimTimerRef.current);
       interimTimerRef.current = null;
     }
+  };
+
+  const saveHistoryAsPdf = () => {
+    if (history.length === 0) {
+      setAlert("No transcript history to export.");
+      return;
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `interp-history-${timestamp}.pdf`;
+    const rows = history
+      .map((entry) => {
+        const sourceLabel = entry.sourceLang.toUpperCase();
+        const targetLabel = entry.targetLang.toUpperCase();
+
+        return `
+          <section class="entry">
+            <p class="time">[${escapeHtml(formatHistoryTimestamp(entry.timestamp))}]</p>
+            <p><strong>${escapeHtml(sourceLabel)}:</strong> ${escapeHtml(entry.original || "")}</p>
+            <p><strong>${escapeHtml(targetLabel)}:</strong> ${escapeHtml(entry.translated || "")}</p>
+          </section>
+        `;
+      })
+      .join("");
+    const printableHtml = `
+      <!doctype html>
+      <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>${escapeHtml(filename)}</title>
+          <style>
+            body { font-family: Inter, Arial, sans-serif; color: #111827; margin: 32px; line-height: 1.55; }
+            h1 { font-size: 22px; margin: 0 0 20px; }
+            .entry { border-bottom: 1px solid #e5e7eb; padding: 14px 0; break-inside: avoid; }
+            .time { color: #64748b; font-size: 12px; margin: 0 0 8px; }
+            p { margin: 4px 0; white-space: pre-wrap; }
+          </style>
+        </head>
+        <body>
+          <h1>InterpShield Conversation History</h1>
+          ${rows}
+        </body>
+      </html>
+    `;
+    const printWindow = window.open("", "_blank");
+
+    if (!printWindow) {
+      const previousTitle = document.title;
+      document.title = filename;
+      window.print();
+      window.setTimeout(() => {
+        document.title = previousTitle;
+      }, 500);
+      return;
+    }
+
+    printWindow.document.open();
+    printWindow.document.write(printableHtml);
+    printWindow.document.close();
+    printWindow.focus();
+    printWindow.print();
+    window.setTimeout(() => printWindow.close(), 500);
   };
 
   const persistSetting = <K extends keyof UserSettings>(key: K, value: UserSettings[K]) => {
@@ -1332,11 +1516,40 @@ export default function App() {
               <p className="text-sm font-bold text-slate-300">Press and hold to talk</p>
               <div className="flex flex-wrap justify-center gap-2 text-xs">
                 <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 font-mono text-slate-300"><Timer className="h-3.5 w-3.5 text-slate-500" />{formatTime(sessionSeconds)}</span>
-                <span className="rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 font-bold uppercase tracking-wider text-slate-500">2 min max session</span>
+                <span className="rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 font-bold uppercase tracking-wider text-slate-500">1 hr safety limit</span>
                 {chunkCount > 0 && <span className="rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 font-bold text-slate-500">{chunkCount} chunks</span>}
                 {lastLatency !== null && <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 font-bold text-emerald-300">{lastLatency}ms</span>}
               </div>
             </div>
+          </div>
+        </GlassPanel>
+
+        <GlassPanel className="overflow-hidden">
+          <div className="flex flex-col gap-3 border-b border-white/10 px-5 py-4 md:flex-row md:items-center md:justify-between">
+            <div>
+              <p className="text-xs font-bold uppercase tracking-widest text-slate-500">Conversation history</p>
+              <p className="mt-1 text-sm font-semibold text-slate-400">{history.length} saved transcript lines</p>
+            </div>
+            <button onClick={saveHistoryAsPdf} disabled={history.length === 0} className="flex w-fit items-center gap-2 rounded-lg border border-white/10 bg-slate-950/70 px-4 py-2 text-sm font-bold text-slate-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40">
+              <Download className="h-4 w-4" />
+              Save as PDF
+            </button>
+          </div>
+          <div className="max-h-72 overflow-y-auto px-5 py-4">
+            {history.length === 0 ? (
+              <p className="rounded-lg border border-white/10 bg-slate-950/50 p-4 text-sm text-slate-500">Final transcripts will stay here during long sessions and after refresh.</p>
+            ) : (
+              <div className="space-y-3">
+                {history.map((entry) => (
+                  <div key={entry.id} className="rounded-lg border border-white/10 bg-slate-950/55 p-4">
+                    <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-600">[{formatHistoryTimestamp(entry.timestamp)}]</p>
+                    <p className="text-sm leading-6 text-slate-300"><span className="font-black text-slate-100">{entry.sourceLang.toUpperCase()}:</span> {entry.original || "No transcript text"}</p>
+                    <p className="mt-2 text-sm leading-6 text-blue-50"><span className="font-black text-blue-200">{entry.targetLang.toUpperCase()}:</span> {entry.translated || "No translation text"}</p>
+                  </div>
+                ))}
+                <div ref={historyEndRef} />
+              </div>
+            )}
           </div>
         </GlassPanel>
 
@@ -1424,8 +1637,8 @@ export default function App() {
         <button onClick={() => void fetchHistory()} className="rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-sm font-bold text-slate-200 hover:bg-white/10">Refresh</button>
       </div>
       <div className="space-y-3">
-        {history.length === 0 && <GlassPanel className="p-6 text-sm text-slate-500">No saved sessions yet.</GlassPanel>}
-        {history.map((item) => (
+        {savedHistory.length === 0 && <GlassPanel className="p-6 text-sm text-slate-500">No saved sessions yet.</GlassPanel>}
+        {savedHistory.map((item) => (
           <GlassPanel key={item.id} className="p-5">
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>

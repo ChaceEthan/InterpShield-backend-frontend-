@@ -121,11 +121,12 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
         sessionTimer = setTimeout(() => {
           stopSession();
-          socket.emit("warning", { message: "Two minute session limit reached." });
+          socket.emit("warning", { message: "One hour safety session limit reached." });
           socket.emit("session:closed");
         }, env.maxSessionSeconds * 1000);
+        sessionTimer.unref?.();
 
-        ack?.({ ok: true, mode: "production" });
+        ack?.({ ok: true, mode: "production", sessionId: session.sessionId });
       } catch (error) {
         console.error("Interpreter session start failed:", error?.message || error);
         const message = startErrorMessage(error);
