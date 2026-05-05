@@ -4,6 +4,7 @@ import { translateWithGemini } from "./gemini.js";
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
 const MAX_TRANSCRIPT_HISTORY = 500;
 const MAX_STORED_SESSIONS = 100;
+const MAX_TARGET_LANGUAGES = 3;
 const SENTENCE_DEBOUNCE_MS = 1000;
 const SILENCE_DEBOUNCE_MS = 1400;
 const sessionHistoryStore = new Map();
@@ -31,12 +32,72 @@ export const getInterpreterSessionHistory = (sessionId) => {
 };
 
 const cleanTranscriptText = (text = "") => {
-  return text
+  const compactText = text
     .replace(FILLER_PATTERN, "")
     .replace(/\s+/g, " ")
     .replace(/\s+([,.;:!?])/g, "$1")
     .replace(/([,.;:!?]){2,}/g, "$1")
     .trim();
+
+  return removeRepeatedFragments(compactText);
+};
+
+const normalizeNoiseToken = (word = "") => word.toLowerCase().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+
+const removeRepeatedFragments = (text = "") => {
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length < 2) return text;
+
+  const normalizedWords = () => words.map(normalizeNoiseToken);
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    const normalized = normalizedWords();
+    const maxFragmentSize = Math.min(8, Math.floor(words.length / 2));
+
+    for (let fragmentSize = maxFragmentSize; fragmentSize >= 1; fragmentSize -= 1) {
+      for (let index = 0; index + fragmentSize * 2 <= words.length; index += 1) {
+        const first = normalized.slice(index, index + fragmentSize);
+        const second = normalized.slice(index + fragmentSize, index + fragmentSize * 2);
+
+        if (first.some(Boolean) && first.join(" ") === second.join(" ")) {
+          words.splice(index + fragmentSize, fragmentSize);
+          changed = true;
+          break;
+        }
+      }
+
+      if (changed) break;
+    }
+  }
+
+  return words.join(" ").trim();
+};
+
+const hasMeaningfulTranslationText = (text = "") =>
+  text
+    .split(/\s+/)
+    .map(normalizeNoiseToken)
+    .some((word) => word.length >= 3);
+
+const normalizeTargetLanguages = (targetLanguages, fallbackTargetLang = "es") => {
+  const requestedLanguages = Array.isArray(targetLanguages)
+    ? targetLanguages
+    : targetLanguages
+      ? [targetLanguages]
+      : [fallbackTargetLang];
+
+  const uniqueLanguages = [];
+
+  for (const language of requestedLanguages) {
+    const code = String(language || "").trim();
+    if (!code || uniqueLanguages.includes(code)) continue;
+    uniqueLanguages.push(code);
+    if (uniqueLanguages.length === MAX_TARGET_LANGUAGES) break;
+  }
+
+  return uniqueLanguages.length > 0 ? uniqueLanguages : [fallbackTargetLang || "es"];
 };
 
 const prepareTextForTranslation = (text = "") => {
@@ -64,15 +125,17 @@ const appendSentenceChunk = (sentence = "", chunk = "") => {
   return `${cleanSentence} ${cleanChunk}`.replace(/\s+/g, " ").trim();
 };
 
-const resolveDirection = ({ sourceLang, targetLang, detectedLanguage, twoWay }) => {
+const resolveDirection = ({ sourceLang, targetLang, targetLanguages, detectedLanguage, twoWay }) => {
   void twoWay;
-  return { source: detectedLanguage || sourceLang, target: targetLang };
+  const targets = normalizeTargetLanguages(targetLanguages, targetLang);
+  return { source: detectedLanguage || sourceLang, target: targets[0], targets };
 };
 
 export const createInterpreterSession = async ({
   env,
   sourceLang,
   targetLang,
+  targetLanguages,
   shouldTranslate,
   twoWay,
   onReady,
@@ -85,7 +148,8 @@ export const createInterpreterSession = async ({
   let lastInterimTranscript = "";
   let lastTranslatedTranscript = "";
   let currentSentence = "";
-  let currentDirection = { source: sourceLang, target: targetLang };
+  const sessionTargetLanguages = normalizeTargetLanguages(targetLanguages, targetLang);
+  let currentDirection = { source: sourceLang, target: sessionTargetLanguages[0], targets: sessionTargetLanguages };
   let currentDetectedLanguage = null;
   let translationTimer = null;
   const sessionId = createSessionId();
@@ -107,28 +171,44 @@ export const createInterpreterSession = async ({
     currentSentence = "";
     lastInterimTranscript = "";
 
-    if (!sentence || sentence.length < 3 || normalizedSentence === lastTranslatedTranscript) {
+    if (!sentence || !hasMeaningfulTranslationText(sentence) || normalizedSentence === lastTranslatedTranscript) {
       return;
     }
 
     const startedAt = Date.now();
     const translationInput = prepareTextForTranslation(sentence);
-    const translatedText = shouldTranslate
-      ? await translateWithGemini({
-          apiKey: env.geminiApiKey,
-          text: translationInput,
-          sourceLang: direction.source,
-          targetLang: direction.target
-        })
-      : "";
+    const translations = {};
+
+    if (shouldTranslate) {
+      const translatedEntries = await Promise.all(
+        direction.targets.map(async (language) => [
+          language,
+          await translateWithGemini({
+            apiKey: env.geminiApiKey,
+            text: translationInput,
+            sourceLang: direction.source,
+            targetLang: language
+          })
+        ])
+      );
+
+      for (const [language, translatedText] of translatedEntries) {
+        if (translatedText) translations[language] = translatedText;
+      }
+    }
+
+    const translatedText = translations[direction.target] || Object.values(translations).find(Boolean) || "";
 
     if (shouldTranslate && !translatedText) {
       onResult?.({
+        original: sentence,
         originalText: sentence,
         translatedText: "",
+        translations: {},
         isFinal: true,
         sourceLang: direction.source,
         targetLang: direction.target,
+        targetLanguages: direction.targets,
         detectedLanguage,
         latencyMs: Date.now() - startedAt,
         mode: "production"
@@ -142,9 +222,11 @@ export const createInterpreterSession = async ({
       const transcriptEntry = {
         original: sentence,
         translated: translatedText,
+        translations,
         timestamp: new Date(),
         sourceLang: direction.source,
-        targetLang: direction.target
+        targetLang: direction.target,
+        targetLanguages: direction.targets
       };
 
       session.transcriptHistory.push(transcriptEntry);
@@ -154,11 +236,14 @@ export const createInterpreterSession = async ({
     }
 
     onResult?.({
+      original: sentence,
       originalText: sentence,
       translatedText,
+      translations,
       isFinal: true,
       sourceLang: direction.source,
       targetLang: direction.target,
+      targetLanguages: direction.targets,
       detectedLanguage,
       latencyMs: Date.now() - startedAt,
       mode: "production"
@@ -188,7 +273,7 @@ export const createInterpreterSession = async ({
     },
     onClose: onClosed,
     onTranscript: async ({ text, isFinal, detectedLanguage }) => {
-      const direction = resolveDirection({ sourceLang, targetLang, detectedLanguage, twoWay });
+      const direction = resolveDirection({ sourceLang, targetLang, targetLanguages: sessionTargetLanguages, detectedLanguage, twoWay });
       const displayText = cleanTranscriptText(text);
       const normalized = normalizeTranscript(displayText);
 
@@ -211,6 +296,7 @@ export const createInterpreterSession = async ({
           isFinal: false,
           sourceLang: direction.source,
           targetLang: direction.target,
+          targetLanguages: direction.targets,
           detectedLanguage
         });
         return;

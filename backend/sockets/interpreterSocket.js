@@ -2,6 +2,8 @@
 import { verifyToken } from "../services/authService.js";
 import { createInterpreterSession } from "../services/interpreter.js";
 
+const MAX_TARGET_LANGUAGES = 3;
+
 const audioPayloadToBuffer = (audio) => {
   if (Buffer.isBuffer(audio)) return audio;
   if (audio instanceof ArrayBuffer) return Buffer.from(audio);
@@ -10,6 +12,25 @@ const audioPayloadToBuffer = (audio) => {
 
   const payload = typeof audio === "string" && audio.includes(",") ? audio.split(",").pop() : audio;
   return Buffer.from(payload || "", "base64");
+};
+
+const normalizeTargetLanguages = (targetLanguages, fallbackTargetLang = "es") => {
+  const requestedLanguages = Array.isArray(targetLanguages)
+    ? targetLanguages
+    : targetLanguages
+      ? [targetLanguages]
+      : [fallbackTargetLang];
+
+  const uniqueLanguages = [];
+
+  for (const language of requestedLanguages) {
+    const code = String(language || "").trim();
+    if (!code || uniqueLanguages.includes(code)) continue;
+    uniqueLanguages.push(code);
+    if (uniqueLanguages.length === MAX_TARGET_LANGUAGES) break;
+  }
+
+  return uniqueLanguages.length > 0 ? uniqueLanguages : [fallbackTargetLang || "es"];
 };
 
 export const registerInterpreterSocket = (io, env, getPublicConfig) => {
@@ -60,6 +81,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           text: result.originalText,
           sourceLang: result.sourceLang,
           targetLang: result.targetLang,
+          targetLanguages: result.targetLanguages || [result.targetLang],
           detectedLanguage: result.detectedLanguage
         });
         socket.emit("result", result);
@@ -70,15 +92,21 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         text: result.originalText,
         sourceLang: result.sourceLang,
         targetLang: result.targetLang,
+        targetLanguages: result.targetLanguages || [result.targetLang],
         detectedLanguage: result.detectedLanguage,
         latencyMs: result.latencyMs
       });
 
-      if (result.translatedText) {
+      const translations = result.translations || (result.translatedText ? { [result.targetLang]: result.translatedText } : {});
+
+      if (Object.keys(translations).length > 0) {
         socket.emit("translation_update", {
+          original: result.originalText,
           text: result.translatedText,
+          translations,
           sourceLang: result.sourceLang,
           targetLang: result.targetLang,
+          targetLanguages: result.targetLanguages || [result.targetLang],
           latencyMs: result.latencyMs
         });
       }
@@ -90,11 +118,12 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       stopSession();
 
       const sourceLang = payload.sourceLang || "en";
-      const targetLang = payload.targetLang || "es";
+      const targetLanguages = normalizeTargetLanguages(payload.targetLanguages, payload.targetLang || "es");
+      const targetLang = targetLanguages[0];
       const shouldTranslate = payload.translate !== false;
       const twoWay = Boolean(payload.twoWay);
       lastSequence = -1;
-      console.log("Interpreter session starts", { socketId: socket.id, sourceLang, targetLang, shouldTranslate, twoWay });
+      console.log("Interpreter session starts", { socketId: socket.id, sourceLang, targetLang, targetLanguages, shouldTranslate, twoWay });
 
       try {
         if (!env.deepgramApiKey) {
@@ -105,6 +134,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           env,
           sourceLang,
           targetLang,
+          targetLanguages,
           shouldTranslate,
           twoWay,
           onReady: () => {
@@ -126,7 +156,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         }, env.maxSessionSeconds * 1000);
         sessionTimer.unref?.();
 
-        ack?.({ ok: true, mode: "production", sessionId: session.sessionId });
+        ack?.({ ok: true, mode: "production", sessionId: session.sessionId, targetLanguages });
       } catch (error) {
         console.error("Interpreter session start failed:", error?.message || error);
         const message = startErrorMessage(error);

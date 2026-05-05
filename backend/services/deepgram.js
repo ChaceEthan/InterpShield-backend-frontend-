@@ -55,12 +55,12 @@ export const createDeepgramSession = ({
     const options = {
       model: "nova-3",
       Authorization: `Token ${apiKey}`,
-      interim_results: "true",
-      punctuate: "true",
-      smart_format: "true",
-      endpointing: "300",
-      utterance_end_ms: "1000",
-      vad_events: "true",
+      interim_results: true,
+      punctuate: true,
+      smart_format: true,
+      endpointing: 300,
+      utterance_end_ms: 1000,
+      vad_events: true,
       reconnectAttempts: 3,
       connectionTimeoutInSeconds: 10
     };

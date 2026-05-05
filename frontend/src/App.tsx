@@ -45,6 +45,7 @@ interface UserSettings {
   shareableMode?: boolean;
   preferredSourceLang?: string;
   preferredTargetLang?: string;
+  preferredTargetLanguages?: string[];
   saveTranscript?: boolean;
   saveAudio?: boolean;
   speakerDetection?: boolean;
@@ -93,9 +94,11 @@ interface AppConfig {
 interface InterpretationResult {
   originalText: string;
   translatedText: string;
+  translations?: Record<string, string>;
   isFinal: boolean;
   sourceLang: string;
   targetLang: string;
+  targetLanguages?: string[];
   detectedLanguage?: string;
   latencyMs?: number;
 }
@@ -115,9 +118,11 @@ interface TranscriptHistoryEntry {
   id: string;
   original: string;
   translated: string;
+  translations?: Record<string, string>;
   timestamp: string;
   sourceLang: string;
   targetLang: string;
+  targetLanguages?: string[];
 }
 
 interface GoogleCredentialResponse {
@@ -127,6 +132,7 @@ interface GoogleCredentialResponse {
 
 declare global {
   interface Window {
+    webkitAudioContext?: typeof AudioContext;
     google?: {
       accounts: {
         id: {
@@ -153,6 +159,8 @@ const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const TRANSCRIPT_HISTORY_STORAGE_KEY = "interp_history";
 const MAX_TRANSCRIPT_HISTORY_ENTRIES = 500;
+const MAX_TARGET_LANGUAGES = 3;
+const DEFAULT_TARGET_LANGUAGES = ["es"];
 const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
@@ -181,6 +189,42 @@ const TOOL_ITEMS: Array<{ mode: Mode; label: string; icon: LucideIcon }> = [
   { mode: "dubbing", label: "Dubbing", icon: Volume2 }
 ];
 
+const LANGUAGE_FLAGS: Record<string, string> = {
+  en: "🇺🇸",
+  es: "🇪🇸",
+  fr: "🇫🇷",
+  de: "🇩🇪",
+  it: "🇮🇹",
+  pt: "🇵🇹",
+  nl: "🇳🇱",
+  ar: "🇸🇦",
+  zh: "🇨🇳",
+  ja: "🇯🇵",
+  ko: "🇰🇷",
+  hi: "🇮🇳",
+  tr: "🇹🇷",
+  pl: "🇵🇱",
+  ru: "🇷🇺"
+};
+
+const SPEECH_SYNTHESIS_LANGS: Record<string, string> = {
+  en: "en-US",
+  es: "es-ES",
+  fr: "fr-FR",
+  de: "de-DE",
+  it: "it-IT",
+  pt: "pt-PT",
+  nl: "nl-NL",
+  ar: "ar-SA",
+  zh: "zh-CN",
+  ja: "ja-JP",
+  ko: "ko-KR",
+  hi: "hi-IN",
+  tr: "tr-TR",
+  pl: "pl-PL",
+  ru: "ru-RU"
+};
+
 const PRICING_PLANS = [
   {
     name: "Basic",
@@ -205,6 +249,61 @@ const PRICING_PLANS = [
   }
 ];
 
+const normalizeTargetLanguages = (languages?: unknown, fallback = DEFAULT_TARGET_LANGUAGES[0]) => {
+  const requestedLanguages = Array.isArray(languages) ? languages : languages ? [languages] : [fallback];
+  const validCodes = new Set(LANGUAGES.map((language) => language.code));
+  const normalized: string[] = [];
+
+  for (const language of requestedLanguages) {
+    const code = String(language || "").trim();
+    if (!code || !validCodes.has(code) || normalized.includes(code)) continue;
+    normalized.push(code);
+    if (normalized.length === MAX_TARGET_LANGUAGES) break;
+  }
+
+  if (normalized.length > 0) return normalized;
+  return validCodes.has(fallback) ? [fallback] : DEFAULT_TARGET_LANGUAGES;
+};
+
+const normalizeTranslationMap = (translations?: unknown, fallbackText = "", fallbackLang = DEFAULT_TARGET_LANGUAGES[0]) => {
+  const normalized: Record<string, string> = {};
+
+  if (translations && typeof translations === "object" && !Array.isArray(translations)) {
+    for (const [language, translatedText] of Object.entries(translations as Record<string, unknown>)) {
+      const text = String(translatedText || "").trim();
+      if (language && text) normalized[language] = text;
+    }
+  }
+
+  const cleanFallbackText = fallbackText.trim();
+  if (Object.keys(normalized).length === 0 && cleanFallbackText) {
+    normalized[fallbackLang] = cleanFallbackText;
+  }
+
+  return normalized;
+};
+
+const orderedTranslationEntries = (translations: Record<string, string>, targetLanguages: string[]) => {
+  const knownLanguages = normalizeTargetLanguages(targetLanguages);
+  const orderedEntries = knownLanguages
+    .map((language) => [language, translations[language]?.trim() || ""] as const)
+    .filter(([, translatedText]) => Boolean(translatedText));
+
+  for (const [language, translatedText] of Object.entries(translations)) {
+    if (!knownLanguages.includes(language) && translatedText.trim()) orderedEntries.push([language, translatedText.trim()]);
+  }
+
+  return orderedEntries.slice(0, MAX_TARGET_LANGUAGES);
+};
+
+const formatTranslationsText = (translations: Record<string, string>, targetLanguages: string[]) =>
+  orderedTranslationEntries(translations, targetLanguages)
+    .map(([language, translatedText]) => `${language.toUpperCase()}: ${translatedText}`)
+    .join("\n");
+
+const languageFlag = (code: string) => LANGUAGE_FLAGS[code] || "🌐";
+const speechLanguage = (code: string) => SPEECH_SYNTHESIS_LANGS[code] || code;
+
 const readStoredToken = () => sessionStorage.getItem("interp_shield_token") || localStorage.getItem("interp_shield_token");
 const readStoredUser = () => sessionStorage.getItem("interp_shield_user") || localStorage.getItem("interp_shield_user");
 
@@ -219,14 +318,21 @@ const readStoredTranscriptHistory = (): TranscriptHistoryEntry[] => {
       .filter((entry): entry is TranscriptHistoryEntry => {
         return Boolean(entry && typeof entry === "object" && "original" in entry && "translated" in entry && "timestamp" in entry);
       })
-      .map((entry) => ({
-        id: entry.id || `${entry.timestamp}-${entry.original}`,
-        original: String(entry.original || ""),
-        translated: String(entry.translated || ""),
-        timestamp: String(entry.timestamp || new Date().toISOString()),
-        sourceLang: String(entry.sourceLang || "auto"),
-        targetLang: String(entry.targetLang || "")
-      }))
+      .map((entry) => {
+        const targetLanguages = normalizeTargetLanguages(entry.targetLanguages, String(entry.targetLang || DEFAULT_TARGET_LANGUAGES[0]));
+        const translations = normalizeTranslationMap(entry.translations, String(entry.translated || ""), targetLanguages[0]);
+
+        return {
+          id: entry.id || `${entry.timestamp}-${entry.original}`,
+          original: String(entry.original || ""),
+          translated: String(entry.translated || formatTranslationsText(translations, targetLanguages)),
+          translations,
+          timestamp: String(entry.timestamp || new Date().toISOString()),
+          sourceLang: String(entry.sourceLang || "auto"),
+          targetLang: String(entry.targetLang || targetLanguages[0]),
+          targetLanguages
+        };
+      })
       .slice(-MAX_TRANSCRIPT_HISTORY_ENTRIES);
   } catch {
     return [];
@@ -249,17 +355,46 @@ const buildAudioConstraints = ({
   noiseSuppression: boolean;
   autoGainControl: boolean;
 }): MediaTrackConstraints => {
-  const audio: MediaTrackConstraints = {
-    echoCancellation,
-    noiseSuppression,
-    autoGainControl,
-    sampleRate: { ideal: 44100 },
-    channelCount: { ideal: 1 },
-    sampleSize: { ideal: 16 }
-  };
+  const supportedConstraints = typeof navigator !== "undefined" && navigator.mediaDevices?.getSupportedConstraints ? navigator.mediaDevices.getSupportedConstraints() : {};
+  const audio: MediaTrackConstraints = {};
+
+  if (supportedConstraints.echoCancellation) audio.echoCancellation = echoCancellation;
+  if (supportedConstraints.noiseSuppression) audio.noiseSuppression = noiseSuppression;
+  if (supportedConstraints.autoGainControl) audio.autoGainControl = autoGainControl;
+  if (supportedConstraints.sampleRate) audio.sampleRate = { ideal: 48000 };
+  if (supportedConstraints.channelCount) audio.channelCount = { ideal: 1 };
+  if (supportedConstraints.sampleSize) audio.sampleSize = { ideal: 16 };
 
   if (microphoneId !== "default") audio.deviceId = { exact: microphoneId };
   return audio;
+};
+
+const createAmplifiedAudioStream = (stream: MediaStream): { stream: MediaStream; audioContext: AudioContext | null } => {
+  const AudioContextCtor = typeof window !== "undefined" ? window.AudioContext || window.webkitAudioContext : null;
+  if (!AudioContextCtor) return { stream, audioContext: null };
+
+  try {
+    const audioContext = new AudioContextCtor();
+    const source = audioContext.createMediaStreamSource(stream);
+    const gainNode = audioContext.createGain();
+    const compressor = audioContext.createDynamicsCompressor();
+    const destination = audioContext.createMediaStreamDestination();
+
+    gainNode.gain.value = 1.2;
+    compressor.threshold.value = -24;
+    compressor.knee.value = 24;
+    compressor.ratio.value = 3;
+    compressor.attack.value = 0.003;
+    compressor.release.value = 0.25;
+
+    source.connect(gainNode);
+    gainNode.connect(compressor);
+    compressor.connect(destination);
+
+    return { stream: destination.stream, audioContext };
+  } catch {
+    return { stream, audioContext: null };
+  }
 };
 
 const formatTime = (seconds: number) => {
@@ -462,6 +597,83 @@ const LanguageSelect = ({
   </label>
 );
 
+const TargetLanguageTriangle = ({
+  sourceLang,
+  targetLanguages,
+  disabled,
+  onSourceChange,
+  onToggleTarget,
+  onSwap
+}: {
+  sourceLang: string;
+  targetLanguages: string[];
+  disabled?: boolean;
+  onSourceChange: (value: string) => void;
+  onToggleTarget: (value: string) => void;
+  onSwap: () => void;
+}) => (
+  <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(220px,0.7fr)_1fr] lg:items-center">
+    <LanguageSelect label="Speaker Language" value={sourceLang} disabled={disabled} onChange={onSourceChange} />
+
+    <div className="rounded-lg border border-white/10 bg-slate-950/55 p-4">
+      <div className="mx-auto max-w-sm">
+        <div className="flex justify-center">
+          <span className="inline-flex min-h-11 min-w-20 items-center justify-center gap-2 rounded-lg border border-slate-500/25 bg-slate-900 px-4 py-2 text-sm font-black text-white">
+            <span aria-hidden="true">{languageFlag(sourceLang)}</span>
+            {sourceLang.toUpperCase()}
+          </span>
+        </div>
+        <div className={`mt-3 grid gap-3 ${targetLanguages.length === 1 ? "grid-cols-1 px-20" : targetLanguages.length === 2 ? "grid-cols-2 px-8" : "grid-cols-3"}`}>
+          {targetLanguages.map((language) => (
+            <button
+              key={language}
+              type="button"
+              disabled={disabled}
+              onClick={() => onToggleTarget(language)}
+              className="inline-flex min-h-11 items-center justify-center gap-2 rounded-lg border border-blue-400/30 bg-blue-500/15 px-3 py-2 text-sm font-black text-blue-50 transition hover:bg-blue-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+              aria-pressed
+            >
+              <span aria-hidden="true">{languageFlag(language)}</span>
+              {language.toUpperCase()}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="mt-4 flex flex-wrap justify-center gap-2">
+        {LANGUAGES.filter((language) => language.code !== sourceLang).map((language) => {
+          const active = targetLanguages.includes(language.code);
+          const locked = disabled || (!active && targetLanguages.length >= MAX_TARGET_LANGUAGES);
+
+          return (
+            <button
+              key={language.code}
+              type="button"
+              disabled={locked}
+              onClick={() => onToggleTarget(language.code)}
+              className={`min-h-9 rounded-lg border px-3 py-1.5 text-xs font-black uppercase transition ${
+                active
+                  ? "border-blue-400/40 bg-blue-500 text-white"
+                  : "border-white/10 bg-white/[0.04] text-slate-400 hover:border-white/20 hover:text-white disabled:opacity-35"
+              }`}
+              aria-pressed={active}
+              title={language.name}
+            >
+              {language.code}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="mt-3 flex justify-center border-t border-white/10 pt-3">
+        <button onClick={onSwap} disabled={disabled} className="flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-slate-950/70 text-slate-400 hover:border-blue-500/40 hover:text-white disabled:opacity-40" aria-label="Swap primary language">
+          <ArrowRightLeft className="h-5 w-5" />
+        </button>
+      </div>
+    </div>
+  </div>
+);
+
 const GoogleSignIn = ({
   loading,
   onCredential,
@@ -655,7 +867,7 @@ export default function App() {
 
   const [mode, setMode] = useState<Mode>("translate");
   const [sourceLang, setSourceLang] = useState("en");
-  const [targetLang, setTargetLang] = useState("es");
+  const [targetLanguages, setTargetLanguages] = useState<string[]>(DEFAULT_TARGET_LANGUAGES);
   const [privateMode, setPrivateMode] = useState(true);
   const [shareableMode, setShareableMode] = useState(false);
   const [twoWay, setTwoWay] = useState(false);
@@ -666,6 +878,7 @@ export default function App() {
   const [liveText, setLiveText] = useState("");
   const [finalText, setFinalText] = useState("");
   const [finalTranslationText, setFinalTranslationText] = useState("");
+  const [finalTranslations, setFinalTranslations] = useState<Record<string, string>>({});
   const [interimOriginal, setInterimOriginal] = useState("");
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [chunkCount, setChunkCount] = useState(0);
@@ -690,16 +903,22 @@ export default function App() {
   const [sentimentTracking, setSentimentTracking] = useState(false);
   const [keywordsExtraction, setKeywordsExtraction] = useState(true);
 
+  const targetLang = targetLanguages[0] || DEFAULT_TARGET_LANGUAGES[0];
+
   const socketRef = useRef<Socket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const processedStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
   const recordingRef = useRef(false);
   const modeRef = useRef<Mode>("translate");
   const sourceLangRef = useRef(sourceLang);
   const targetLangRef = useRef(targetLang);
+  const targetLanguagesRef = useRef(targetLanguages);
   const activeSessionPayloadRef = useRef<{
     sourceLang: string;
     targetLang: string;
+    targetLanguages: string[];
     translate: boolean;
     twoWay: boolean;
     mimeType: string;
@@ -710,7 +929,7 @@ export default function App() {
   const lastInterimRef = useRef("");
   const lastFinalOriginalRef = useRef("");
   const lastFinalTranslationRef = useRef("");
-  const pendingFinalTranscriptRef = useRef<Pick<TranscriptHistoryEntry, "original" | "timestamp" | "sourceLang" | "targetLang"> | null>(null);
+  const pendingFinalTranscriptRef = useRef<Pick<TranscriptHistoryEntry, "original" | "timestamp" | "sourceLang" | "targetLang" | "targetLanguages"> | null>(null);
   const audioChunkMsRef = useRef(700);
   const interimTimerRef = useRef<number | null>(null);
   const historyEndRef = useRef<HTMLDivElement | null>(null);
@@ -719,7 +938,8 @@ export default function App() {
   const isPro = user?.plan === "pro";
   const isRecording = status === "connecting" || status === "listening";
   const latestOriginal = [finalText, liveText].filter(Boolean).join(" ").trim();
-  const latestTranslation = finalTranslationText;
+  const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
+  const latestTranslationEntries = orderedTranslationEntries(finalTranslations, targetLanguages);
   const maxSessionSeconds = config?.maxSessionSeconds || 3600;
   const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
 
@@ -758,7 +978,7 @@ export default function App() {
     if (!settings) return;
 
     setSourceLang(settings.preferredSourceLang || "en");
-    setTargetLang(settings.preferredTargetLang || "es");
+    setTargetLanguages(normalizeTargetLanguages(settings.preferredTargetLanguages, settings.preferredTargetLang || DEFAULT_TARGET_LANGUAGES[0]));
     setPrivateMode(settings.privateMode ?? true);
     setShareableMode(Boolean(settings.shareableMode));
     setSaveTranscript(settings.saveTranscript ?? true);
@@ -834,7 +1054,16 @@ export default function App() {
   useEffect(() => {
     sourceLangRef.current = sourceLang;
     targetLangRef.current = targetLang;
-  }, [sourceLang, targetLang]);
+    targetLanguagesRef.current = targetLanguages;
+  }, [sourceLang, targetLang, targetLanguages]);
+
+  useEffect(() => {
+    setTargetLanguages((current) => {
+      if (!current.includes(sourceLang)) return current;
+      const fallback = LANGUAGES.find((language) => language.code !== sourceLang)?.code || DEFAULT_TARGET_LANGUAGES[0];
+      return normalizeTargetLanguages(current.filter((language) => language !== sourceLang), fallback);
+    });
+  }, [sourceLang]);
 
   useEffect(() => {
     recordingRef.current = isRecording;
@@ -874,8 +1103,12 @@ export default function App() {
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") recorder.stop();
     mediaRecorderRef.current = null;
+    processedStreamRef.current?.getTracks().forEach((track) => track.stop());
+    processedStreamRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    void audioContextRef.current?.close().catch(() => undefined);
+    audioContextRef.current = null;
     recordingRef.current = false;
     activeSessionPayloadRef.current = null;
     shouldRestartSessionOnReconnectRef.current = false;
@@ -973,7 +1206,7 @@ export default function App() {
       setStatus("listening");
     });
 
-    socket.on("transcript_final", ({ text, detectedLanguage, latencyMs, sourceLang: eventSourceLang, targetLang: eventTargetLang }: { text?: string; detectedLanguage?: string; latencyMs?: number; sourceLang?: string; targetLang?: string }) => {
+    socket.on("transcript_final", ({ text, detectedLanguage, latencyMs, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages }: { text?: string; detectedLanguage?: string; latencyMs?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[] }) => {
       const originalText = text?.trim() || "";
       if (!originalText || originalText === lastFinalOriginalRef.current) return;
       if (detectedLanguage) setDetectedLanguage(detectedLanguage);
@@ -981,11 +1214,13 @@ export default function App() {
 
       lastInterimRef.current = "";
       lastFinalOriginalRef.current = originalText;
+      const pendingTargetLanguages = normalizeTargetLanguages(eventTargetLanguages, eventTargetLang || targetLangRef.current);
       const pendingEntry = {
         original: originalText,
         timestamp: new Date().toISOString(),
         sourceLang: detectedLanguage || eventSourceLang || sourceLangRef.current,
-        targetLang: eventTargetLang || targetLangRef.current
+        targetLang: eventTargetLang || pendingTargetLanguages[0],
+        targetLanguages: pendingTargetLanguages
       };
       pendingFinalTranscriptRef.current = pendingEntry;
       setInterimOriginal("");
@@ -1000,21 +1235,28 @@ export default function App() {
       setStatus("listening");
     });
 
-    socket.on("translation_update", ({ text, latencyMs, sourceLang: eventSourceLang, targetLang: eventTargetLang }: { text?: string; latencyMs?: number; sourceLang?: string; targetLang?: string }) => {
-      const nextTranslation = text?.trim() || "";
+    socket.on("translation_update", ({ text, translations, latencyMs, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages }: { text?: string; translations?: Record<string, string>; latencyMs?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[] }) => {
       const pendingTranscript = pendingFinalTranscriptRef.current;
-      if (!nextTranslation || (!pendingTranscript && nextTranslation === lastFinalTranslationRef.current)) return;
+      const nextTargetLanguages = normalizeTargetLanguages(eventTargetLanguages || pendingTranscript?.targetLanguages || targetLanguagesRef.current, eventTargetLang || pendingTranscript?.targetLang || targetLangRef.current);
+      const nextTranslations = normalizeTranslationMap(translations, text || "", eventTargetLang || nextTargetLanguages[0]);
+      const nextTranslation = formatTranslationsText(nextTranslations, nextTargetLanguages);
+      const nextTranslationSignature = JSON.stringify(orderedTranslationEntries(nextTranslations, nextTargetLanguages));
+
+      if (!nextTranslation || (!pendingTranscript && nextTranslationSignature === lastFinalTranslationRef.current)) return;
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
 
-      lastFinalTranslationRef.current = nextTranslation;
-      setFinalTranslationText((current) => [current, nextTranslation].filter(Boolean).join(" ").trim());
+      lastFinalTranslationRef.current = nextTranslationSignature;
+      setFinalTranslations(nextTranslations);
+      setFinalTranslationText((current) => [current, nextTranslation].filter(Boolean).join("\n\n").trim());
       setTranslatedSegments((current) => [...current, nextTranslation].slice(-40));
       appendTranscriptHistory({
         original: pendingTranscript?.original || lastFinalOriginalRef.current,
         translated: nextTranslation,
+        translations: nextTranslations,
         timestamp: pendingTranscript?.timestamp || new Date().toISOString(),
         sourceLang: eventSourceLang || pendingTranscript?.sourceLang || sourceLangRef.current,
-        targetLang: eventTargetLang || pendingTranscript?.targetLang || targetLangRef.current
+        targetLang: eventTargetLang || pendingTranscript?.targetLang || nextTargetLanguages[0],
+        targetLanguages: nextTargetLanguages
       });
       pendingFinalTranscriptRef.current = null;
     });
@@ -1040,16 +1282,18 @@ export default function App() {
   }, [maxSessionSeconds, stopSession]);
 
   useEffect(() => {
-    if (mode !== "dubbing" || translatedSegments.length === 0 || !("speechSynthesis" in window)) return;
+    if (mode !== "dubbing" || !("speechSynthesis" in window)) return;
 
-    const latest = translatedSegments.at(-1);
-    if (!latest) return;
+    const entries = orderedTranslationEntries(finalTranslations, targetLanguages);
+    if (entries.length === 0) return;
 
     window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(latest);
-    utterance.lang = targetLang;
-    window.speechSynthesis.speak(utterance);
-  }, [mode, targetLang, translatedSegments]);
+    for (const [language, translatedText] of entries) {
+      const utterance = new SpeechSynthesisUtterance(translatedText);
+      utterance.lang = speechLanguage(language);
+      window.speechSynthesis.speak(utterance);
+    }
+  }, [mode, finalTranslations, targetLanguages]);
 
   const applyAuthSession = (session: { token: string; user: AppUser }) => {
     setToken(session.token);
@@ -1189,10 +1433,17 @@ export default function App() {
       streamRef.current = stream;
       void refreshMicrophones();
 
+      const enhancedAudio = createAmplifiedAudioStream(stream);
+      processedStreamRef.current = enhancedAudio.stream === stream ? null : enhancedAudio.stream;
+      audioContextRef.current = enhancedAudio.audioContext;
+      if (enhancedAudio.audioContext?.state === "suspended") {
+        await enhancedAudio.audioContext.resume().catch(() => undefined);
+      }
+
       const mimeType = getSupportedMimeType();
-      const recorder = new MediaRecorder(stream, {
+      const recorder = new MediaRecorder(enhancedAudio.stream, {
         ...(mimeType ? { mimeType } : {}),
-        audioBitsPerSecond: 96_000
+        audioBitsPerSecond: 128_000
       });
       mediaRecorderRef.current = recorder;
 
@@ -1211,12 +1462,14 @@ export default function App() {
         cleanupMedia();
       };
 
+      const activeTargetLanguages = normalizeTargetLanguages(targetLanguages, targetLang);
       const sessionPayload = {
         sourceLang,
-        targetLang,
+        targetLang: activeTargetLanguages[0],
+        targetLanguages: activeTargetLanguages,
         translate: modeRef.current !== "transcribe",
         twoWay,
-        mimeType: "audio/webm"
+        mimeType: mimeType || "audio/webm"
       };
       activeSessionPayloadRef.current = sessionPayload;
       shouldRestartSessionOnReconnectRef.current = false;
@@ -1248,16 +1501,29 @@ export default function App() {
 
       setAlert("Microphone not detected");
     }
-  }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, refreshMicrophones, sourceLang, targetLang, twoWay]);
+  }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, refreshMicrophones, sourceLang, targetLang, targetLanguages, twoWay]);
 
   const selectMode = (nextMode: Mode) => {
     setMode(nextMode);
   };
 
+  const toggleTargetLanguage = (language: string) => {
+    if (isRecording || language === sourceLang) return;
+
+    setTargetLanguages((current) => {
+      if (current.includes(language)) {
+        return current.length > 1 ? current.filter((targetLanguage) => targetLanguage !== language) : current;
+      }
+
+      if (current.length >= MAX_TARGET_LANGUAGES) return current;
+      return normalizeTargetLanguages([...current, language], targetLang);
+    });
+  };
+
   const swapLanguages = () => {
     if (isRecording) return;
     setSourceLang(targetLang);
-    setTargetLang(sourceLang);
+    setTargetLanguages((current) => normalizeTargetLanguages([sourceLang, ...current.filter((language) => language !== targetLang && language !== sourceLang)], sourceLang));
   };
 
   const clearLiveSession = () => {
@@ -1266,6 +1532,7 @@ export default function App() {
     setLiveText("");
     setFinalText("");
     setFinalTranslationText("");
+    setFinalTranslations({});
     setInterimOriginal("");
     setSessionSeconds(0);
     setChunkCount(0);
@@ -1294,12 +1561,13 @@ export default function App() {
     const formattedText = stableHistory
       .map((entry) => {
         const sourceLabel = entry.sourceLang.toUpperCase();
-        const targetLabel = entry.targetLang.toUpperCase();
+        const translations = normalizeTranslationMap(entry.translations, entry.translated, entry.targetLang);
+        const translationLines = orderedTranslationEntries(translations, entry.targetLanguages || [entry.targetLang]).map(([language, translatedText]) => `${language.toUpperCase()}: ${translatedText}`);
 
         return [
           `[${formatHistoryTimestamp(entry.timestamp)}]`,
           `${sourceLabel}: ${entry.original}`,
-          `${targetLabel}: ${entry.translated}`
+          ...translationLines
         ].join("\n");
       })
       .join("\n\n");
@@ -1443,13 +1711,7 @@ export default function App() {
 
       <section className="space-y-5">
         <GlassPanel className="p-4">
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_auto_1fr] lg:items-end">
-            <LanguageSelect label="Speaker Language" value={sourceLang} disabled={isRecording} onChange={setSourceLang} />
-            <button onClick={swapLanguages} disabled={isRecording} className="flex h-12 w-12 items-center justify-center self-center rounded-lg border border-white/10 bg-slate-950/70 text-slate-400 hover:border-blue-500/40 hover:text-white disabled:opacity-40 lg:self-end" aria-label="Swap languages">
-              <ArrowRightLeft className="h-5 w-5" />
-            </button>
-            <LanguageSelect label="Translation Language" value={targetLang} disabled={isRecording} onChange={setTargetLang} />
-          </div>
+          <TargetLanguageTriangle sourceLang={sourceLang} targetLanguages={targetLanguages} disabled={isRecording} onSourceChange={setSourceLang} onToggleTarget={toggleTargetLanguage} onSwap={swapLanguages} />
           <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-4">
             <button onClick={() => setTwoWay((current) => !current)} className={`flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-bold ${twoWay ? "border-blue-500/20 bg-blue-500/10 text-blue-100" : "border-white/10 bg-slate-950/60 text-slate-400 hover:text-white"}`}>
               <ArrowRightLeft className="h-4 w-4" />
@@ -1462,7 +1724,7 @@ export default function App() {
           <div className="flex flex-col gap-2 border-b border-white/10 px-5 py-4 md:flex-row md:items-center md:justify-between">
             <div>
               <h1 className="text-xl font-black text-white">Live AI Interpreter</h1>
-              <p className="mt-1 text-sm font-semibold text-slate-400">{languageName(detectedLanguage || sourceLang)} <span className="text-slate-600">-&gt;</span> {languageName(targetLang)}</p>
+              <p className="mt-1 text-sm font-semibold text-slate-400">{languageName(detectedLanguage || sourceLang)} <span className="text-slate-600">-&gt;</span> {targetLanguages.map(languageName).join(", ")}</p>
             </div>
             <span className={`w-fit rounded-full border px-3 py-1 text-xs font-bold uppercase tracking-wider ${status === "listening" ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-300" : status === "error" ? "border-red-500/20 bg-red-500/10 text-red-200" : "border-white/10 bg-slate-950/60 text-slate-400"}`}>
               {statusLabel}
@@ -1476,11 +1738,28 @@ export default function App() {
                 <TypingSubtitle text={latestOriginal} muted={Boolean(interimOriginal)} empty="Waiting for speech." />
               </p>
 
-              <div className="mx-auto mt-8 w-full max-w-3xl rounded-xl border border-blue-500/10 bg-blue-500/[0.045] p-5 md:p-7">
-                <p className="mb-3 text-xs font-bold uppercase tracking-widest text-blue-100/70">Translated text</p>
-                <p className="min-h-24 text-2xl font-black leading-snug tracking-normal text-white sm:text-3xl md:text-4xl">
-                  <TypingSubtitle text={mode === "transcribe" ? latestOriginal : latestTranslation} empty="Translated subtitles appear here." />
-                </p>
+              <div className="mx-auto mt-8 w-full max-w-3xl rounded-xl border border-blue-500/10 bg-blue-500/[0.045] p-5 text-left md:p-7">
+                <p className="mb-3 text-xs font-bold uppercase tracking-widest text-blue-100/70">Translations</p>
+                {mode === "transcribe" ? (
+                  <p className="min-h-20 text-2xl font-black leading-snug tracking-normal text-white sm:text-3xl">
+                    <TypingSubtitle text={latestOriginal} empty="Transcribed subtitles appear here." />
+                  </p>
+                ) : latestTranslationEntries.length > 0 ? (
+                  <div className="space-y-3">
+                    {latestTranslationEntries.map(([language, translatedText]) => (
+                      <div key={language} className="grid grid-cols-[72px_1fr] gap-3 rounded-lg border border-white/10 bg-slate-950/35 p-3">
+                        <span className="flex items-center gap-2 text-sm font-black text-blue-100"><span aria-hidden="true">{languageFlag(language)}</span>{language.toUpperCase()}</span>
+                        <p className="min-h-7 text-lg font-black leading-7 text-white md:text-2xl md:leading-9">
+                          <TypingSubtitle text={translatedText} empty="Translated subtitles appear here." />
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="min-h-20 text-2xl font-black leading-snug tracking-normal text-white sm:text-3xl">
+                    <TypingSubtitle text={latestTranslation} empty="Translated subtitles appear here." />
+                  </p>
+                )}
               </div>
             </div>
 
@@ -1520,7 +1799,11 @@ export default function App() {
                   <div key={entry.id} className="rounded-lg border border-white/10 bg-slate-950/55 p-4">
                     <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-600">[{formatHistoryTimestamp(entry.timestamp)}]</p>
                     <p className="text-sm leading-6 text-slate-300"><span className="font-black text-slate-100">{entry.sourceLang.toUpperCase()}:</span> {entry.original || "No transcript text"}</p>
-                    <p className="mt-2 text-sm leading-6 text-blue-50"><span className="font-black text-blue-200">{entry.targetLang.toUpperCase()}:</span> {entry.translated || "No translation text"}</p>
+                    <div className="mt-2 space-y-1.5">
+                      {orderedTranslationEntries(normalizeTranslationMap(entry.translations, entry.translated, entry.targetLang), entry.targetLanguages || [entry.targetLang]).map(([language, translatedText]) => (
+                        <p key={language} className="text-sm leading-6 text-blue-50"><span className="font-black text-blue-200">{languageFlag(language)} {language.toUpperCase()}:</span> {translatedText || "No translation text"}</p>
+                      ))}
+                    </div>
                   </div>
                 ))}
                 <div ref={historyEndRef} />
