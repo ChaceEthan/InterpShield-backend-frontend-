@@ -7,6 +7,8 @@ const MAX_STORED_SESSIONS = 100;
 const MAX_TARGET_LANGUAGES = 3;
 const SENTENCE_DEBOUNCE_MS = 1000;
 const SILENCE_DEBOUNCE_MS = 1400;
+const TRANSLATION_RATE_LIMIT_DELAY_MS = 300;
+const MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3;
 const sessionHistoryStore = new Map();
 
 const createSessionId = () => {
@@ -108,6 +110,7 @@ const prepareTextForTranslation = (text = "") => {
 
 const normalizeTranscript = (text = "") => cleanTranscriptText(text).toLowerCase();
 const sentenceEnds = (text = "") => /[.!?]$/.test(text.trim());
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const appendSentenceChunk = (sentence = "", chunk = "") => {
   const cleanChunk = cleanTranscriptText(chunk);
@@ -152,6 +155,8 @@ export const createInterpreterSession = async ({
   let currentDirection = { source: sourceLang, target: sessionTargetLanguages[0], targets: sessionTargetLanguages };
   let currentDetectedLanguage = null;
   let translationTimer = null;
+  let consecutiveTranslationFailures = 0;
+  const lastSuccessfulTranslations = new Map();
   const sessionId = createSessionId();
 
   const clearTranslationTimer = () => {
@@ -159,6 +164,90 @@ export const createInterpreterSession = async ({
       clearTimeout(translationTimer);
       translationTimer = null;
     }
+  };
+
+  const resetTranslationState = () => {
+    clearTranslationTimer();
+    currentSentence = "";
+    lastInterimTranscript = "";
+    lastTranslatedTranscript = "";
+    consecutiveTranslationFailures = 0;
+  };
+
+  const noteTranslationSuccess = (language, translatedText) => {
+    consecutiveTranslationFailures = 0;
+    lastSuccessfulTranslations.set(language, translatedText);
+  };
+
+  const noteTranslationFailure = (language, error) => {
+    consecutiveTranslationFailures += 1;
+    console.warn("Translation failure", {
+      targetLang: language,
+      failures: consecutiveTranslationFailures,
+      error: error?.message || error || "No valid translation returned"
+    });
+
+    if (consecutiveTranslationFailures >= MAX_CONSECUTIVE_TRANSLATION_FAILURES) {
+      console.warn("Translation state reset after repeated failures", {
+        failures: consecutiveTranslationFailures
+      });
+      resetTranslationState();
+    }
+  };
+
+  const translateLanguageWithRecovery = async ({ language, translationInput, direction }) => {
+    let lastError = null;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (attempt > 0) {
+        console.log("Retrying Gemini translation", { targetLang: language, attempt: attempt + 1 });
+        await delay(TRANSLATION_RATE_LIMIT_DELAY_MS);
+      }
+
+      const attemptStartedAt = Date.now();
+
+      try {
+        const translatedText = await translateWithGemini({
+          apiKey: env.geminiApiKey,
+          text: translationInput,
+          sourceLang: direction.source,
+          targetLang: language
+        });
+        const responseTimeMs = Date.now() - attemptStartedAt;
+        const safeTranslatedText = String(translatedText || "").trim();
+
+        console.log("Gemini translation response", {
+          targetLang: language,
+          attempt: attempt + 1,
+          responseTimeMs,
+          empty: !safeTranslatedText
+        });
+
+        if (safeTranslatedText) {
+          noteTranslationSuccess(language, safeTranslatedText);
+          return safeTranslatedText;
+        }
+
+        lastError = new Error("Empty translation response");
+      } catch (error) {
+        lastError = error;
+        console.warn("Gemini translation attempt failed", {
+          targetLang: language,
+          attempt: attempt + 1,
+          responseTimeMs: Date.now() - attemptStartedAt,
+          error: error?.message || error
+        });
+      }
+    }
+
+    noteTranslationFailure(language, lastError);
+
+    const fallbackTranslation = String(lastSuccessfulTranslations.get(language) || "").trim();
+    if (fallbackTranslation) {
+      console.warn("Using previous successful translation fallback", { targetLang: language });
+    }
+
+    return fallbackTranslation;
   };
 
   const emitStableSentence = async () => {
@@ -178,22 +267,23 @@ export const createInterpreterSession = async ({
     const startedAt = Date.now();
     const translationInput = prepareTextForTranslation(sentence);
     const translations = {};
+    const translationOutputs = [];
 
     if (shouldTranslate) {
-      const translatedEntries = await Promise.all(
-        direction.targets.map(async (language) => [
-          language,
-          await translateWithGemini({
-            apiKey: env.geminiApiKey,
-            text: translationInput,
-            sourceLang: direction.source,
-            targetLang: language
-          })
-        ])
-      );
+      const targetQueue = direction.targets.slice(0, MAX_TARGET_LANGUAGES);
 
-      for (const [language, translatedText] of translatedEntries) {
-        if (translatedText) translations[language] = translatedText;
+      for (const language of targetQueue) {
+        if (translationOutputs.length > 0) {
+          await delay(TRANSLATION_RATE_LIMIT_DELAY_MS);
+        }
+
+        const translatedText = await translateLanguageWithRecovery({ language, translationInput, direction });
+        const safeTranslatedText = String(translatedText || "").trim();
+        translationOutputs.push({ lang: language, text: safeTranslatedText });
+
+        if (safeTranslatedText) {
+          translations[language] = safeTranslatedText;
+        }
       }
     }
 
@@ -205,6 +295,7 @@ export const createInterpreterSession = async ({
         originalText: sentence,
         translatedText: "",
         translations: {},
+        translationOutputs,
         isFinal: true,
         sourceLang: direction.source,
         targetLang: direction.target,
@@ -240,6 +331,7 @@ export const createInterpreterSession = async ({
       originalText: sentence,
       translatedText,
       translations,
+      translationOutputs,
       isFinal: true,
       sourceLang: direction.source,
       targetLang: direction.target,
@@ -254,7 +346,11 @@ export const createInterpreterSession = async ({
     clearTranslationTimer();
     const delay = sentenceEnds(currentSentence) ? SENTENCE_DEBOUNCE_MS : SILENCE_DEBOUNCE_MS;
     translationTimer = setTimeout(() => {
-      void emitStableSentence();
+      void emitStableSentence().catch((error) => {
+        console.error("Translation processing failed:", error?.message || error);
+        resetTranslationState();
+        onWarning?.("Translation temporarily failed; continuing session.");
+      });
     }, delay);
     translationTimer.unref?.();
   };

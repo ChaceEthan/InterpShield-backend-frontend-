@@ -180,7 +180,9 @@ const LANGUAGES: Language[] = [
   { code: "hi", name: "Hindi", region: "India" },
   { code: "tr", name: "Turkish", region: "Turkiye" },
   { code: "pl", name: "Polish", region: "Poland" },
-  { code: "ru", name: "Russian", region: "Global" }
+  { code: "ru", name: "Russian", region: "Global" },
+  { code: "rw", name: "Kinyarwanda", region: "Rwanda" },
+  { code: "rn", name: "Kirundi", region: "Burundi" }
 ];
 
 const TOOL_ITEMS: Array<{ mode: Mode; label: string; icon: LucideIcon }> = [
@@ -204,7 +206,9 @@ const LANGUAGE_FLAGS: Record<string, string> = {
   hi: "🇮🇳",
   tr: "🇹🇷",
   pl: "🇵🇱",
-  ru: "🇷🇺"
+  ru: "🇷🇺",
+  rw: "🇷🇼",
+  rn: "🇧🇮"
 };
 
 const SPEECH_SYNTHESIS_LANGS: Record<string, string> = {
@@ -222,7 +226,9 @@ const SPEECH_SYNTHESIS_LANGS: Record<string, string> = {
   hi: "hi-IN",
   tr: "tr-TR",
   pl: "pl-PL",
-  ru: "ru-RU"
+  ru: "ru-RU",
+  rw: "rw-RW",
+  rn: "rn-BI"
 };
 
 const PRICING_PLANS = [
@@ -933,6 +939,8 @@ export default function App() {
   const audioChunkMsRef = useRef(700);
   const interimTimerRef = useRef<number | null>(null);
   const historyEndRef = useRef<HTMLDivElement | null>(null);
+  const dubbingQueueRef = useRef<Array<{ language: string; text: string }>>([]);
+  const dubbingSpeakingRef = useRef(false);
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro";
@@ -942,6 +950,34 @@ export default function App() {
   const latestTranslationEntries = orderedTranslationEntries(finalTranslations, targetLanguages);
   const maxSessionSeconds = config?.maxSessionSeconds || 3600;
   const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
+
+  const playNextDubbingUtterance = useCallback(() => {
+    if (!("speechSynthesis" in window) || dubbingSpeakingRef.current) return;
+
+    const nextUtterance = dubbingQueueRef.current.shift();
+    if (!nextUtterance) return;
+
+    const utterance = new SpeechSynthesisUtterance(nextUtterance.text);
+    utterance.lang = speechLanguage(nextUtterance.language);
+    dubbingSpeakingRef.current = true;
+
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      dubbingSpeakingRef.current = false;
+      window.setTimeout(() => playNextDubbingUtterance(), 0);
+    };
+
+    utterance.onend = finish;
+    utterance.onerror = finish;
+
+    try {
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      finish();
+    }
+  }, []);
 
   const navigate = useCallback(
     (nextView: View) => {
@@ -1282,18 +1318,24 @@ export default function App() {
   }, [maxSessionSeconds, stopSession]);
 
   useEffect(() => {
-    if (mode !== "dubbing" || !("speechSynthesis" in window)) return;
+    if (!("speechSynthesis" in window)) return;
+
+    if (mode !== "dubbing") {
+      window.speechSynthesis.cancel();
+      dubbingQueueRef.current = [];
+      dubbingSpeakingRef.current = false;
+      return;
+    }
 
     const entries = orderedTranslationEntries(finalTranslations, targetLanguages);
     if (entries.length === 0) return;
 
-    window.speechSynthesis.cancel();
     for (const [language, translatedText] of entries) {
-      const utterance = new SpeechSynthesisUtterance(translatedText);
-      utterance.lang = speechLanguage(language);
-      window.speechSynthesis.speak(utterance);
+      dubbingQueueRef.current.push({ language, text: translatedText });
     }
-  }, [mode, finalTranslations, targetLanguages]);
+
+    playNextDubbingUtterance();
+  }, [mode, finalTranslations, targetLanguages, playNextDubbingUtterance]);
 
   const applyAuthSession = (session: { token: string; user: AppUser }) => {
     setToken(session.token);
@@ -1715,7 +1757,7 @@ export default function App() {
           <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-4">
             <button onClick={() => setTwoWay((current) => !current)} className={`flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-bold ${twoWay ? "border-blue-500/20 bg-blue-500/10 text-blue-100" : "border-white/10 bg-slate-950/60 text-slate-400 hover:text-white"}`}>
               <ArrowRightLeft className="h-4 w-4" />
-              Two-way translation
+              Three-way translation
             </button>
           </div>
         </GlassPanel>

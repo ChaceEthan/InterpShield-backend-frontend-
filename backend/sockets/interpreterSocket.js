@@ -104,6 +104,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           original: result.originalText,
           text: result.translatedText,
           translations,
+          outputs: result.translationOutputs || [],
           sourceLang: result.sourceLang,
           targetLang: result.targetLang,
           targetLanguages: result.targetLanguages || [result.targetLang],
