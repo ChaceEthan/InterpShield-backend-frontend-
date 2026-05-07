@@ -370,21 +370,148 @@ const normalizeTargetLanguages = (languages?: unknown, fallback = DEFAULT_TARGET
   return validCodes.has(fallback) ? [fallback] : DEFAULT_TARGET_LANGUAGES;
 };
 
-const isVisibleTranslationText = (text = "") =>
-  Boolean(text.trim()) && !/\b(temporar(?:il)y unavailable|temporar(?:il)y failed|translation unavailable|provider failed)\b/i.test(text);
+const normalizeLanguageCode = (language = "") => {
+  const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
+  if (normalized === "lg" || normalized === "lg-ug" || normalized === "lug") return "luganda";
+  if (normalized.startsWith("rw")) return "rw";
+  if (normalized.startsWith("rn")) return "rn";
+  if (normalized.startsWith("sw")) return "sw";
+  if (normalized.startsWith("zh")) return "zh";
+  if (normalized.startsWith("es")) return "es";
+  if (normalized.startsWith("en")) return "en";
+  return normalized.split("-")[0] || normalized;
+};
 
-const normalizeTranslationMap = (translations?: unknown, fallbackText = "", fallbackLang = DEFAULT_TARGET_LANGUAGES[0]) => {
+const normalizeComparableText = (text = "") =>
+  text
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.!?]+$/g, "");
+
+const normalizeLanguageDetectionText = (text = "") =>
+  text
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .replace(/\s+/g, " ");
+
+const languageTokens = (text = "") => normalizeLanguageDetectionText(text).match(/[\p{L}\p{N}']+/gu) || [];
+
+const countLanguageMarkers = (text = "", markers: { phrases?: string[]; words?: string[] }) => {
+  const normalized = normalizeLanguageDetectionText(text);
+  const tokens = new Set(languageTokens(text));
+  let score = 0;
+
+  for (const phrase of markers.phrases || []) {
+    const normalizedPhrase = normalizeLanguageDetectionText(phrase);
+    if (normalizedPhrase && normalized.includes(normalizedPhrase)) score += 2;
+  }
+
+  for (const word of markers.words || []) {
+    const normalizedWord = normalizeLanguageDetectionText(word);
+    if (normalizedWord && tokens.has(normalizedWord)) score += 1;
+  }
+
+  return score;
+};
+
+const ENGLISH_MARKERS = {
+  phrases: ["can you", "could you", "please give", "give me", "thank you", "how are you", "good morning", "no problem"],
+  words: ["the", "and", "you", "your", "please", "give", "book", "hello", "thanks", "thank", "problem", "question", "answer", "friend", "okay", "need", "want", "have", "this", "that", "what", "when", "where", "why", "how", "can", "could", "would", "should"]
+};
+
+const TARGET_LANGUAGE_MARKERS: Record<string, { phrases?: string[]; words?: string[] }> = {
+  es: {
+    phrases: ["por favor", "muchas gracias", "buenos dias", "buenas tardes", "buenas noches", "me puedes", "puedes darme", "tu libro", "su libro", "de nada", "lo siento", "que tal"],
+    words: ["el", "la", "los", "las", "un", "una", "de", "del", "que", "para", "por", "con", "sin", "como", "hola", "gracias", "favor", "vale", "claro", "bueno", "bien", "perdon", "adios", "listo", "puedes", "puede", "puedo", "dame", "darme", "libro", "libros", "necesito", "quiero", "tengo", "tienes", "tiene", "buenos", "buenas", "dias", "noches", "si", "aqui", "ahora", "usted", "tu", "mi", "su", "voy", "hablar", "escuchar", "traducir", "ayuda"]
+  },
+  rw: {
+    phrases: ["murakoze cyane", "nta kibazo", "ntacyo bitwaye", "urashobora kumpa", "igitabo cyawe", "ndagusabye"],
+    words: ["amakuru", "murakoze", "yego", "oya", "ndabizi", "ikibazo", "muraho", "mwaramutse", "mwiriwe", "cyane", "ndashaka", "urashobora", "kumpa", "igitabo", "cyawe", "nyamuneka", "byiza", "kuri", "kandi", "ndashobora", "tugomba", "gukora", "avuga", "abantu", "umuntu", "cyangwa", "ariko", "rero", "kuko", "ubu", "hano", "akazi", "ubuzima", "amafaranga", "umuryango", "mfasha"]
+  },
+  rn: {
+    phrases: ["ego cane", "amakuru meza", "urakoze cane", "murakoze cane", "ni vyiza", "urashobora kumpa", "igitabu cawe"],
+    words: ["ego", "cane", "vyiza", "amahoro", "mwaramutse", "urashobora", "kumpa", "igitabu", "cawe", "ndagusavye", "oya", "kuri", "kandi", "ndashobora", "tugomba", "gukora", "avuga", "abantu", "umuntu", "canke", "ariko", "rero", "kuko", "ubu", "ngaha", "akazi", "ubuzima", "amafaranga", "umuryango", "mfasha"]
+  },
+  sw: {
+    phrases: ["asante sana", "unaweza kunipa", "kitabu chako", "habari", "tafadhali"],
+    words: ["habari", "asante", "sawa", "rafiki", "tafadhali", "karibu", "jambo", "ndio", "ndiyo", "hapana", "sana", "unaweza", "kunipa", "kitabu", "chako", "nina", "kwa", "mimi", "wewe", "yeye", "sisi", "wao", "ni", "na", "ya", "za", "wa", "watu", "mtu", "leo", "kesho", "sasa", "hapa", "kazi", "fedha", "familia", "afya", "msaada", "wako", "ninahitaji"]
+  },
+  luganda: {
+    phrases: ["oli otya", "webale nyo", "osobola okumpa", "ekitabo kyo"],
+    words: ["ssebo", "nyabo", "webale", "mukwano", "banange", "gyebale", "mpola", "kale", "naye", "osobola", "okumpa", "ekitabo", "kyo", "nkusaba", "nze", "ggwe", "ndi", "oli", "ali", "tuli", "muli", "bali", "nga", "kuba", "mu", "ku", "ne", "era", "abantu", "omuntu", "leero", "wano", "ssente", "famire", "obulamu", "nsobola", "okukuyamba", "kati", "kubanga", "omulimu", "guno", "mukulu"]
+  }
+};
+
+const isSourceTaggedFallbackText = (text = "") => /^\[[a-z]{2,12}(?:-[a-z0-9]{2,12})?\]\s+/i.test(text.trim());
+
+const isVisibleTranslationText = (text = "") =>
+  Boolean(text.trim()) &&
+  !isSourceTaggedFallbackText(text) &&
+  !/\b(temporar(?:il)y unavailable|temporar(?:il)y failed|translation unavailable|provider failed|timed out|timeout)\b/i.test(text);
+
+const hasSpanishOrthography = (text = "") => /[\u00e1\u00e9\u00ed\u00f3\u00fa\u00fc\u00f1\u00c1\u00c9\u00cd\u00d3\u00da\u00dc\u00d1\u00bf\u00a1]/.test(text);
+const hasChineseCharacters = (text = "") => /[\u3400-\u9fff\uf900-\ufaff]/.test(text);
+
+const isTargetLanguageText = (text = "", targetLang = "") => {
+  const target = normalizeLanguageCode(targetLang);
+  if (!target || target === "auto" || target === "en") return true;
+
+  const tokenCount = languageTokens(text).length;
+  const englishScore = countLanguageMarkers(text, ENGLISH_MARKERS);
+
+  if (target === "zh") return hasChineseCharacters(text);
+
+  if (target === "es") {
+    const spanishScore = countLanguageMarkers(text, TARGET_LANGUAGE_MARKERS.es);
+    return hasSpanishOrthography(text) || spanishScore >= 2 || (spanishScore >= 1 && englishScore === 0 && tokenCount <= 3);
+  }
+
+  if (["rw", "rn", "sw", "luganda"].includes(target)) {
+    const markerScore = countLanguageMarkers(text, TARGET_LANGUAGE_MARKERS[target] || {});
+    return markerScore >= 2 || (markerScore >= 1 && englishScore === 0 && tokenCount <= 4);
+  }
+
+  return englishScore < 3;
+};
+
+const isValidTranslationText = ({
+  text = "",
+  sourceText = "",
+  targetLang = ""
+}: {
+  text?: string;
+  sourceText?: string;
+  targetLang?: string;
+}) => {
+  const cleanText = text.trim();
+  if (!isVisibleTranslationText(cleanText)) return false;
+  if (sourceText && normalizeComparableText(cleanText) === normalizeComparableText(sourceText)) return false;
+  return isTargetLanguageText(cleanText, targetLang);
+};
+
+const normalizeTranslationMap = (
+  translations?: unknown,
+  fallbackText = "",
+  fallbackLang = DEFAULT_TARGET_LANGUAGES[0],
+  context: { sourceText?: string; targetLanguages?: string[] } = {}
+) => {
   const normalized: Record<string, string> = {};
 
   if (translations && typeof translations === "object" && !Array.isArray(translations)) {
     for (const [language, translatedText] of Object.entries(translations as Record<string, unknown>)) {
       const text = String(translatedText || "").trim();
-      if (language && isVisibleTranslationText(text)) normalized[language] = text;
+      if (language && isValidTranslationText({ text, sourceText: context.sourceText, targetLang: language })) normalized[language] = text;
     }
   }
 
   const cleanFallbackText = fallbackText.trim();
-  if (Object.keys(normalized).length === 0 && isVisibleTranslationText(cleanFallbackText)) {
+  if (
+    Object.keys(normalized).length === 0 &&
+    isValidTranslationText({ text: cleanFallbackText, sourceText: context.sourceText, targetLang: fallbackLang })
+  ) {
     normalized[fallbackLang] = cleanFallbackText;
   }
 
@@ -395,10 +522,10 @@ const orderedTranslationEntries = (translations: Record<string, string>, targetL
   const knownLanguages = normalizeTargetLanguages(targetLanguages);
   const orderedEntries = knownLanguages
     .map((language) => [language, translations[language]?.trim() || ""] as const)
-    .filter(([, translatedText]) => isVisibleTranslationText(translatedText));
+    .filter(([language, translatedText]) => isValidTranslationText({ text: translatedText, targetLang: language }));
 
   for (const [language, translatedText] of Object.entries(translations)) {
-    if (!knownLanguages.includes(language) && isVisibleTranslationText(translatedText)) orderedEntries.push([language, translatedText.trim()]);
+    if (!knownLanguages.includes(language) && isValidTranslationText({ text: translatedText, targetLang: language })) orderedEntries.push([language, translatedText.trim()]);
   }
 
   return orderedEntries.slice(0, MAX_TARGET_LANGUAGES);
@@ -438,12 +565,17 @@ const readStoredTranscriptHistory = (): TranscriptHistoryEntry[] => {
       })
       .map((entry) => {
         const targetLanguages = normalizeTargetLanguages(entry.targetLanguages, String(entry.targetLang || DEFAULT_TARGET_LANGUAGES[0]));
-        const translations = normalizeTranslationMap(entry.translations, String(entry.translated || ""), targetLanguages[0]);
+        const original = String(entry.original || "");
+        const translations = normalizeTranslationMap(entry.translations, String(entry.translated || ""), targetLanguages[0], { sourceText: original });
+        const storedTranslated = String(entry.translated || "");
+        const translated = isValidTranslationText({ text: storedTranslated, sourceText: original, targetLang: targetLanguages[0] })
+          ? storedTranslated
+          : formatTranslationsText(translations, targetLanguages);
 
         return {
           id: entry.id || `${entry.timestamp}-${entry.original}`,
-          original: String(entry.original || ""),
-          translated: String(entry.translated || formatTranslationsText(translations, targetLanguages)),
+          original,
+          translated,
           translations,
           timestamp: String(entry.timestamp || new Date().toISOString()),
           sourceLang: String(entry.sourceLang || "auto"),
@@ -1288,7 +1420,7 @@ export default function App() {
     const original = entry.original.trim();
     const translated = entry.translated.trim();
 
-    if (!original || !isVisibleTranslationText(translated)) return;
+    if (!original || !isValidTranslationText({ text: translated, sourceText: original, targetLang: entry.targetLang })) return;
 
     setHistory((current) => {
       const historySignature = `${entry.timestamp}|${original}|${translated}`;
@@ -1558,7 +1690,8 @@ export default function App() {
       }
 
       const nextTargetLanguages = normalizeTargetLanguages(eventTargetLanguages || pendingTranscript?.targetLanguages || targetLanguagesRef.current, eventTargetLang || pendingTranscript?.targetLang || targetLangRef.current);
-      const nextTranslations = normalizeTranslationMap(translations, text || "", eventTargetLang || nextTargetLanguages[0]);
+      const sourceText = updateOriginal || pendingTranscript?.original || lastFinalOriginalRef.current;
+      const nextTranslations = normalizeTranslationMap(translations, text || "", eventTargetLang || nextTargetLanguages[0], { sourceText });
       const nextTranslation = formatTranslationsText(nextTranslations, nextTargetLanguages);
       const nextTranslationSignature = JSON.stringify(orderedTranslationEntries(nextTranslations, nextTargetLanguages));
       const isComplete = complete !== false && !partial;
@@ -1567,7 +1700,7 @@ export default function App() {
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
       trackLatency(latencyMs, provider);
 
-      lastTranslationOriginalRef.current = updateOriginal || pendingTranscript?.original || lastFinalOriginalRef.current;
+      lastTranslationOriginalRef.current = sourceText;
       lastFinalTranslationRef.current = nextTranslationSignature;
       setFinalTranslations(nextTranslations);
 
@@ -1579,7 +1712,7 @@ export default function App() {
         setFinalTranslationText((current) => [current, nextTranslation].filter(Boolean).join("\n\n").trim().slice(-3500));
         setTranslatedSegments((current) => [...current, nextTranslation].slice(-MAX_LIVE_SEGMENTS));
         appendTranscriptHistory({
-          original: pendingTranscript?.original || updateOriginal || lastFinalOriginalRef.current,
+          original: sourceText,
           translated: nextTranslation,
           translations: nextTranslations,
           timestamp: pendingTranscript?.timestamp || new Date().toISOString(),
@@ -1964,7 +2097,7 @@ export default function App() {
       const formattedText = stableHistory
         .map((entry) => {
           const sourceLabel = entry.sourceLang.toUpperCase();
-          const translations = normalizeTranslationMap(entry.translations, entry.translated, entry.targetLang);
+          const translations = normalizeTranslationMap(entry.translations, entry.translated, entry.targetLang, { sourceText: entry.original });
           const translationLines = orderedTranslationEntries(translations, entry.targetLanguages || [entry.targetLang]).map(([language, translatedText]) => `${language.toUpperCase()}: ${translatedText}`);
 
           return [
@@ -2272,7 +2405,7 @@ export default function App() {
                     <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-600">[{formatHistoryTimestamp(entry.timestamp)}]</p>
                     <p className="text-sm leading-6 text-slate-300"><span className="font-black text-slate-100">{entry.sourceLang.toUpperCase()}:</span> {entry.original || "No transcript text"}</p>
                     <div className="mt-2 space-y-1.5">
-                      {orderedTranslationEntries(normalizeTranslationMap(entry.translations, entry.translated, entry.targetLang), entry.targetLanguages || [entry.targetLang]).map(([language, translatedText]) => (
+                      {orderedTranslationEntries(normalizeTranslationMap(entry.translations, entry.translated, entry.targetLang, { sourceText: entry.original }), entry.targetLanguages || [entry.targetLang]).map(([language, translatedText]) => (
                         <p key={language} className="text-sm leading-6 text-blue-50"><span className="font-black text-blue-200">{languageFlag(language)} {language.toUpperCase()}:</span> {translatedText || "No translation text"}</p>
                       ))}
                     </div>

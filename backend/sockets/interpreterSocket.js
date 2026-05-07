@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { verifyToken } from "../services/authService.js";
-import { createInterpreterSession } from "../services/interpreter.js";
+import { createInterpreterSession, isTranslationDisplayable } from "../services/interpreter.js";
 
 const MAX_TARGET_LANGUAGES = 3;
 
@@ -31,6 +31,51 @@ const normalizeTargetLanguages = (targetLanguages, fallbackTargetLang = "es") =>
   }
 
   return uniqueLanguages.length > 0 ? uniqueLanguages : [fallbackTargetLang || "es"];
+};
+
+const sanitizeTranslationResult = (result = {}) => {
+  const targetLanguages = normalizeTargetLanguages(result.targetLanguages, result.targetLang || "es");
+  const rawTranslations = result.translations && typeof result.translations === "object"
+    ? result.translations
+    : result.translatedText
+      ? { [result.targetLang || targetLanguages[0]]: result.translatedText }
+      : {};
+  const translations = {};
+
+  for (const [language, value] of Object.entries(rawTranslations)) {
+    const text = String(value || "").trim();
+    if (
+      isTranslationDisplayable({
+        text,
+        sourceText: result.originalText || result.original || "",
+        sourceLang: result.sourceLang,
+        targetLang: language,
+        provider: result.provider
+      })
+    ) {
+      translations[language] = text;
+    }
+  }
+
+  const translatedText = translations[result.targetLang] || translations[targetLanguages[0]] || Object.values(translations).find(Boolean) || "";
+  const translationOutputs = targetLanguages
+    .map((language) => {
+      const text = translations[language];
+      return text ? { lang: language, text } : null;
+    })
+    .filter(Boolean);
+
+  return {
+    result: {
+      ...result,
+      translatedText,
+      translations,
+      translationOutputs
+    },
+    translatedText,
+    translations,
+    translationOutputs
+  };
 };
 
 export const registerInterpreterSocket = (io, env, getPublicConfig) => {
@@ -92,14 +137,15 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       }
 
       if (result.isTranslationPartial || result.isTranslationComplete) {
-        const translations = result.translations || (result.translatedText ? { [result.targetLang]: result.translatedText } : {});
+        const safe = sanitizeTranslationResult(result);
+        const translations = safe.translations;
 
         if (Object.keys(translations).length > 0) {
           socket.emit("translation_update", {
             original: result.originalText,
-            text: result.translatedText,
+            text: safe.translatedText,
             translations,
-            outputs: result.translationOutputs || [],
+            outputs: safe.translationOutputs,
             sourceLang: result.sourceLang,
             targetLang: result.targetLang,
             targetLanguages: result.targetLanguages || [result.targetLang],
@@ -111,7 +157,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           });
         }
 
-        socket.emit("result", result);
+        socket.emit("result", safe.result);
         return;
       }
 
@@ -129,14 +175,15 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         return;
       }
 
-      const translations = result.translations || (result.translatedText ? { [result.targetLang]: result.translatedText } : {});
+      const safe = sanitizeTranslationResult(result);
+      const translations = safe.translations;
 
       if (Object.keys(translations).length > 0) {
         socket.emit("translation_update", {
           original: result.originalText,
-          text: result.translatedText,
+          text: safe.translatedText,
           translations,
-          outputs: result.translationOutputs || [],
+          outputs: safe.translationOutputs,
           sourceLang: result.sourceLang,
           targetLang: result.targetLang,
           targetLanguages: result.targetLanguages || [result.targetLang],
@@ -146,7 +193,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         });
       }
 
-      socket.emit("result", result);
+      socket.emit("result", safe.result);
     };
 
     const handleStartSession = async (payload = {}, ack) => {

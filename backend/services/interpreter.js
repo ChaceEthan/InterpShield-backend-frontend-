@@ -9,6 +9,7 @@ import {
   normalizeMixedSpeech,
   resolveLocalTranslation
 } from "../utils/translationEnhancer.js";
+import { LOCAL_LANGUAGE_MARKERS } from "../data/languageMemory.js";
 
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
 const MAX_TRANSCRIPT_HISTORY = 500;
@@ -29,6 +30,8 @@ const TRANSLATION_RATE_LIMIT_DELAY_MS = 80;
 const CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS = 3000;
 const LATENCY_WINDOW_SIZE = 5;
 const MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3;
+const MAX_PROVIDER_RETRY_ATTEMPTS = 2;
+const PROVIDER_RETRY_DELAY_MS = 320;
 
 // Admin Dashboard Tracking (Simulated Persistent Store)
 const globalUsageStats = {
@@ -167,11 +170,15 @@ const removeRepeatedFragments = (text = "") => {
   return words.join(" ").trim();
 };
 
-const hasMeaningfulTranslationText = (text = "") =>
-  text
+const hasMeaningfulTranslationText = (text = "") => {
+  const cleanText = cleanTranscriptText(text);
+  if (/[\u3400-\u9fff\uf900-\ufaff]/.test(cleanText)) return true;
+
+  return cleanText
     .split(/\s+/)
     .map(normalizeNoiseToken)
-    .some((word) => word.length >= 3);
+    .some((word) => word.length >= 2);
+};
 
 const normalizeTargetLanguages = (targetLanguages, fallbackTargetLang = "es") => {
   const requestedLanguages = Array.isArray(targetLanguages)
@@ -206,12 +213,20 @@ const wordCount = (text = "") => text.split(/\s+/).filter(Boolean).length;
 const normalizeInterpreterLanguageCode = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
   if (!normalized) return "";
+  if (normalized === "auto") return "auto";
   if (normalized === "lg" || normalized === "lg-ug" || normalized === "lug" || normalized === "luganda") return "luganda";
   if (normalized.startsWith("rw")) return "rw";
   if (normalized.startsWith("rn")) return "rn";
   if (normalized.startsWith("sw")) return "sw";
   if (normalized.startsWith("en")) return "en";
+  if (normalized.startsWith("zh")) return "zh";
+  if (normalized.startsWith("es")) return "es";
   return normalized.split("-")[0] || normalized;
+};
+
+const shouldUseDetectedSourceLanguage = ({ configuredSourceLang = "", twoWay = false } = {}) => {
+  const configured = normalizeInterpreterLanguageCode(configuredSourceLang);
+  return Boolean(twoWay || !configured || configured === "auto");
 };
 
 const isFastLocalLaneLanguage = ({ sourceLang = "", targetLang = "" } = {}) => {
@@ -221,37 +236,6 @@ const isFastLocalLaneLanguage = ({ sourceLang = "", targetLang = "" } = {}) => {
   if (FAST_LOCAL_LANGUAGE_CODES.has(target)) return true;
   if (target === "en" && FAST_LOCAL_LANGUAGE_CODES.has(source)) return true;
   return source === "en" && target === "en";
-};
-
-const triggerBackgroundRetry = (params) => {
-  const { job, language, translateInLane, emitUpdate, retryTimers } = params;
-  const jitteredDelay = 1500 + Math.random() * 2000;
-
-  const retryTimer = setTimeout(async () => {
-    retryTimers?.delete(retryTimer);
-    if (!job || job.stale) return;
-
-    try {
-      const result = await translateInLane({
-        language,
-        translationInput: job.translationInput,
-        direction: job.direction,
-        translationContext: job.translationContext,
-        jobId: job.id
-      });
-
-      const translatedText = String(result?.text || result || "").trim();
-      if (translatedText && !job.stale) {
-        job.translations[language] = translatedText;
-        emitUpdate?.(translatedText, result?.provider || "retry");
-      }
-    } catch (error) {
-      void error;
-    }
-  }, jitteredDelay);
-  retryTimer.unref?.();
-
-  retryTimers?.add(retryTimer);
 };
 
 const translationLaneForLanguage = ({ sourceLang = "", targetLang = "" } = {}) =>
@@ -304,20 +288,425 @@ const translationCacheTtlMs = ({ source, target } = {}) =>
 const isProviderFailureText = (text = "") =>
   /\b(temporar(?:il)y unavailable|temporar(?:il)y failed|translation unavailable|provider failed|timed out|timeout)\b/i.test(String(text || ""));
 
-const isCacheableTranslation = ({ text = "", sourceText = "", provider = "" } = {}) => {
+const isSourceTaggedFallbackText = (text = "") => /^\[[a-z]{2,12}(?:-[a-z0-9]{2,12})?\]\s+/i.test(cleanTranscriptText(text));
+
+const isSourceEchoTranslation = ({ text = "", sourceText = "" } = {}) => {
   const cleanText = cleanTranscriptText(text);
-  if (!cleanText || isProviderFailureText(cleanText)) return false;
-  if (provider === "failed" || provider === "source") return false;
-  if (!hasMeaningfulTranslationText(cleanText)) return false;
-  if (sourceText && normalizeTranscript(cleanText) === normalizeTranscript(sourceText) && provider !== "local") return false;
+  if (!cleanText) return false;
+  return Boolean(sourceText && normalizeTranscript(cleanText) === normalizeTranscript(sourceText));
+};
+
+const TARGET_LANGUAGE_MARKERS = {
+  es: {
+    phrases: [
+      "por favor",
+      "muchas gracias",
+      "buenos dias",
+      "buenas tardes",
+      "buenas noches",
+      "me puedes",
+      "puedes darme",
+      "dame el",
+      "dame la",
+      "tu libro",
+      "su libro",
+      "de nada",
+      "lo siento",
+      "que tal"
+    ],
+    words: [
+      "el",
+      "la",
+      "los",
+      "las",
+      "un",
+      "una",
+      "unos",
+      "unas",
+      "de",
+      "del",
+      "que",
+      "para",
+      "por",
+      "con",
+      "sin",
+      "como",
+      "hola",
+      "gracias",
+      "favor",
+      "vale",
+      "claro",
+      "bueno",
+      "bien",
+      "perdon",
+      "adios",
+      "listo",
+      "puedes",
+      "puede",
+      "puedo",
+      "podemos",
+      "dame",
+      "darme",
+      "libro",
+      "libros",
+      "necesito",
+      "quiero",
+      "tengo",
+      "tienes",
+      "tiene",
+      "buenos",
+      "buenas",
+      "dias",
+      "noches",
+      "si",
+      "aqui",
+      "ahora",
+      "usted",
+      "ustedes",
+      "tu",
+      "mi",
+      "su",
+      "nuestro",
+      "voy",
+      "vaya",
+      "hablar",
+      "escuchar",
+      "traducir",
+      "pregunta",
+      "respuesta",
+      "ayuda",
+      "medico",
+      "hospital"
+    ]
+  },
+  rw: {
+    phrases: [
+      ...(LOCAL_LANGUAGE_MARKERS.rw?.phrases || []),
+      "urashobora kumpa",
+      "igitabo cyawe",
+      "ndagusabye",
+      "mumbabarire"
+    ],
+    words: [
+      ...(LOCAL_LANGUAGE_MARKERS.rw?.words || []),
+      "urashobora",
+      "kumpa",
+      "igitabo",
+      "cyawe",
+      "ndagusabye",
+      "nyamuneka",
+      "oya",
+      "byiza",
+      "iki",
+      "ibyo",
+      "uyu",
+      "wacu",
+      "wawe",
+      "kuri",
+      "kandi",
+      "ndi",
+      "uri",
+      "ari",
+      "muri",
+      "bose",
+      "ndashobora",
+      "tugomba",
+      "gukora",
+      "avuga",
+      "abantu",
+      "umuntu",
+      "cyangwa",
+      "ariko",
+      "rero",
+      "kuko",
+      "ubu",
+      "hano",
+      "akazi",
+      "ubuzima",
+      "amafaranga",
+      "umuryango",
+      "mfasha"
+    ]
+  },
+  rn: {
+    phrases: [
+      ...(LOCAL_LANGUAGE_MARKERS.rn?.phrases || []),
+      "urashobora kumpa",
+      "igitabu cawe",
+      "ndagusavye"
+    ],
+    words: [
+      ...(LOCAL_LANGUAGE_MARKERS.rn?.words || []),
+      "urashobora",
+      "kumpa",
+      "igitabu",
+      "cawe",
+      "ndagusavye",
+      "oya",
+      "amahoro",
+      "nkeneye",
+      "ndashaka",
+      "ivyo",
+      "vyiza",
+      "kuri",
+      "kandi",
+      "ndashobora",
+      "tugomba",
+      "gukora",
+      "avuga",
+      "abantu",
+      "umuntu",
+      "canke",
+      "ariko",
+      "rero",
+      "kuko",
+      "ubu",
+      "ngaha",
+      "akazi",
+      "ubuzima",
+      "amafaranga",
+      "umuryango",
+      "mfasha"
+    ]
+  },
+  sw: {
+    phrases: [
+      ...(LOCAL_LANGUAGE_MARKERS.sw?.phrases || []),
+      "unaweza kunipa",
+      "kitabu chako",
+      "asante sana"
+    ],
+    words: [
+      ...(LOCAL_LANGUAGE_MARKERS.sw?.words || []),
+      "unaweza",
+      "kunipa",
+      "kitabu",
+      "chako",
+      "tafadhali",
+      "asante",
+      "habari",
+      "ndiyo",
+      "hapana",
+      "nina",
+      "kwa",
+      "hii",
+      "hiyo",
+      "mimi",
+      "wewe",
+      "sisi",
+      "yeye",
+      "wao",
+      "ni",
+      "na",
+      "ya",
+      "za",
+      "wa",
+      "watu",
+      "mtu",
+      "leo",
+      "kesho",
+      "sasa",
+      "hapa",
+      "kazi",
+      "fedha",
+      "familia",
+      "afya",
+      "msaada",
+      "wako",
+      "ninahitaji"
+    ]
+  },
+  luganda: {
+    phrases: [
+      ...(LOCAL_LANGUAGE_MARKERS.luganda?.phrases || []),
+      "osobola okumpa",
+      "ekitabo kyo",
+      "webale nyo"
+    ],
+    words: [
+      ...(LOCAL_LANGUAGE_MARKERS.luganda?.words || []),
+      "osobola",
+      "okumpa",
+      "ekitabo",
+      "kyo",
+      "nkusaba",
+      "mpa",
+      "nze",
+      "ggwe",
+      "ffe",
+      "mwe",
+      "kino",
+      "kiri",
+      "ndi",
+      "oli",
+      "ali",
+      "tuli",
+      "muli",
+      "bali",
+      "nga",
+      "kuba",
+      "mu",
+      "ku",
+      "ne",
+      "era",
+      "abantu",
+      "omuntu",
+      "leero",
+      "wano",
+      "ssente",
+      "famire",
+      "obulamu",
+      "nsobola",
+      "okukuyamba",
+      "kati",
+      "kubanga",
+      "omulimu",
+      "guno",
+      "mukulu"
+    ]
+  }
+};
+
+const ENGLISH_LANGUAGE_MARKERS = {
+  phrases: [
+    "can you",
+    "could you",
+    "please give",
+    "give me",
+    "thank you",
+    "how are you",
+    "good morning",
+    "good evening",
+    "no problem",
+    "i would",
+    "i am",
+    "you are"
+  ],
+  words: [
+    "the",
+    "and",
+    "you",
+    "your",
+    "please",
+    "give",
+    "book",
+    "hello",
+    "thanks",
+    "thank",
+    "problem",
+    "question",
+    "answer",
+    "friend",
+    "okay",
+    "need",
+    "want",
+    "have",
+    "this",
+    "that",
+    "what",
+    "when",
+    "where",
+    "why",
+    "how",
+    "can",
+    "could",
+    "would",
+    "should"
+  ]
+};
+
+const normalizeLanguageDetectionText = (text = "") =>
+  cleanTranscriptText(text)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const languageTokens = (text = "") => normalizeLanguageDetectionText(text).match(/[\p{L}\p{N}']+/gu) || [];
+
+const countLanguageMarkers = (text = "", markers = {}) => {
+  const normalized = normalizeLanguageDetectionText(text);
+  const tokens = new Set(languageTokens(text));
+  let score = 0;
+
+  for (const phrase of markers.phrases || []) {
+    const normalizedPhrase = normalizeLanguageDetectionText(phrase);
+    if (normalizedPhrase && normalized.includes(normalizedPhrase)) score += 2;
+  }
+
+  for (const word of markers.words || []) {
+    const normalizedWord = normalizeLanguageDetectionText(word);
+    if (normalizedWord && tokens.has(normalizedWord)) score += 1;
+  }
+
+  return score;
+};
+
+const hasSpanishOrthography = (text = "") => /[\u00e1\u00e9\u00ed\u00f3\u00fa\u00fc\u00f1\u00c1\u00c9\u00cd\u00d3\u00da\u00dc\u00d1\u00bf\u00a1]/.test(text);
+const hasChineseCharacters = (text = "") => /[\u3400-\u9fff\uf900-\ufaff]/.test(text);
+
+const isTargetLanguageText = ({ text = "", targetLang = "" } = {}) => {
+  const target = normalizeInterpreterLanguageCode(targetLang);
+  const cleanText = cleanTranscriptText(text);
+  if (!cleanText) return false;
+  if (!target || target === "auto" || target === "en") return true;
+
+  const tokenCount = languageTokens(cleanText).length;
+  const englishScore = countLanguageMarkers(cleanText, ENGLISH_LANGUAGE_MARKERS);
+
+  if (target === "zh") {
+    return hasChineseCharacters(cleanText);
+  }
+
+  if (target === "es") {
+    const spanishScore = countLanguageMarkers(cleanText, TARGET_LANGUAGE_MARKERS.es);
+    return (
+      hasSpanishOrthography(cleanText) ||
+      spanishScore >= 2 ||
+      (spanishScore >= 1 && englishScore === 0 && tokenCount <= 3)
+    );
+  }
+
+  if (["rw", "rn", "sw", "luganda"].includes(target)) {
+    const markerScore = countLanguageMarkers(cleanText, TARGET_LANGUAGE_MARKERS[target]);
+    return markerScore >= 2 || (markerScore >= 1 && englishScore === 0 && tokenCount <= 4);
+  }
+
+  if (englishScore >= 3) return false;
   return true;
 };
+
+export const isTranslationDisplayable = ({ text = "", sourceText = "", sourceLang = "", targetLang = "", provider = "" } = {}) => {
+  const cleanText = cleanTranscriptText(text);
+  if (!cleanText || isProviderFailureText(cleanText)) return false;
+  if (isSourceTaggedFallbackText(cleanText)) return false;
+  if (provider === "failed" || provider === "source") return false;
+  if (!hasMeaningfulTranslationText(cleanText)) return false;
+
+  if (isSourceEchoTranslation({ text: cleanText, sourceText })) return false;
+  if (!isTargetLanguageText({ text: cleanText, targetLang })) return false;
+
+  void sourceLang;
+  return true;
+};
+
+const isCacheableTranslation = ({ text = "", sourceText = "", provider = "", sourceLang = "", targetLang = "" } = {}) =>
+  isTranslationDisplayable({ text, sourceText, provider, sourceLang, targetLang });
 
 const pruneTranslationCache = (cache = sharedTranslationCache) => {
   const now = Date.now();
 
   for (const [key, entry] of cache.entries()) {
-    if (!entry?.expiresAt || entry.expiresAt <= now) cache.delete(key);
+    if (
+      !entry?.expiresAt ||
+      entry.expiresAt <= now ||
+      !entry.text ||
+      isProviderFailureText(entry.text) ||
+      isSourceTaggedFallbackText(entry.text)
+    ) {
+      cache.delete(key);
+    }
   }
 
   while (cache.size > MAX_TRANSLATION_CACHE_ENTRIES) {
@@ -325,11 +714,24 @@ const pruneTranslationCache = (cache = sharedTranslationCache) => {
   }
 };
 
-const readCachedTranslation = (cache, key) => {
+const readCachedTranslation = (cache, key, metadata = {}) => {
   const entry = cache.get(key);
   if (!entry) return "";
 
   if (entry.expiresAt <= Date.now()) {
+    cache.delete(key);
+    return "";
+  }
+
+  if (
+    !isCacheableTranslation({
+      text: entry.text,
+      sourceText: metadata.sourceText || entry.sourceText,
+      provider: entry.provider || metadata.provider || "cache",
+      sourceLang: metadata.source || entry.source,
+      targetLang: metadata.target || entry.target
+    })
+  ) {
     cache.delete(key);
     return "";
   }
@@ -340,22 +742,30 @@ const readCachedTranslation = (cache, key) => {
 };
 
 const rememberCachedTranslation = (cache, key, value, metadata = {}) => {
-  if (!key || !isCacheableTranslation({ text: value, sourceText: metadata.sourceText, provider: metadata.provider })) return;
+  if (
+    !key ||
+    !isCacheableTranslation({
+      text: value,
+      sourceText: metadata.sourceText,
+      provider: metadata.provider,
+      sourceLang: metadata.source,
+      targetLang: metadata.target
+    })
+  ) {
+    return;
+  }
   if (cache.has(key)) cache.delete(key);
   cache.set(key, {
     text: cleanTranscriptText(value),
     provider: metadata.provider || "unknown",
+    source: metadata.source,
+    target: metadata.target,
+    sourceText: metadata.sourceText,
     createdAt: Date.now(),
     expiresAt: Date.now() + translationCacheTtlMs({ source: metadata.source, target: metadata.target })
   });
 
   pruneTranslationCache(cache);
-};
-
-const sourceLanguageFallbackText = ({ text = "", sourceLang = "" } = {}) => {
-  const cleanText = cleanTranscriptText(text);
-  const source = normalizeInterpreterLanguageCode(sourceLang) || String(sourceLang || "source").trim().toLowerCase() || "source";
-  return cleanText ? `[${source.toUpperCase()}] ${cleanText}` : "";
 };
 
 const adaptiveDebounceDelay = (sentence = "") => {
@@ -446,14 +856,31 @@ const appendSentenceChunk = (sentence = "", chunk = "") => {
 
   if (normalizedSentence.endsWith(normalizedChunk)) return cleanSentence;
   if (normalizedChunk.startsWith(normalizedSentence)) return cleanChunk;
+  if (normalizedSentence.includes(normalizedChunk)) return cleanSentence;
+
+  const sentenceWords = cleanSentence.split(/\s+/).filter(Boolean);
+  const chunkWords = cleanChunk.split(/\s+/).filter(Boolean);
+  const sentenceTokens = sentenceWords.map(normalizeNoiseToken);
+  const chunkTokens = chunkWords.map(normalizeNoiseToken);
+  const maxOverlap = Math.min(sentenceTokens.length, chunkTokens.length, 8);
+
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    const sentenceTail = sentenceTokens.slice(-overlap).join(" ");
+    const chunkHead = chunkTokens.slice(0, overlap).join(" ");
+    if (sentenceTail && sentenceTail === chunkHead) {
+      return `${sentenceWords.join(" ")} ${chunkWords.slice(overlap).join(" ")}`.replace(/\s+/g, " ").trim();
+    }
+  }
 
   return `${cleanSentence} ${cleanChunk}`.replace(/\s+/g, " ").trim();
 };
 
 const resolveDirection = ({ sourceLang, targetLang, targetLanguages, detectedLanguage, twoWay }) => {
-  void twoWay;
   const targets = normalizeTargetLanguages(targetLanguages, targetLang);
-  return { source: detectedLanguage || sourceLang, target: targets[0], targets };
+  const source = shouldUseDetectedSourceLanguage({ configuredSourceLang: sourceLang, twoWay })
+    ? detectedLanguage || sourceLang
+    : sourceLang;
+  return { source, target: targets[0], targets };
 };
 
 export const createInterpreterSession = async ({
@@ -491,7 +918,6 @@ export const createInterpreterSession = async ({
 
   let translationTimer = null;
   let consecutiveTranslationFailures = 0;
-  const lastSuccessfulTranslations = new Map();
   const styleMemoryByLanguage = new Map();
   const translationCache = sharedTranslationCache;
   const staleTranslationJobs = new Set();
@@ -518,6 +944,16 @@ export const createInterpreterSession = async ({
 
     if (!translationLanes[laneId]) {
       translationLanes[laneId] = createTranslationLane({ group, language });
+    }
+
+    return translationLanes[laneId];
+  };
+  const getProviderFallbackLane = (targetLanguage = "") => {
+    const language = normalizeInterpreterLanguageCode(targetLanguage) || String(targetLanguage || "default").trim().toLowerCase() || "default";
+    const laneId = `${TRANSLATION_LANE_PROVIDER}:${language}`;
+
+    if (!translationLanes[laneId]) {
+      translationLanes[laneId] = createTranslationLane({ group: TRANSLATION_LANE_PROVIDER, language });
     }
 
     return translationLanes[laneId];
@@ -739,7 +1175,6 @@ export const createInterpreterSession = async ({
 
   const noteTranslationSuccess = (language, translatedText, translationContext) => {
     consecutiveTranslationFailures = 0;
-    lastSuccessfulTranslations.set(language, translatedText);
     const previousMemory = styleMemoryByLanguage.get(language) || {};
     const recentTranslations = [...(previousMemory.recentTranslations || []), translatedText.slice(0, 180)].slice(-MAX_STYLE_MEMORY_ENTRIES);
 
@@ -775,9 +1210,7 @@ export const createInterpreterSession = async ({
     const source = normalizeInterpreterLanguageCode(direction.source);
     const target = normalizeInterpreterLanguageCode(language);
 
-    if (source && source === target) {
-      return enhanceTranslation({ text: cleanTranscriptText(translationInput), targetLang: language });
-    }
+    if (source && source === target) return "";
 
     if (target === "en" && FAST_LOCAL_LANGUAGE_CODES.has(source)) {
       const mixedSpeech = normalizeMixedSpeech(translationInput);
@@ -790,7 +1223,12 @@ export const createInterpreterSession = async ({
   const translateFastLocalLanguage = async ({ language, translationInput, direction, translationContext }) => {
     const languageTranslationContext = languageTranslationContextFor(language, translationContext);
     const cacheKey = translationCacheKey({ source: direction.source, target: language, text: translationInput });
-    const cachedTranslation = readCachedTranslation(translationCache, cacheKey);
+    const cachedTranslation = readCachedTranslation(translationCache, cacheKey, {
+      source: direction.source,
+      target: language,
+      sourceText: translationInput,
+      provider: "cache"
+    });
 
     if (cachedTranslation) {
       noteTranslationSuccess(language, cachedTranslation, languageTranslationContext);
@@ -798,7 +1236,15 @@ export const createInterpreterSession = async ({
     }
 
     const localTranslation = String(resolveFastLocalTranslation({ language, translationInput, direction }) || "").trim();
-    if (localTranslation) {
+    if (
+      isTranslationDisplayable({
+        text: localTranslation,
+        sourceText: translationInput,
+        sourceLang: direction.source,
+        targetLang: language,
+        provider: "local"
+      })
+    ) {
       noteTranslationSuccess(language, localTranslation, languageTranslationContext);
       rememberCachedTranslation(translationCache, cacheKey, localTranslation, {
         source: direction.source,
@@ -809,7 +1255,13 @@ export const createInterpreterSession = async ({
       return { text: localTranslation, provider: "local" };
     }
 
-    return { text: sourceLanguageFallbackText({ text: translationInput, sourceLang: direction.source }), provider: "source" };
+    const source = normalizeInterpreterLanguageCode(direction.source);
+    const target = normalizeInterpreterLanguageCode(language);
+    return {
+      text: "",
+      provider: "local-miss",
+      needsProviderFallback: Boolean(source && target && source !== target)
+    };
   };
 
   const providerRunner = (provider) => (provider === "gemini" ? translateWithGemini : translateWithOpenAI);
@@ -850,7 +1302,16 @@ export const createInterpreterSession = async ({
       const responseTimeMs = Date.now() - attemptStartedAt;
       const safeTranslatedText = String(translatedText || "").trim();
 
-      if (safeTranslatedText) {
+      if (
+        safeTranslatedText &&
+        isTranslationDisplayable({
+          text: safeTranslatedText,
+          sourceText: translationInput,
+          sourceLang: direction.source,
+          targetLang: language,
+          provider
+        })
+      ) {
         trackUsage(provider, 150);
         return {
           provider,
@@ -862,7 +1323,7 @@ export const createInterpreterSession = async ({
       return {
         provider,
         responseTimeMs,
-        error: new Error(`Empty ${providerName} translation response`)
+        error: new Error(`Invalid ${providerName} translation response for ${language}`)
       };
     } catch (error) {
       return {
@@ -880,7 +1341,12 @@ export const createInterpreterSession = async ({
     let lastError = null;
     const languageTranslationContext = languageTranslationContextFor(language, translationContext);
     const cacheKey = translationCacheKey({ source: direction.source, target: language, text: translationInput });
-    const cachedTranslation = readCachedTranslation(translationCache, cacheKey);
+    const cachedTranslation = readCachedTranslation(translationCache, cacheKey, {
+      source: direction.source,
+      target: language,
+      sourceText: translationInput,
+      provider: "cache"
+    });
 
     if (cachedTranslation) {
       noteTranslationSuccess(language, cachedTranslation, languageTranslationContext);
@@ -906,7 +1372,16 @@ export const createInterpreterSession = async ({
         return "";
       }
 
-      if (result.translatedText) {
+      if (
+        result.translatedText &&
+        isTranslationDisplayable({
+          text: result.translatedText,
+          sourceText: translationInput,
+          sourceLang: direction.source,
+          targetLang: language,
+          provider: result.provider
+        })
+      ) {
         noteProviderSuccess(result.provider);
         noteTranslationSuccess(language, result.translatedText, languageTranslationContext);
         rememberCachedTranslation(translationCache, cacheKey, result.translatedText, {
@@ -918,7 +1393,7 @@ export const createInterpreterSession = async ({
         return { text: result.translatedText, provider: result.provider };
       }
 
-      lastError = result.error || new Error(`${result.provider || "Provider"} did not return a translation`);
+      lastError = result.error || new Error(`${result.provider || "Provider"} did not return a valid ${language} translation`);
       if (result.provider) noteProviderFailure(result.provider, lastError);
       return { text: "", provider: result.provider };
     };
@@ -956,18 +1431,18 @@ export const createInterpreterSession = async ({
 
     noteTranslationFailure(language, lastError);
 
-    const failureCachedTranslation = readCachedTranslation(translationCache, cacheKey);
+    const failureCachedTranslation = readCachedTranslation(translationCache, cacheKey, {
+      source: direction.source,
+      target: language,
+      sourceText: translationInput,
+      provider: "cache"
+    });
     if (failureCachedTranslation) {
       noteTranslationSuccess(language, failureCachedTranslation, languageTranslationContext);
       return { text: failureCachedTranslation, provider: "cache" };
     }
 
-    const fallbackTranslation = String(lastSuccessfulTranslations.get(language) || "").trim();
-    if (fallbackTranslation) {
-      return { text: fallbackTranslation, provider: "fallback" };
-    }
-
-    return { text: sourceLanguageFallbackText({ text: translationInput, sourceLang: direction.source }), provider: "source" };
+    return { text: "", provider: "retry" };
   };
 
   const translationTaskKey = (jobId, language) => `${jobId}:${language}`;
@@ -1050,6 +1525,7 @@ export const createInterpreterSession = async ({
 
     const cleanSentence = cleanTranscriptText(sentence);
     if (!cleanSentence || !hasMeaningfulTranslationText(cleanSentence)) return;
+    if (wordCount(cleanSentence) <= 1 && !sentenceEnds(cleanSentence)) return;
 
     const now = Date.now();
     if (now - lastStreamingPreviewAt < PARTIAL_TRANSLATION_PREVIEW_THROTTLE_MS) return;
@@ -1059,7 +1535,12 @@ export const createInterpreterSession = async ({
 
     for (const language of direction.targets.slice(0, MAX_TARGET_LANGUAGES)) {
       const cacheKey = translationCacheKey({ source: direction.source, target: language, text: translationInput });
-      const cachedTranslation = readCachedTranslation(translationCache, cacheKey);
+      const cachedTranslation = readCachedTranslation(translationCache, cacheKey, {
+        source: direction.source,
+        target: language,
+        sourceText: translationInput,
+        provider: "cache"
+      });
       const laneGroup = translationLaneForLanguage({ sourceLang: direction.source, targetLang: language });
       let translatedText = cachedTranslation;
 
@@ -1067,11 +1548,17 @@ export const createInterpreterSession = async ({
         translatedText = resolveFastLocalTranslation({ language, translationInput, direction });
       }
 
-      if (!translatedText) {
-        translatedText = sourceLanguageFallbackText({ text: translationInput, sourceLang: direction.source });
+      if (
+        isTranslationDisplayable({
+          text: translatedText,
+          sourceText: translationInput,
+          sourceLang: direction.source,
+          targetLang: language,
+          provider: laneGroup === TRANSLATION_LANE_FAST_LOCAL ? "local" : "cache"
+        })
+      ) {
+        translations[language] = cleanTranscriptText(translatedText);
       }
-
-      if (translatedText) translations[language] = translatedText;
     }
 
     const translatedText = translations[direction.target] || Object.values(translations).find(Boolean) || "";
@@ -1134,14 +1621,26 @@ export const createInterpreterSession = async ({
 
   const emitTranslationUpdate = (job, language, translatedText, provider) => {
     if (!translatedText || job.stale || staleTranslationJobs.has(job.id)) return;
+    const safeTranslatedText = cleanTranscriptText(translatedText);
+    if (
+      !isTranslationDisplayable({
+        text: safeTranslatedText,
+        sourceText: job.translationInput,
+        sourceLang: job.direction.source,
+        targetLang: language,
+        provider
+      })
+    ) {
+      return;
+    }
 
-    job.translations[language] = translatedText;
+    job.translations[language] = safeTranslatedText;
     const translationOutputs = translationOutputsForJob(job);
 
     onResult?.({
       original: job.sentence,
       originalText: job.sentence,
-      translatedText: job.translations[job.direction.target] || translatedText,
+      translatedText: job.translations[job.direction.target] || safeTranslatedText,
       translations: { ...job.translations },
       translationOutputs,
       isFinal: true,
@@ -1213,14 +1712,85 @@ export const createInterpreterSession = async ({
     }
   };
 
-  const finishTranslationTask = (lane, job, language, taskKey) => {
+  const finishTranslationTask = (lane, job, language, taskKey, options = {}) => {
     const activeTask = lane.activeTasks.get(taskKey);
     if (!activeTask) return false;
 
     updateLaneLatency(lane, Date.now() - activeTask.startedAt);
     lane.activeTasks.delete(taskKey);
     job.runningLanguages.delete(language);
-    job.completedLanguages.add(language);
+    if (options.completeLanguage !== false) job.completedLanguages.add(language);
+    return true;
+  };
+
+  const queueProviderFallbackTranslation = (job, language) => {
+    if (!job || job.stale || job.completed || staleTranslationJobs.has(job.id)) return false;
+    if (job.translations?.[language] || job.runningLanguages.has(language) || job.pendingLanguages.has(language)) return false;
+    if (job.providerFallbackLanguages?.has(language)) return false;
+    if (getHealthyProviders().length === 0) return false;
+
+    job.providerFallbackLanguages?.add(language);
+    job.pendingLanguages.add(language);
+
+    const lane = getProviderFallbackLane(language);
+    lane.queue.push({
+      id: `${translationTaskKey(job.id, language)}:providerFallback`,
+      jobId: job.id,
+      job,
+      language,
+      laneId: lane.id,
+      createdAt: Date.now(),
+      startedAt: 0,
+      stale: false,
+      fallbackFromLocal: true
+    });
+
+    pruneTranslationLaneQueue(lane);
+    scheduleTranslationDrain(lane.id);
+    return true;
+  };
+
+  const queueProviderRetryTranslation = (job, language) => {
+    if (!job || job.stale || job.completed || staleTranslationJobs.has(job.id)) return false;
+    if (job.translations?.[language] || job.runningLanguages.has(language) || job.pendingLanguages.has(language)) return false;
+    if (getHealthyProviders().length === 0) return false;
+
+    const retryAttempts = job.providerRetryAttempts || new Map();
+    job.providerRetryAttempts = retryAttempts;
+    const attempt = retryAttempts.get(language) || 0;
+    if (attempt >= MAX_PROVIDER_RETRY_ATTEMPTS) return false;
+
+    retryAttempts.set(language, attempt + 1);
+    job.pendingLanguages.add(language);
+
+    const retryTimer = setTimeout(() => {
+      backgroundRetryTimers.delete(retryTimer);
+
+      if (job.stale || job.completed || staleTranslationJobs.has(job.id) || job.translations?.[language]) {
+        job.pendingLanguages.delete(language);
+        finalizeTranslationJobIfReady(job);
+        return;
+      }
+
+      const lane = getProviderFallbackLane(language);
+      lane.queue.push({
+        id: `${translationTaskKey(job.id, language)}:providerRetry:${attempt + 1}`,
+        jobId: job.id,
+        job,
+        language,
+        laneId: lane.id,
+        createdAt: Date.now(),
+        startedAt: 0,
+        stale: false,
+        retryAttempt: attempt + 1
+      });
+
+      pruneTranslationLaneQueue(lane);
+      scheduleTranslationDrain(lane.id);
+    }, PROVIDER_RETRY_DELAY_MS * (attempt + 1));
+    retryTimer.unref?.();
+    backgroundRetryTimers.add(retryTimer);
+
     return true;
   };
 
@@ -1261,40 +1831,43 @@ export const createInterpreterSession = async ({
 
       const translatedText = result?.text || "";
       const provider = result?.provider || (lane.group === TRANSLATION_LANE_FAST_LOCAL ? "local" : "unknown");
+      const needsProviderFallback = Boolean(result?.needsProviderFallback);
+      const safeTranslatedText = cleanTranscriptText(translatedText);
+      const hasValidTranslation = Boolean(
+        safeTranslatedText &&
+          isTranslationDisplayable({
+            text: safeTranslatedText,
+            sourceText: job.translationInput,
+            sourceLang: job.direction.source,
+            targetLang: language,
+            provider
+          })
+      );
       job.lastProviderUsed = provider;
 
-      if (!finishTranslationTask(lane, job, language, taskKey)) {
+      if (
+        !finishTranslationTask(lane, job, language, taskKey, {
+          completeLanguage:
+            hasValidTranslation ||
+            (lane.group !== TRANSLATION_LANE_PROVIDER &&
+              !(lane.group === TRANSLATION_LANE_FAST_LOCAL && needsProviderFallback))
+        })
+      ) {
         scheduleTranslationDrain(lane.id);
         return;
       }
 
       if (!job.stale && !staleTranslationJobs.has(job.id)) {
-        const safeTranslatedText = String(translatedText || "").trim();
-
-        if (safeTranslatedText) {
+        if (hasValidTranslation) {
           emitTranslationUpdate(job, language, safeTranslatedText, provider);
-
-          const isFallback = provider === "source" ||
-                            safeTranslatedText === job.translationInput ||
-                            safeTranslatedText === lastSuccessfulTranslations.get(language);
-
-          if (isFallback && lane.group === TRANSLATION_LANE_PROVIDER) {
-            triggerBackgroundRetry({
-              job,
-              language,
-              translateInLane,
-              retryTimers: backgroundRetryTimers,
-              emitUpdate: (retryText, retryProvider) => emitTranslationUpdate(job, language, retryText, retryProvider)
-            });
+        } else if (needsProviderFallback && lane.group === TRANSLATION_LANE_FAST_LOCAL) {
+          if (!queueProviderFallbackTranslation(job, language)) {
+            job.completedLanguages.add(language);
           }
         } else if (lane.group === TRANSLATION_LANE_PROVIDER) {
-          triggerBackgroundRetry({
-            job,
-            language,
-            translateInLane,
-            retryTimers: backgroundRetryTimers,
-            emitUpdate: (retryText, retryProvider) => emitTranslationUpdate(job, language, retryText, retryProvider)
-          });
+          if (!queueProviderRetryTranslation(job, language)) {
+            job.completedLanguages.add(language);
+          }
         }
 
         finalizeTranslationJobIfReady(job);
@@ -1434,7 +2007,9 @@ export const createInterpreterSession = async ({
       return;
     }
 
-    const localDetection = resolveSourceLanguage({ text: sentence, providerDetectedLanguage: detectedLanguage });
+    const localDetection = shouldUseDetectedSourceLanguage({ configuredSourceLang: sourceLang, twoWay })
+      ? resolveSourceLanguage({ text: sentence, providerDetectedLanguage: detectedLanguage })
+      : { language: sourceLang, confidence: 1, source: "configured" };
     const direction = {
       ...baseDirection,
       source: localDetection.language || baseDirection.source
@@ -1484,6 +2059,8 @@ export const createInterpreterSession = async ({
       pendingLanguages: new Set(direction.targets.slice(0, MAX_TARGET_LANGUAGES)),
       runningLanguages: new Set(),
       completedLanguages: new Set(),
+      providerFallbackLanguages: new Set(),
+      providerRetryAttempts: new Map(),
       createdAt: startedAt,
       startedAt,
       completed: false,
@@ -1571,7 +2148,9 @@ export const createInterpreterSession = async ({
         return;
       }
 
-      const localDetection = resolveSourceLanguage({ text: displayText, providerDetectedLanguage: detectedLanguage });
+      const localDetection = shouldUseDetectedSourceLanguage({ configuredSourceLang: sourceLang, twoWay })
+        ? resolveSourceLanguage({ text: displayText, providerDetectedLanguage: detectedLanguage })
+        : { language: sourceLang, confidence: 1, source: "configured" };
       const effectiveDetectedLanguage = localDetection.language || detectedLanguage;
       const direction = resolveDirection({
         sourceLang,
@@ -1584,6 +2163,11 @@ export const createInterpreterSession = async ({
       if (!isFinal) {
         const previewText = appendSentenceChunk(currentSentence, displayText);
         const previewNormalized = normalizeTranscript(previewText);
+        const tinyPreviewFragment = wordCount(previewText) <= 1 && !sentenceEnds(previewText);
+
+        if (tinyPreviewFragment) {
+          return;
+        }
 
         if (previewNormalized === lastInterimTranscript || normalized === lastFinalTranscript) {
           return;
@@ -1619,7 +2203,7 @@ export const createInterpreterSession = async ({
         confidence: localDetection.confidence
       });
       currentSentence = trimTextWindow(appendSentenceChunk(currentSentence, displayText));
-      scheduleStableTranslation(0);
+      scheduleStableTranslation();
     }
   });
 
