@@ -177,9 +177,9 @@ const MAX_TRANSCRIPT_HISTORY_ENTRIES = 500;
 const MAX_TARGET_LANGUAGES = 3;
 const LIVE_TEXT_WINDOW_CHARS = 900;
 const LIVE_SEGMENT_WINDOW = 6;
-const MAX_LIVE_SEGMENTS = 24;
-const VISIBLE_HISTORY_ITEMS = 80;
-const PARTIAL_SUBTITLE_THROTTLE_MS = 90;
+const MAX_LIVE_SEGMENTS = 18;
+const VISIBLE_HISTORY_ITEMS = 40;
+const PARTIAL_SUBTITLE_THROTTLE_MS = 120;
 const HISTORY_PERSIST_DEBOUNCE_MS = 250;
 const MAX_DUBBING_QUEUE_ITEMS = 6;
 const MAX_SPOKEN_DUBBING_KEYS = 180;
@@ -268,7 +268,9 @@ const LANGUAGES: Language[] = [
   { code: "pl", name: "Polish", region: "Poland" },
   { code: "ru", name: "Russian", region: "Global" },
   { code: "rw", name: "Kinyarwanda", region: "Rwanda" },
-  { code: "rn", name: "Kirundi", region: "Burundi" }
+  { code: "rn", name: "Kirundi", region: "Burundi" },
+  { code: "sw", name: "Swahili", region: "East Africa" },
+  { code: "luganda", name: "Luganda", region: "Uganda" }
 ];
 
 const TOOL_ITEMS: Array<{ mode: Mode; label: string; icon: LucideIcon }> = [
@@ -294,7 +296,9 @@ const LANGUAGE_FLAGS: Record<string, string> = {
   pl: "🇵🇱",
   ru: "🇷🇺",
   rw: "🇷🇼",
-  rn: "🇧🇮"
+  rn: "🇧🇮",
+  sw: "SW",
+  luganda: "UG"
 };
 
 const SPEECH_SYNTHESIS_LANGS: Record<string, string> = {
@@ -314,7 +318,9 @@ const SPEECH_SYNTHESIS_LANGS: Record<string, string> = {
   pl: "pl-PL",
   ru: "ru-RU",
   rw: "rw-RW",
-  rn: "rn-BI"
+  rn: "rn-BI",
+  sw: "sw-KE",
+  luganda: "lg-UG"
 };
 
 const PRICING_PLANS = [
@@ -1049,6 +1055,7 @@ export default function App() {
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
   const displayTranslationEntries = targetLanguages.map((language) => [language, finalTranslations[language]?.trim() || ""] as const);
+  const visibleHistory = useMemo(() => history.slice(-VISIBLE_HISTORY_ITEMS), [history]);
   const maxSessionSeconds = config?.maxSessionSeconds || 3600;
   const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
 
@@ -2133,7 +2140,7 @@ export default function App() {
               <p className="rounded-lg border border-white/10 bg-slate-950/50 p-4 text-sm text-slate-500">Final transcripts will stay here during long sessions and after refresh.</p>
             ) : (
               <div className="space-y-3">
-                {history.slice(-VISIBLE_HISTORY_ITEMS).map((entry) => (
+                {visibleHistory.map((entry) => (
                   <div key={entry.id} className="rounded-lg border border-white/10 bg-slate-950/55 p-4">
                     <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-600">[{formatHistoryTimestamp(entry.timestamp)}]</p>
                     <p className="text-sm leading-6 text-slate-300"><span className="font-black text-slate-100">{entry.sourceLang.toUpperCase()}:</span> {entry.original || "No transcript text"}</p>

@@ -2,28 +2,30 @@
 import { createDeepgramSession } from "./deepgram.js";
 import { translateWithGemini } from "./gemini.js";
 import { translateWithOpenAI } from "./openai.js";
-import { detectRegionAccent, normalizeMixedSpeech, resolveLocalTranslation } from "../utils/translationEnhancer.js";
+import { detectLocalSourceLanguage, detectRegionAccent, normalizeMixedSpeech, resolveLocalTranslation } from "../utils/translationEnhancer.js";
 
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
 const MAX_TRANSCRIPT_HISTORY = 500;
 const MAX_STORED_SESSIONS = 100;
 const MAX_TARGET_LANGUAGES = 3;
-const SENTENCE_DEBOUNCE_MS = 520;
-const SHORT_PAUSE_DEBOUNCE_MS = 760;
-const SILENCE_DEBOUNCE_MS = 940;
-const TRANSLATION_RATE_LIMIT_DELAY_MS = 180;
+const SENTENCE_DEBOUNCE_MS = 360;
+const SHORT_PAUSE_DEBOUNCE_MS = 700;
+const SILENCE_DEBOUNCE_MS = 700;
+const LOCAL_LANGUAGE_CONFIDENCE_THRESHOLD = 0.7;
+const MAX_ACTIVE_TRANSLATIONS = 2;
+const MAX_QUEUE_SIZE = 10;
+const STALE_JOB_TIMEOUT = 6000;
+const TRANSLATION_RATE_LIMIT_DELAY_MS = 80;
 const MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3;
 const MAX_STYLE_MEMORY_ENTRIES = 20;
 const MAX_TRANSLATION_CACHE_ENTRIES = 180;
-const TRANSLATION_ATTEMPT_TIMEOUT_MS = 8500;
-const TRANSLATION_JOB_TIMEOUT_MS = 16000;
+const TRANSLATION_ATTEMPT_TIMEOUT_MS = 2500;
 const PROVIDER_FAILURE_THRESHOLD = 2;
 const PROVIDER_COOLDOWN_MS = 30000;
 const SESSION_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
 const SESSION_HEALTH_CHECK_MS = 2500;
 const MAX_STALE_TRANSLATION_JOBS = 40;
 const MAX_PENDING_SENTENCE_CHARS = 1400;
-const QUEUED_TRANSLATION_RESCHEDULE_MS = 220;
 const SAFE_FALLBACK_TRANSLATION = "Translation temporarily unavailable.";
 const sessionHistoryStore = new Map();
 
@@ -318,10 +320,15 @@ export const createInterpreterSession = async ({
   const styleMemoryByLanguage = new Map();
   const translationCache = new Map();
   const staleTranslationJobs = new Set();
-  let translationInFlight = false;
-  let activeTranslationStartedAt = 0;
-  let activeTranslationJobId = 0;
-  let activeTranslationSnapshot = null;
+  const translationQueue = [];
+  const activeTranslationTasks = new Map();
+  const activeTranslationJobs = new Map();
+  const localSourceMemory = {
+    language: null,
+    confidence: 0,
+    transcriptHistory: []
+  };
+  let drainScheduled = false;
   let translationJobSequence = 0;
   const sessionId = createSessionId();
   const providerHealth = {
@@ -342,10 +349,17 @@ export const createInterpreterSession = async ({
     lastInterimTranscript = "";
     lastTranslatedTranscript = "";
     consecutiveTranslationFailures = 0;
-    translationInFlight = false;
-    activeTranslationStartedAt = 0;
-    activeTranslationJobId = 0;
-    activeTranslationSnapshot = null;
+    drainScheduled = false;
+    for (const job of translationQueue) {
+      staleTranslationJobs.add(job.id);
+      job.stale = true;
+    }
+    for (const task of activeTranslationTasks.values()) {
+      staleTranslationJobs.add(task.jobId);
+    }
+    translationQueue.length = 0;
+    activeTranslationJobs.clear();
+    activeTranslationTasks.clear();
   };
 
   const trimStaleTranslationJobs = () => {
@@ -393,6 +407,45 @@ export const createInterpreterSession = async ({
     }
   };
 
+  const rememberLocalSourceLanguage = ({ text = "", language, confidence = 0 } = {}) => {
+    const cleanText = cleanTranscriptText(text);
+    if (!cleanText || !language) return;
+
+    localSourceMemory.language = language;
+    localSourceMemory.confidence = Math.max(localSourceMemory.confidence || 0, confidence);
+    localSourceMemory.transcriptHistory.push({ original: cleanText, language, confidence });
+
+    if (localSourceMemory.transcriptHistory.length > 12) {
+      localSourceMemory.transcriptHistory.splice(0, localSourceMemory.transcriptHistory.length - 12);
+    }
+  };
+
+  const resolveSourceLanguage = ({ text = "", providerDetectedLanguage = "" } = {}) => {
+    const detection = detectLocalSourceLanguage({
+      text,
+      transcriptHistory: localSourceMemory.transcriptHistory,
+      previousLanguage: localSourceMemory.language || currentDetectedLanguage,
+      providerLanguage: providerDetectedLanguage,
+      configuredSourceLang: sourceLang
+    });
+
+    if (detection.language && detection.confidence >= LOCAL_LANGUAGE_CONFIDENCE_THRESHOLD) {
+      rememberLocalSourceLanguage({ text, language: detection.language, confidence: detection.confidence });
+      return {
+        language: detection.language,
+        confidence: detection.confidence,
+        source: detection.source
+      };
+    }
+
+    const fallbackLanguage = providerDetectedLanguage || localSourceMemory.language || currentDetectedLanguage || sourceLang;
+    return {
+      language: fallbackLanguage,
+      confidence: detection.confidence,
+      source: providerDetectedLanguage ? "provider" : "memory"
+    };
+  };
+
   const noteTranslationSuccess = (language, translatedText, translationContext) => {
     consecutiveTranslationFailures = 0;
     lastSuccessfulTranslations.set(language, translatedText);
@@ -438,6 +491,18 @@ export const createInterpreterSession = async ({
       console.log("Translation cache hit", { targetLang: language });
       noteTranslationSuccess(language, cachedTranslation, languageTranslationContext);
       return cachedTranslation;
+    }
+
+    const localTranslation = resolveLocalTranslation({ text: translationInput, sourceLang: direction.source, targetLang: language });
+    if (localTranslation) {
+      console.log("Local instant translation hit", {
+        sourceLang: direction.source,
+        targetLang: language,
+        latencyTargetMs: 100
+      });
+      noteTranslationSuccess(language, localTranslation, languageTranslationContext);
+      rememberCachedTranslation(translationCache, cacheKey, localTranslation);
+      return localTranslation;
     }
 
     if (env.geminiApiKey && providerAvailable("gemini")) {
@@ -567,14 +632,6 @@ export const createInterpreterSession = async ({
       });
     }
 
-    const localTranslation = resolveLocalTranslation({ text: translationInput, targetLang: language });
-    if (localTranslation) {
-      console.warn("Using local translation enhancer fallback", { targetLang: language });
-      noteTranslationSuccess(language, localTranslation, languageTranslationContext);
-      rememberCachedTranslation(translationCache, cacheKey, localTranslation);
-      return localTranslation;
-    }
-
     noteTranslationFailure(language, lastError);
 
     const fallbackTranslation = String(lastSuccessfulTranslations.get(language) || "").trim();
@@ -595,169 +652,380 @@ export const createInterpreterSession = async ({
     return SAFE_FALLBACK_TRANSLATION;
   };
 
+  const translationTaskKey = (jobId, language) => `${jobId}:${language}`;
+
+  const removeTranslationJob = (jobId) => {
+    const queueIndex = translationQueue.findIndex((queuedJob) => queuedJob.id === jobId);
+    if (queueIndex >= 0) translationQueue.splice(queueIndex, 1);
+    activeTranslationJobs.delete(jobId);
+  };
+
+  const markTranslationJobStale = (job, reason) => {
+    if (!job || job.stale) return;
+
+    job.stale = true;
+    staleTranslationJobs.add(job.id);
+    job.pendingLanguages.length = 0;
+    job.runningLanguages.clear();
+    removeTranslationJob(job.id);
+
+    for (const [taskKey, task] of activeTranslationTasks.entries()) {
+      if (task.jobId === job.id) activeTranslationTasks.delete(taskKey);
+    }
+
+    console.warn("Translation job discarded", {
+      jobId: job.id,
+      reason,
+      queueDepth: translationQueue.length,
+      activeTranslations: activeTranslationTasks.size
+    });
+  };
+
+  const pruneTranslationQueue = () => {
+    while (translationQueue.length > MAX_QUEUE_SIZE) {
+      const newestIndex = translationQueue.length - 1;
+      let dropIndex = translationQueue.findIndex(
+        (job, index) => index < newestIndex && job.runningLanguages.size === 0 && !job.isFinalizedSentence
+      );
+
+      if (dropIndex < 0) {
+        dropIndex = translationQueue.findIndex((job, index) => index < newestIndex && job.runningLanguages.size === 0);
+      }
+
+      if (dropIndex < 0) dropIndex = 0;
+
+      const [droppedJob] = translationQueue.splice(dropIndex, 1);
+      markTranslationJobStale(droppedJob, "queue_overflow");
+    }
+  };
+
+  const translationOutputsForJob = (job) =>
+    job.direction.targets
+      .map((language) => {
+        const text = job.translations[language];
+        return text ? { lang: language, text } : null;
+      })
+      .filter(Boolean);
+
+  const rememberTranscriptEntry = (job, translatedText) => {
+    if (!translatedText) return;
+
+    const transcriptEntry = {
+      original: job.sentence,
+      translated: translatedText,
+      translations: { ...job.translations },
+      timestamp: new Date(),
+      sourceLang: job.direction.source,
+      targetLang: job.direction.target,
+      targetLanguages: job.direction.targets
+    };
+
+    const lastTranscriptEntry = session.transcriptHistory[session.transcriptHistory.length - 1];
+    const duplicateTranscriptEntry =
+      lastTranscriptEntry?.original === transcriptEntry.original &&
+      lastTranscriptEntry?.translated === transcriptEntry.translated &&
+      JSON.stringify(lastTranscriptEntry?.translations || {}) === JSON.stringify(transcriptEntry.translations || {});
+
+    if (!duplicateTranscriptEntry) {
+      session.transcriptHistory.push(transcriptEntry);
+    }
+
+    if (session.transcriptHistory.length > MAX_TRANSCRIPT_HISTORY) {
+      session.transcriptHistory.splice(0, session.transcriptHistory.length - MAX_TRANSCRIPT_HISTORY);
+    }
+    touchSessionHistory(sessionId);
+  };
+
+  const emitTranslationUpdate = (job, language, translatedText) => {
+    if (!translatedText || job.stale || staleTranslationJobs.has(job.id)) return;
+
+    job.translations[language] = translatedText;
+    const translationOutputs = translationOutputsForJob(job);
+
+    onResult?.({
+      original: job.sentence,
+      originalText: job.sentence,
+      translatedText: job.translations[job.direction.target] || translatedText,
+      translations: { ...job.translations },
+      translationOutputs,
+      isFinal: true,
+      isTranslationPartial: true,
+      translationComplete: false,
+      sourceLang: job.direction.source,
+      targetLang: job.direction.target,
+      targetLanguages: job.direction.targets,
+      detectedLanguage: job.detectedLanguage,
+      latencyMs: Date.now() - job.startedAt,
+      mode: "production"
+    });
+  };
+
+  const finalizeTranslationJobIfReady = (job) => {
+    if (!job || job.completed || job.stale || staleTranslationJobs.has(job.id)) return;
+    if (job.pendingLanguages.length > 0 || job.runningLanguages.size > 0) return;
+
+    job.completed = true;
+    removeTranslationJob(job.id);
+    staleTranslationJobs.delete(job.id);
+    trimStaleTranslationJobs();
+
+    const translatedText = job.translations[job.direction.target] || Object.values(job.translations).find(Boolean) || "";
+    lastTranslatedTranscript = job.normalizedSentence;
+
+    if (translatedText) {
+      rememberTranscriptEntry(job, translatedText);
+    }
+
+    onResult?.({
+      original: job.sentence,
+      originalText: job.sentence,
+      translatedText,
+      translations: { ...job.translations },
+      translationOutputs: translationOutputsForJob(job),
+      isFinal: true,
+      isTranslationComplete: job.shouldTranslate,
+      sourceLang: job.direction.source,
+      targetLang: job.direction.target,
+      targetLanguages: job.direction.targets,
+      detectedLanguage: job.detectedLanguage,
+      latencyMs: Date.now() - job.startedAt,
+      mode: "production"
+    });
+  };
+
+  const scheduleTranslationDrain = () => {
+    if (drainScheduled) return;
+    drainScheduled = true;
+
+    setTimeout(() => {
+      drainScheduled = false;
+      drainTranslationQueue();
+    }, 0).unref?.();
+  };
+
+  const finishTranslationTask = (job, language, taskKey) => {
+    const activeTask = activeTranslationTasks.get(taskKey);
+    if (!activeTask) return false;
+
+    activeTranslationTasks.delete(taskKey);
+    job.runningLanguages.delete(language);
+    job.completedLanguages.add(language);
+    return true;
+  };
+
+  const startTranslationTask = (job, language) => {
+    const taskKey = translationTaskKey(job.id, language);
+    if (activeTranslationTasks.has(taskKey) || job.runningLanguages.has(language) || job.completedLanguages.has(language)) return;
+
+    job.startedAt = job.startedAt || Date.now();
+    job.runningLanguages.add(language);
+    activeTranslationJobs.set(job.id, job);
+    activeTranslationTasks.set(taskKey, {
+      jobId: job.id,
+      language,
+      startedAt: Date.now()
+    });
+
+    void (async () => {
+      let translatedText = "";
+
+      try {
+        translatedText = await translateLanguageWithRecovery({
+          language,
+          translationInput: job.translationInput,
+          direction: job.direction,
+          translationContext: job.translationContext,
+          jobId: job.id
+        });
+      } catch (error) {
+        noteTranslationFailure(language, error);
+        console.warn("Translation task failed unexpectedly", {
+          jobId: job.id,
+          targetLang: language,
+          error: error?.message || error
+        });
+      }
+
+      if (!finishTranslationTask(job, language, taskKey)) {
+        scheduleTranslationDrain();
+        return;
+      }
+
+      if (!job.stale && !staleTranslationJobs.has(job.id)) {
+        const safeTranslatedText = String(translatedText || "").trim();
+        if (safeTranslatedText) emitTranslationUpdate(job, language, safeTranslatedText);
+        finalizeTranslationJobIfReady(job);
+      }
+
+      scheduleTranslationDrain();
+    })();
+  };
+
+  const nextTranslationTask = () => {
+    for (const job of translationQueue) {
+      if (job.stale || job.completed || staleTranslationJobs.has(job.id)) continue;
+      if (job.pendingLanguages.length === 0 && job.runningLanguages.size === 0) {
+        finalizeTranslationJobIfReady(job);
+        continue;
+      }
+
+      const nextLanguage = job.pendingLanguages.shift();
+      if (!nextLanguage) continue;
+
+      return { job, language: nextLanguage };
+    }
+
+    return null;
+  };
+
+  const cleanupStaleTranslationWork = () => {
+    const now = Date.now();
+
+    for (const [taskKey, task] of activeTranslationTasks.entries()) {
+      if (now - task.startedAt < STALE_JOB_TIMEOUT) continue;
+
+      const job = activeTranslationJobs.get(task.jobId);
+      activeTranslationTasks.delete(taskKey);
+
+      if (job) {
+        job.runningLanguages.delete(task.language);
+        job.completedLanguages.add(task.language);
+        noteTranslationFailure(task.language, new Error("Translation task became stale"));
+        finalizeTranslationJobIfReady(job);
+      }
+
+      console.warn("Translation worker auto-reset after stale task", {
+        jobId: task.jobId,
+        targetLang: task.language,
+        activeForMs: now - task.startedAt
+      });
+    }
+
+    for (const job of [...translationQueue]) {
+      if (job.startedAt || now - job.createdAt < STALE_JOB_TIMEOUT * 2) continue;
+      markTranslationJobStale(job, "queued_too_long");
+    }
+  };
+
+  function drainTranslationQueue() {
+    cleanupStaleTranslationWork();
+    refreshProviderCooldowns();
+    pruneTranslationQueue();
+
+    while (activeTranslationTasks.size < MAX_ACTIVE_TRANSLATIONS) {
+      const nextTask = nextTranslationTask();
+      if (!nextTask) break;
+      startTranslationTask(nextTask.job, nextTask.language);
+    }
+  }
+
+  const enqueueTranslationJob = (job) => {
+    translationQueue.push(job);
+    pruneTranslationQueue();
+    scheduleTranslationDrain();
+  };
+
+  const hasQueuedTranslationForSentence = (normalizedSentence) =>
+    translationQueue.some((job) => !job.stale && !job.completed && job.normalizedSentence === normalizedSentence);
+
   const emitStableSentence = async () => {
     clearTranslationTimer();
-
-    if (translationInFlight) {
-      if (currentSentence.trim()) {
-        scheduleStableTranslation(QUEUED_TRANSLATION_RESCHEDULE_MS);
-      }
-      return;
-    }
+    cleanupStaleTranslationWork();
 
     const sentence = cleanTranscriptText(currentSentence);
     const normalizedSentence = normalizeTranscript(sentence);
-    const direction = { ...currentDirection };
+    const baseDirection = { ...currentDirection, targets: [...currentDirection.targets] };
     const detectedLanguage = currentDetectedLanguage;
     currentSentence = "";
     lastInterimTranscript = "";
 
-    if (!sentence || !hasMeaningfulTranslationText(sentence) || normalizedSentence === lastTranslatedTranscript) {
+    if (
+      !sentence ||
+      !hasMeaningfulTranslationText(sentence) ||
+      normalizedSentence === lastTranslatedTranscript ||
+      hasQueuedTranslationForSentence(normalizedSentence)
+    ) {
+      return;
+    }
+
+    const localDetection = resolveSourceLanguage({ text: sentence, providerDetectedLanguage: detectedLanguage });
+    const direction = {
+      ...baseDirection,
+      source: localDetection.language || baseDirection.source
+    };
+    const effectiveDetectedLanguage = localDetection.language || detectedLanguage;
+    const isFinalizedSentence = sentenceEnds(sentence);
+    const looksLikeTinyFragment = wordCount(sentence) <= 1 && !isFinalizedSentence && sentence.length < 4;
+
+    if (looksLikeTinyFragment) {
       return;
     }
 
     const startedAt = Date.now();
     const jobId = translationJobSequence + 1;
     translationJobSequence = jobId;
-    activeTranslationJobId = jobId;
-    activeTranslationStartedAt = startedAt;
-    activeTranslationSnapshot = {
-      sentence,
-      normalizedSentence,
-      direction,
-      detectedLanguage
-    };
-    translationInFlight = true;
-
-    try {
     const translationInput = prepareTextForTranslation(sentence);
-    const translations = {};
-    const translationOutputs = [];
-    const translationContext = buildTranslationContext({ sentence, direction, detectedLanguage });
+    const translationContext = buildTranslationContext({ sentence, direction, detectedLanguage: effectiveDetectedLanguage });
 
-    if (shouldTranslate) {
+    if (!shouldTranslate) {
+      lastTranslatedTranscript = normalizedSentence;
       onResult?.({
         original: sentence,
         originalText: sentence,
         translatedText: "",
         translations: {},
-        translationOutputs,
+        translationOutputs: [],
         isFinal: true,
-        isTranscriptOnly: true,
         sourceLang: direction.source,
         targetLang: direction.target,
         targetLanguages: direction.targets,
-        detectedLanguage,
+        detectedLanguage: effectiveDetectedLanguage,
         latencyMs: Date.now() - startedAt,
         mode: "production"
       });
-    }
-
-    if (shouldTranslate) {
-      const targetQueue = direction.targets.slice(0, MAX_TARGET_LANGUAGES);
-
-      for (const language of targetQueue) {
-        if (staleTranslationJobs.has(jobId)) break;
-
-        if (translationOutputs.length > 0) {
-          await delay(TRANSLATION_RATE_LIMIT_DELAY_MS);
-        }
-
-        const translatedText = await translateLanguageWithRecovery({ language, translationInput, direction, translationContext, jobId });
-        if (staleTranslationJobs.has(jobId)) break;
-
-        const safeTranslatedText = String(translatedText || "").trim();
-        translationOutputs.push({ lang: language, text: safeTranslatedText });
-
-        if (safeTranslatedText) {
-          translations[language] = safeTranslatedText;
-          onResult?.({
-            original: sentence,
-            originalText: sentence,
-            translatedText: translations[direction.target] || safeTranslatedText,
-            translations: { ...translations },
-            translationOutputs: [...translationOutputs],
-            isFinal: true,
-            isTranslationPartial: true,
-            translationComplete: false,
-            sourceLang: direction.source,
-            targetLang: direction.target,
-            targetLanguages: direction.targets,
-            detectedLanguage,
-            latencyMs: Date.now() - startedAt,
-            mode: "production"
-          });
-        }
-      }
-    }
-
-    if (staleTranslationJobs.has(jobId)) {
       return;
     }
 
-    const translatedText = translations[direction.target] || Object.values(translations).find(Boolean) || "";
-
-    if (shouldTranslate && !translatedText) {
-      return;
-    }
-
-    lastTranslatedTranscript = normalizedSentence;
-
-    if (translatedText) {
-      const transcriptEntry = {
-        original: sentence,
-        translated: translatedText,
-        translations,
-        timestamp: new Date(),
-        sourceLang: direction.source,
-        targetLang: direction.target,
-        targetLanguages: direction.targets
-      };
-
-      const lastTranscriptEntry = session.transcriptHistory[session.transcriptHistory.length - 1];
-      const duplicateTranscriptEntry =
-        lastTranscriptEntry?.original === transcriptEntry.original &&
-        lastTranscriptEntry?.translated === transcriptEntry.translated &&
-        JSON.stringify(lastTranscriptEntry?.translations || {}) === JSON.stringify(transcriptEntry.translations || {});
-
-      if (!duplicateTranscriptEntry) {
-        session.transcriptHistory.push(transcriptEntry);
-      }
-
-      if (session.transcriptHistory.length > MAX_TRANSCRIPT_HISTORY) {
-        session.transcriptHistory.splice(0, session.transcriptHistory.length - MAX_TRANSCRIPT_HISTORY);
-      }
-      touchSessionHistory(sessionId);
-    }
+    const job = {
+      id: jobId,
+      sentence,
+      normalizedSentence,
+      translationInput,
+      direction,
+      detectedLanguage: effectiveDetectedLanguage,
+      translationContext,
+      translations: {},
+      pendingLanguages: direction.targets.slice(0, MAX_TARGET_LANGUAGES),
+      runningLanguages: new Set(),
+      completedLanguages: new Set(),
+      createdAt: startedAt,
+      startedAt,
+      completed: false,
+      stale: false,
+      shouldTranslate,
+      isFinalizedSentence
+    };
 
     onResult?.({
       original: sentence,
       originalText: sentence,
-      translatedText,
-      translations,
-      translationOutputs,
+      translatedText: "",
+      translations: {},
+      translationOutputs: [],
       isFinal: true,
-      isTranslationComplete: shouldTranslate,
+      isTranscriptOnly: true,
       sourceLang: direction.source,
       targetLang: direction.target,
       targetLanguages: direction.targets,
-      detectedLanguage,
+      detectedLanguage: effectiveDetectedLanguage,
       latencyMs: Date.now() - startedAt,
       mode: "production"
     });
-    } finally {
-      staleTranslationJobs.delete(jobId);
-      trimStaleTranslationJobs();
-      if (activeTranslationJobId === jobId) {
-        translationInFlight = false;
-        activeTranslationStartedAt = 0;
-        activeTranslationJobId = 0;
-        activeTranslationSnapshot = null;
-      }
 
-      if (currentSentence.trim()) {
-        scheduleStableTranslation(120);
-      }
+    enqueueTranslationJob(job);
+
+    if (currentSentence.trim()) {
+      scheduleStableTranslation(120);
     }
   };
 
@@ -774,45 +1042,15 @@ export const createInterpreterSession = async ({
     translationTimer.unref?.();
   };
 
-  const recoverStalledTranslationJob = (reason) => {
-    const stalledJobId = activeTranslationJobId;
-    const stalledForMs = activeTranslationStartedAt ? Date.now() - activeTranslationStartedAt : 0;
-    const stalledSentence = activeTranslationSnapshot?.sentence || "";
-
-    if (stalledJobId) staleTranslationJobs.add(stalledJobId);
-    if (stalledSentence) currentSentence = trimTextWindow(appendSentenceChunk(stalledSentence, currentSentence));
-
-    translationInFlight = false;
-    activeTranslationStartedAt = 0;
-    activeTranslationJobId = 0;
-    activeTranslationSnapshot = null;
-    trimStaleTranslationJobs();
-
-    console.warn("Translation health monitor recovered a stalled job", {
-      jobId: stalledJobId,
-      reason,
-      activeForMs: stalledForMs
-    });
-
-    if (currentSentence.trim()) {
-      scheduleStableTranslation(QUEUED_TRANSLATION_RESCHEDULE_MS);
-    }
-  };
-
   const sessionHealthMonitor = setInterval(() => {
     cleanupSessionHistoryStore();
     refreshProviderCooldowns();
     trimStaleTranslationJobs();
+    cleanupStaleTranslationWork();
+    drainTranslationQueue();
 
     if (currentSentence.length > MAX_PENDING_SENTENCE_CHARS) {
       currentSentence = trimTextWindow(currentSentence);
-    }
-
-    if (!translationInFlight || !activeTranslationStartedAt) return;
-
-    const activeForMs = Date.now() - activeTranslationStartedAt;
-    if (activeForMs >= TRANSLATION_JOB_TIMEOUT_MS) {
-      recoverStalledTranslationJob("job_timeout");
     }
   }, SESSION_HEALTH_CHECK_MS);
   sessionHealthMonitor.unref?.();
@@ -831,13 +1069,22 @@ export const createInterpreterSession = async ({
     },
     onClose: onClosed,
     onTranscript: async ({ text, isFinal, detectedLanguage }) => {
-      const direction = resolveDirection({ sourceLang, targetLang, targetLanguages: sessionTargetLanguages, detectedLanguage, twoWay });
       const displayText = cleanTranscriptText(text);
       const normalized = normalizeTranscript(displayText);
 
       if (!normalized) {
         return;
       }
+
+      const localDetection = resolveSourceLanguage({ text: displayText, providerDetectedLanguage: detectedLanguage });
+      const effectiveDetectedLanguage = localDetection.language || detectedLanguage;
+      const direction = resolveDirection({
+        sourceLang,
+        targetLang,
+        targetLanguages: sessionTargetLanguages,
+        detectedLanguage: effectiveDetectedLanguage,
+        twoWay
+      });
 
       if (!isFinal) {
         const previewText = appendSentenceChunk(currentSentence, displayText);
@@ -855,7 +1102,7 @@ export const createInterpreterSession = async ({
           sourceLang: direction.source,
           targetLang: direction.target,
           targetLanguages: direction.targets,
-          detectedLanguage
+          detectedLanguage: effectiveDetectedLanguage
         });
         return;
       }
@@ -865,7 +1112,12 @@ export const createInterpreterSession = async ({
       }
       lastFinalTranscript = normalized;
       currentDirection = direction;
-      currentDetectedLanguage = detectedLanguage;
+      currentDetectedLanguage = effectiveDetectedLanguage;
+      rememberLocalSourceLanguage({
+        text: displayText,
+        language: effectiveDetectedLanguage,
+        confidence: localDetection.confidence
+      });
       currentSentence = trimTextWindow(appendSentenceChunk(currentSentence, displayText));
       scheduleStableTranslation();
     }
@@ -879,12 +1131,17 @@ export const createInterpreterSession = async ({
   session.stop = () => {
     clearTranslationTimer();
     clearInterval(sessionHealthMonitor);
-    staleTranslationJobs.add(activeTranslationJobId);
+    for (const job of [...translationQueue]) {
+      markTranslationJobStale(job, "session_stop");
+    }
+    for (const task of activeTranslationTasks.values()) {
+      staleTranslationJobs.add(task.jobId);
+    }
+    translationQueue.length = 0;
+    activeTranslationTasks.clear();
+    activeTranslationJobs.clear();
+    drainScheduled = false;
     trimStaleTranslationJobs();
-    translationInFlight = false;
-    activeTranslationStartedAt = 0;
-    activeTranslationJobId = 0;
-    activeTranslationSnapshot = null;
     touchSessionHistory(sessionId);
     stopDeepgramSession?.();
   };
