@@ -160,6 +160,8 @@ const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const TRANSCRIPT_HISTORY_STORAGE_KEY = "interp_history";
 const MAX_TRANSCRIPT_HISTORY_ENTRIES = 500;
 const MAX_TARGET_LANGUAGES = 3;
+const LIVE_TEXT_WINDOW_CHARS = 900;
+const LIVE_SEGMENT_WINDOW = 6;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
 const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
@@ -368,6 +370,11 @@ const formatTranslationsText = (translations: Record<string, string>, targetLang
   orderedTranslationEntries(translations, targetLanguages)
     .map(([language, translatedText]) => `${language.toUpperCase()}: ${translatedText}`)
     .join("\n");
+
+const appendTextWindow = (current: string, next: string, maxChars = LIVE_TEXT_WINDOW_CHARS) => {
+  const combined = [current, next].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  return combined.length <= maxChars ? combined : combined.slice(-maxChars).replace(/^\S+\s*/, "").trim();
+};
 
 const languageFlag = (code: string) => LANGUAGE_FLAGS[code] || "🌐";
 const speechLanguage = (code: string) => SPEECH_SYNTHESIS_LANGS[code] || code;
@@ -691,14 +698,14 @@ const TargetLanguageTriangle = ({
             {sourceLang.toUpperCase()}
           </span>
         </div>
-        <div className={`mt-3 grid gap-3 ${targetLanguages.length === 1 ? "grid-cols-1 px-20" : targetLanguages.length === 2 ? "grid-cols-2 px-8" : "grid-cols-3"}`}>
+        <div className={`mt-3 grid gap-2 ${targetLanguages.length === 1 ? "grid-cols-1 sm:px-16" : targetLanguages.length === 2 ? "grid-cols-2" : "grid-cols-3"}`}>
           {targetLanguages.map((language) => (
             <button
               key={language}
               type="button"
               disabled={disabled}
               onClick={() => onToggleTarget(language)}
-              className="inline-flex min-h-11 items-center justify-center gap-2 rounded-lg border border-blue-400/30 bg-blue-500/15 px-3 py-2 text-sm font-black text-blue-50 transition hover:bg-blue-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+              className="inline-flex min-h-11 min-w-0 items-center justify-center gap-2 rounded-lg border border-blue-400/30 bg-blue-500/15 px-3 py-2 text-sm font-black text-blue-50 transition hover:bg-blue-500/25 disabled:cursor-not-allowed disabled:opacity-60"
               aria-pressed
             >
               <span aria-hidden="true">{languageFlag(language)}</span>
@@ -708,7 +715,7 @@ const TargetLanguageTriangle = ({
         </div>
       </div>
 
-      <div className="mt-4 flex flex-wrap justify-center gap-2">
+      <div className="mt-4 grid grid-cols-4 gap-2 sm:grid-cols-6 lg:grid-cols-8">
         {LANGUAGES.filter((language) => language.code !== sourceLang).map((language) => {
           const active = targetLanguages.includes(language.code);
           const locked = disabled || (!active && targetLanguages.length >= MAX_TARGET_LANGUAGES);
@@ -719,7 +726,7 @@ const TargetLanguageTriangle = ({
               type="button"
               disabled={locked}
               onClick={() => onToggleTarget(language.code)}
-              className={`min-h-9 rounded-lg border px-3 py-1.5 text-xs font-black uppercase transition ${
+              className={`min-h-9 rounded-lg border px-2 py-1.5 text-xs font-black uppercase transition ${
                 active
                   ? "border-blue-400/40 bg-blue-500 text-white"
                   : "border-white/10 bg-white/[0.04] text-slate-400 hover:border-white/20 hover:text-white disabled:opacity-35"
@@ -985,18 +992,21 @@ export default function App() {
   const lastFinalOriginalRef = useRef("");
   const lastFinalTranslationRef = useRef("");
   const pendingFinalTranscriptRef = useRef<Pick<TranscriptHistoryEntry, "original" | "timestamp" | "sourceLang" | "targetLang" | "targetLanguages"> | null>(null);
+  const activeTranslationIdRef = useRef("");
   const audioChunkMsRef = useRef(700);
   const interimTimerRef = useRef<number | null>(null);
   const historyEndRef = useRef<HTMLDivElement | null>(null);
   const dubbingQueueRef = useRef<Array<{ language: string; text: string }>>([]);
   const dubbingSpeakingRef = useRef(false);
+  const spokenDubbingKeysRef = useRef<Set<string>>(new Set());
+  const sessionActionInFlightRef = useRef(false);
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro";
   const isRecording = status === "connecting" || status === "listening";
-  const latestOriginal = [finalText, liveText].filter(Boolean).join(" ").trim();
+  const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
-  const latestTranslationEntries = orderedTranslationEntries(finalTranslations, targetLanguages);
+  const displayTranslationEntries = targetLanguages.map((language) => [language, finalTranslations[language]?.trim() || ""] as const);
   const maxSessionSeconds = config?.maxSessionSeconds || 3600;
   const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
 
@@ -1198,14 +1208,20 @@ export default function App() {
     activeSessionPayloadRef.current = null;
     shouldRestartSessionOnReconnectRef.current = false;
     sessionStartedAtRef.current = null;
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    dubbingQueueRef.current = [];
+    dubbingSpeakingRef.current = false;
   }, []);
 
   const stopSession = useCallback(() => {
+    if (status === "stopping") return;
+    sessionActionInFlightRef.current = true;
     setStatus("stopping");
     cleanupMedia();
     socketRef.current?.emit("end_session");
+    sessionActionInFlightRef.current = false;
     setStatus("idle");
-  }, [cleanupMedia]);
+  }, [cleanupMedia, status]);
 
   useEffect(() => {
     if (!token || !user) return undefined;
@@ -1251,6 +1267,7 @@ export default function App() {
     socket.on("server-config", (serverConfig: AppConfig) => setConfig(serverConfig));
 
     const markSessionReady = () => {
+      sessionActionInFlightRef.current = false;
       const recorder = mediaRecorderRef.current;
       if (recorder?.state === "inactive") {
         recorder.start(audioChunkMsRef.current);
@@ -1263,12 +1280,16 @@ export default function App() {
 
     socket.on("session_ready", markSessionReady);
     socket.on("session:ready", markSessionReady);
-    socket.on("session:closed", () => setStatus((current) => (current === "stopping" ? "idle" : current)));
+    socket.on("session:closed", () => {
+      sessionActionInFlightRef.current = false;
+      setStatus((current) => (current === "stopping" ? "idle" : current));
+    });
     socket.on("warning", ({ message }: { message?: string }) => {
       const warning = message || "";
       if (warning.includes("session limit") || warning.includes("silence")) setAlert(warning);
     });
     const handleSessionError = ({ message }: { message?: string }) => {
+      sessionActionInFlightRef.current = false;
       setStatus("error");
       setAlert(message || "Real-time processing failed.");
     };
@@ -1300,18 +1321,23 @@ export default function App() {
       lastInterimRef.current = "";
       lastFinalOriginalRef.current = originalText;
       const pendingTargetLanguages = normalizeTargetLanguages(eventTargetLanguages, eventTargetLang || targetLangRef.current);
+      const timestamp = new Date().toISOString();
       const pendingEntry = {
         original: originalText,
-        timestamp: new Date().toISOString(),
+        timestamp,
         sourceLang: detectedLanguage || eventSourceLang || sourceLangRef.current,
         targetLang: eventTargetLang || pendingTargetLanguages[0],
         targetLanguages: pendingTargetLanguages
       };
       pendingFinalTranscriptRef.current = pendingEntry;
+      activeTranslationIdRef.current = `${timestamp}-${originalText.slice(0, 48)}`;
+      if (spokenDubbingKeysRef.current.size > 300) spokenDubbingKeysRef.current.clear();
       setInterimOriginal("");
       setLiveText("");
-      setFinalText((current) => [current, originalText].filter(Boolean).join(" ").trim());
+      setFinalText((current) => appendTextWindow(current, originalText));
       setOriginalSegments((current) => [...current, originalText].slice(-40));
+      setFinalTranslations({});
+      lastFinalTranslationRef.current = "";
 
       if (modeRef.current === "transcribe") {
         pendingFinalTranscriptRef.current = null;
@@ -1320,30 +1346,34 @@ export default function App() {
       setStatus("listening");
     });
 
-    socket.on("translation_update", ({ text, translations, latencyMs, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages }: { text?: string; translations?: Record<string, string>; latencyMs?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[] }) => {
+    socket.on("translation_update", ({ text, translations, latencyMs, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete }: { text?: string; translations?: Record<string, string>; latencyMs?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean }) => {
       const pendingTranscript = pendingFinalTranscriptRef.current;
       const nextTargetLanguages = normalizeTargetLanguages(eventTargetLanguages || pendingTranscript?.targetLanguages || targetLanguagesRef.current, eventTargetLang || pendingTranscript?.targetLang || targetLangRef.current);
       const nextTranslations = normalizeTranslationMap(translations, text || "", eventTargetLang || nextTargetLanguages[0]);
       const nextTranslation = formatTranslationsText(nextTranslations, nextTargetLanguages);
       const nextTranslationSignature = JSON.stringify(orderedTranslationEntries(nextTranslations, nextTargetLanguages));
+      const isComplete = complete !== false && !partial;
 
-      if (!nextTranslation || (!pendingTranscript && nextTranslationSignature === lastFinalTranslationRef.current)) return;
+      if (!nextTranslation || (!isComplete && nextTranslationSignature === lastFinalTranslationRef.current)) return;
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
 
       lastFinalTranslationRef.current = nextTranslationSignature;
       setFinalTranslations(nextTranslations);
-      setFinalTranslationText((current) => [current, nextTranslation].filter(Boolean).join("\n\n").trim());
-      setTranslatedSegments((current) => [...current, nextTranslation].slice(-40));
-      appendTranscriptHistory({
-        original: pendingTranscript?.original || lastFinalOriginalRef.current,
-        translated: nextTranslation,
-        translations: nextTranslations,
-        timestamp: pendingTranscript?.timestamp || new Date().toISOString(),
-        sourceLang: eventSourceLang || pendingTranscript?.sourceLang || sourceLangRef.current,
-        targetLang: eventTargetLang || pendingTranscript?.targetLang || nextTargetLanguages[0],
-        targetLanguages: nextTargetLanguages
-      });
-      pendingFinalTranscriptRef.current = null;
+
+      if (isComplete) {
+        setFinalTranslationText((current) => [current, nextTranslation].filter(Boolean).join("\n\n").trim().slice(-5000));
+        setTranslatedSegments((current) => [...current, nextTranslation].slice(-40));
+        appendTranscriptHistory({
+          original: pendingTranscript?.original || lastFinalOriginalRef.current,
+          translated: nextTranslation,
+          translations: nextTranslations,
+          timestamp: pendingTranscript?.timestamp || new Date().toISOString(),
+          sourceLang: eventSourceLang || pendingTranscript?.sourceLang || sourceLangRef.current,
+          targetLang: eventTargetLang || pendingTranscript?.targetLang || nextTargetLanguages[0],
+          targetLanguages: nextTargetLanguages
+        });
+        pendingFinalTranscriptRef.current = null;
+      }
     });
 
     return () => {
@@ -1373,6 +1403,7 @@ export default function App() {
       window.speechSynthesis.cancel();
       dubbingQueueRef.current = [];
       dubbingSpeakingRef.current = false;
+      spokenDubbingKeysRef.current.clear();
       return;
     }
 
@@ -1380,6 +1411,9 @@ export default function App() {
     if (entries.length === 0) return;
 
     for (const [language, translatedText] of entries) {
+      const dubbingKey = `${activeTranslationIdRef.current || "current"}:${language}:${translatedText}`;
+      if (spokenDubbingKeysRef.current.has(dubbingKey)) continue;
+      spokenDubbingKeysRef.current.add(dubbingKey);
       dubbingQueueRef.current.push({ language, text: translatedText });
     }
 
@@ -1478,11 +1512,14 @@ export default function App() {
   }, [fetchHistory, view]);
 
   const startSession = useCallback(async () => {
+    if (sessionActionInFlightRef.current || recordingRef.current) return;
+
     if (!isAuthed) {
       navigate("login");
       return;
     }
 
+    sessionActionInFlightRef.current = true;
     setAlert(null);
     setStatus("connecting");
     setDetectedLanguage(null);
@@ -1493,18 +1530,25 @@ export default function App() {
     lastFinalOriginalRef.current = "";
     lastFinalTranslationRef.current = "";
     pendingFinalTranscriptRef.current = null;
+    activeTranslationIdRef.current = "";
+    spokenDubbingKeysRef.current.clear();
+    dubbingQueueRef.current = [];
+    dubbingSpeakingRef.current = false;
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     if (interimTimerRef.current) {
       window.clearTimeout(interimTimerRef.current);
       interimTimerRef.current = null;
     }
 
     if (!navigator.mediaDevices?.getUserMedia) {
+      sessionActionInFlightRef.current = false;
       setStatus("error");
       setAlert("Microphone not detected");
       return;
     }
 
     if (!("MediaRecorder" in window)) {
+      sessionActionInFlightRef.current = false;
       setStatus("error");
       setAlert("Microphone recording is not supported in this browser.");
       return;
@@ -1570,6 +1614,7 @@ export default function App() {
         sessionPayload,
         (timeoutError: Error | null, response?: { ok?: boolean; error?: string }) => {
           if (timeoutError || response?.error) {
+            sessionActionInFlightRef.current = false;
             cleanupMedia();
             setStatus("error");
             setAlert(response?.error || "Unable to reach the live interpreter.");
@@ -1577,6 +1622,7 @@ export default function App() {
         }
       );
     } catch (error) {
+      sessionActionInFlightRef.current = false;
       cleanupMedia();
       setStatus("error");
 
@@ -1595,6 +1641,7 @@ export default function App() {
   }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, refreshMicrophones, sourceLang, targetLang, targetLanguages, twoWay]);
 
   const selectMode = (nextMode: Mode) => {
+    if (isRecording) return;
     setMode(nextMode);
   };
 
@@ -1632,7 +1679,12 @@ export default function App() {
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
     lastFinalTranslationRef.current = "";
+    activeTranslationIdRef.current = "";
     pendingFinalTranscriptRef.current = null;
+    spokenDubbingKeysRef.current.clear();
+    dubbingQueueRef.current = [];
+    dubbingSpeakingRef.current = false;
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     if (interimTimerRef.current) {
       window.clearTimeout(interimTimerRef.current);
       interimTimerRef.current = null;
@@ -1791,7 +1843,7 @@ export default function App() {
               <span>{shareableMode ? "On" : "Off"}</span>
             </button>
             {TOOL_ITEMS.map(({ mode: toolMode, label, icon: Icon }) => (
-              <button key={toolMode} onClick={() => selectMode(toolMode)} className={`flex w-full items-center justify-between rounded-lg border px-3 py-2.5 text-sm font-bold ${mode === toolMode ? "border-white/20 bg-white/10 text-white" : "border-white/10 bg-slate-950/50 text-slate-400 hover:text-white"}`}>
+              <button key={toolMode} disabled={isRecording} onClick={() => selectMode(toolMode)} className={`flex w-full items-center justify-between rounded-lg border px-3 py-2.5 text-sm font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${mode === toolMode ? "border-white/20 bg-white/10 text-white" : "border-white/10 bg-slate-950/50 text-slate-400 hover:text-white"}`}>
                 <span className="flex items-center gap-2"><Icon className="h-4 w-4" />{label}</span>
               </button>
             ))}
@@ -1804,7 +1856,7 @@ export default function App() {
         <GlassPanel className="p-4">
           <TargetLanguageTriangle sourceLang={sourceLang} targetLanguages={targetLanguages} disabled={isRecording} onSourceChange={setSourceLang} onToggleTarget={toggleTargetLanguage} onSwap={swapLanguages} />
           <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-4">
-            <button onClick={() => setTwoWay((current) => !current)} className={`flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-bold ${twoWay ? "border-blue-500/20 bg-blue-500/10 text-blue-100" : "border-white/10 bg-slate-950/60 text-slate-400 hover:text-white"}`}>
+            <button disabled={isRecording} onClick={() => setTwoWay((current) => !current)} className={`flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${twoWay ? "border-blue-500/20 bg-blue-500/10 text-blue-100" : "border-white/10 bg-slate-950/60 text-slate-400 hover:text-white"}`}>
               <ArrowRightLeft className="h-4 w-4" />
               Three-way translation
             </button>
@@ -1812,36 +1864,46 @@ export default function App() {
         </GlassPanel>
 
         <GlassPanel className="overflow-hidden">
-          <div className="flex flex-col gap-2 border-b border-white/10 px-5 py-4 md:flex-row md:items-center md:justify-between">
+          <div className="flex flex-col gap-3 border-b border-white/10 px-5 py-4 md:flex-row md:items-center md:justify-between">
             <div>
               <h1 className="text-xl font-black text-white">Live AI Interpreter</h1>
               <p className="mt-1 text-sm font-semibold text-slate-400">{languageName(detectedLanguage || sourceLang)} <span className="text-slate-600">-&gt;</span> {targetLanguages.map(languageName).join(", ")}</p>
             </div>
-            <span className={`w-fit rounded-full border px-3 py-1 text-xs font-bold uppercase tracking-wider ${status === "listening" ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-300" : status === "error" ? "border-red-500/20 bg-red-500/10 text-red-200" : "border-white/10 bg-slate-950/60 text-slate-400"}`}>
-              {statusLabel}
-            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className={`w-fit rounded-full border px-3 py-1 text-xs font-bold uppercase tracking-wider ${status === "listening" ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-300" : status === "error" ? "border-red-500/20 bg-red-500/10 text-red-200" : "border-white/10 bg-slate-950/60 text-slate-400"}`}>
+                {statusLabel}
+              </span>
+              <span className="rounded-full border border-white/10 bg-slate-950/60 px-3 py-1 text-xs font-bold uppercase tracking-wider text-slate-400">{mode}</span>
+              {mode === "dubbing" && <span className="rounded-full border border-blue-500/20 bg-blue-500/10 px-3 py-1 text-xs font-bold uppercase tracking-wider text-blue-100">Dubbing queue</span>}
+            </div>
           </div>
 
-          <div className="flex min-h-[430px] flex-col justify-between p-5">
+          <div className="flex min-h-[430px] flex-col justify-between p-4 sm:p-5">
             <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col justify-center text-center">
               <p className="mb-3 text-xs font-bold uppercase tracking-widest text-slate-500">Original text</p>
-              <p className="mx-auto min-h-10 max-w-3xl text-base font-semibold leading-7 text-slate-400 md:text-lg">
+              <p className="mx-auto min-h-12 max-w-3xl text-base font-semibold leading-7 text-slate-300 md:text-lg">
                 <TypingSubtitle text={latestOriginal} muted={Boolean(interimOriginal)} empty="Waiting for speech." />
               </p>
 
-              <div className="mx-auto mt-8 w-full max-w-3xl rounded-xl border border-blue-500/10 bg-blue-500/[0.045] p-5 text-left md:p-7">
-                <p className="mb-3 text-xs font-bold uppercase tracking-widest text-blue-100/70">Translations</p>
+              <div className="mx-auto mt-6 w-full max-w-4xl rounded-xl border border-blue-500/10 bg-blue-500/[0.045] p-4 text-left md:p-6">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <p className="text-xs font-bold uppercase tracking-widest text-blue-100/70">Translations</p>
+                  {isRecording && mode !== "transcribe" && <span className="rounded-full border border-white/10 bg-slate-950/55 px-2.5 py-1 text-[11px] font-black uppercase tracking-widest text-slate-400">live queue</span>}
+                </div>
                 {mode === "transcribe" ? (
                   <p className="min-h-20 text-2xl font-black leading-snug tracking-normal text-white sm:text-3xl">
                     <TypingSubtitle text={latestOriginal} empty="Transcribed subtitles appear here." />
                   </p>
-                ) : latestTranslationEntries.length > 0 ? (
-                  <div className="space-y-3">
-                    {latestTranslationEntries.map(([language, translatedText]) => (
-                      <div key={language} className="grid grid-cols-[72px_1fr] gap-3 rounded-lg border border-white/10 bg-slate-950/35 p-3">
-                        <span className="flex items-center gap-2 text-sm font-black text-blue-100"><span aria-hidden="true">{languageFlag(language)}</span>{language.toUpperCase()}</span>
-                        <p className="min-h-7 text-lg font-black leading-7 text-white md:text-2xl md:leading-9">
-                          <TypingSubtitle text={translatedText} empty="Translated subtitles appear here." />
+                ) : displayTranslationEntries.length > 0 ? (
+                  <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
+                    {displayTranslationEntries.map(([language, translatedText]) => (
+                      <div key={language} className={`rounded-lg border p-3 transition ${translatedText ? "border-white/10 bg-slate-950/40" : "border-white/5 bg-slate-950/20"}`}>
+                        <div className="mb-2 flex items-center justify-between gap-2">
+                          <span className="flex min-w-0 items-center gap-2 text-sm font-black text-blue-100"><span aria-hidden="true">{languageFlag(language)}</span>{language.toUpperCase()}</span>
+                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-black uppercase tracking-widest ${translatedText ? "bg-emerald-500/10 text-emerald-300" : "bg-slate-800/80 text-slate-500"}`}>{translatedText ? "done" : isRecording ? "queued" : "ready"}</span>
+                        </div>
+                        <p className="min-h-20 text-base font-black leading-7 text-white md:text-lg">
+                          <TypingSubtitle text={translatedText} empty={isRecording ? "Translating..." : "Translated subtitles appear here."} />
                         </p>
                       </div>
                     ))}
@@ -1854,12 +1916,12 @@ export default function App() {
               </div>
             </div>
 
-            <div className="mt-8 flex flex-col items-center gap-3">
-              <button onClick={!isRecording ? () => void startSession() : stopSession} disabled={status === "stopping"} className={`relative flex h-20 w-20 items-center justify-center rounded-full text-white shadow-2xl transition hover:scale-105 disabled:cursor-wait disabled:opacity-70 ${isRecording ? "bg-red-500 shadow-red-500/25" : "bg-blue-500 text-white shadow-blue-500/25"}`} aria-label={isRecording ? "Stop recording" : "Start recording"}>
+            <div className="mt-7 flex flex-col items-center gap-3">
+              <button onClick={!isRecording ? () => void startSession() : stopSession} disabled={status === "stopping"} className={`relative flex h-20 w-20 items-center justify-center rounded-full text-white shadow-2xl transition duration-150 hover:scale-105 active:scale-95 disabled:cursor-wait disabled:opacity-70 ${status === "listening" ? "bg-red-500 shadow-red-500/25" : status === "connecting" ? "bg-blue-400 text-white shadow-blue-400/25" : "bg-blue-500 text-white shadow-blue-500/25"}`} aria-label={isRecording ? "Stop recording" : "Start recording"}>
                 {isRecording && <span className="pulse-ring absolute inset-0 rounded-full border border-white/70" />}
                 {isRecording ? <CircleStop className="h-8 w-8" /> : <Mic className="h-8 w-8" />}
               </button>
-              <p className="text-sm font-bold text-slate-300">Press and hold to talk</p>
+              <p className="text-sm font-bold text-slate-300">{status === "connecting" ? "Starting live session..." : isRecording ? "Listening now" : "Tap to start interpreting"}</p>
               <div className="flex flex-wrap justify-center gap-2 text-xs">
                 <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 font-mono text-slate-300"><Timer className="h-3.5 w-3.5 text-slate-500" />{formatTime(sessionSeconds)}</span>
                 <span className="rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 font-bold uppercase tracking-wider text-slate-500">1 hr safety limit</span>

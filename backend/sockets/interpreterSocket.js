@@ -88,6 +88,28 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         return;
       }
 
+      if (result.isTranslationPartial || result.isTranslationComplete) {
+        const translations = result.translations || (result.translatedText ? { [result.targetLang]: result.translatedText } : {});
+
+        if (Object.keys(translations).length > 0) {
+          socket.emit("translation_update", {
+            original: result.originalText,
+            text: result.translatedText,
+            translations,
+            outputs: result.translationOutputs || [],
+            sourceLang: result.sourceLang,
+            targetLang: result.targetLang,
+            targetLanguages: result.targetLanguages || [result.targetLang],
+            latencyMs: result.latencyMs,
+            partial: Boolean(result.isTranslationPartial),
+            complete: Boolean(result.isTranslationComplete)
+          });
+        }
+
+        socket.emit("result", result);
+        return;
+      }
+
       socket.emit("transcript_final", {
         text: result.originalText,
         sourceLang: result.sourceLang,
@@ -96,6 +118,11 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         detectedLanguage: result.detectedLanguage,
         latencyMs: result.latencyMs
       });
+
+      if (result.isTranscriptOnly) {
+        socket.emit("result", result);
+        return;
+      }
 
       const translations = result.translations || (result.translatedText ? { [result.targetLang]: result.translatedText } : {});
 

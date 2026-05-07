@@ -161,6 +161,27 @@ export const detectRegionAccent = ({ text = "", sourceLang, targetLang, targetLa
   };
 };
 
+export const resolveLocalTranslation = ({ text = "", targetLang = "" } = {}) => {
+  const language = String(targetLang || "").trim().toLowerCase();
+  const cleanText = normalizePunctuation(text).replace(/[.!?]+$/g, "").trim();
+
+  if (!cleanText) return "";
+
+  if (language === "rw") {
+    return exactPhraseCorrection(cleanText, LOCAL_PHRASES.rw) || "";
+  }
+
+  if (language === "rn") {
+    return exactPhraseCorrection(cleanText, LOCAL_PHRASES.rn) || "";
+  }
+
+  if (language === "en") {
+    return exactPhraseCorrection(cleanText, LOCAL_PHRASES.ugandaMix) || "";
+  }
+
+  return "";
+};
+
 export const enhanceTranslation = ({ text = "", targetLang = "" } = {}) => {
   const language = String(targetLang || "").trim().toLowerCase();
 
