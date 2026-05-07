@@ -165,6 +165,68 @@ const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;cod
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
 
+let googleIdentityScriptPromise: Promise<void> | null = null;
+let googleIdentityInitializedClientId = "";
+let googleCredentialCallback: ((response: GoogleCredentialResponse) => void) | null = null;
+
+const loadGoogleIdentityScript = () => {
+  if (!GOOGLE_CLIENT_ID || window.google?.accounts?.id) return Promise.resolve();
+  if (googleIdentityScriptPromise) return googleIdentityScriptPromise;
+
+  googleIdentityScriptPromise = new Promise<void>((resolve, reject) => {
+    const existingScript = document.querySelector<HTMLScriptElement>("script[data-google-identity]");
+
+    const handleLoad = () => resolve();
+    const handleError = () => reject(new Error("Unable to load Google Sign-In. Check your network and try again."));
+
+    if (existingScript) {
+      existingScript.addEventListener("load", handleLoad, { once: true });
+      existingScript.addEventListener("error", handleError, { once: true });
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.dataset.googleIdentity = "true";
+    script.addEventListener("load", handleLoad, { once: true });
+    script.addEventListener("error", handleError, { once: true });
+    document.head.appendChild(script);
+  });
+
+  return googleIdentityScriptPromise;
+};
+
+const initializeGoogleIdentityOnce = ({
+  onCredential,
+  onError
+}: {
+  onCredential: (credential: string) => void;
+  onError: (message: string) => void;
+}) => {
+  if (!GOOGLE_CLIENT_ID || !window.google?.accounts?.id) return;
+
+  googleCredentialCallback = (response) => {
+    if (!response.credential) {
+      onError("Google did not return a valid credential.");
+      return;
+    }
+
+    onCredential(response.credential);
+  };
+
+  if (googleIdentityInitializedClientId === GOOGLE_CLIENT_ID) return;
+
+  window.google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    auto_select: false,
+    cancel_on_tap_outside: true,
+    callback: (response) => googleCredentialCallback?.(response)
+  });
+  googleIdentityInitializedClientId = GOOGLE_CLIENT_ID;
+};
+
 const LANGUAGES: Language[] = [
   { code: "en", name: "English", region: "United States" },
   { code: "es", name: "Spanish", region: "Spain / LATAM" },
@@ -696,38 +758,25 @@ const GoogleSignIn = ({
   useEffect(() => {
     if (!GOOGLE_CLIENT_ID) return;
 
-    const existingScript = document.querySelector<HTMLScriptElement>("script[data-google-identity]");
-    if (existingScript) {
-      setLoaded(true);
-      return;
-    }
+    let cancelled = false;
 
-    const script = document.createElement("script");
-    script.src = "https://accounts.google.com/gsi/client";
-    script.async = true;
-    script.defer = true;
-    script.dataset.googleIdentity = "true";
-    script.onload = () => setLoaded(true);
-    script.onerror = () => onError("Unable to load Google Sign-In. Check your network and try again.");
-    document.head.appendChild(script);
+    loadGoogleIdentityScript()
+      .then(() => {
+        if (!cancelled) setLoaded(true);
+      })
+      .catch((error) => {
+        if (!cancelled) onError(error instanceof Error ? error.message : "Unable to load Google Sign-In. Check your network and try again.");
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [onError]);
 
   useEffect(() => {
     if (!loaded || !GOOGLE_CLIENT_ID || !window.google) return;
 
-    window.google.accounts.id.initialize({
-      client_id: GOOGLE_CLIENT_ID,
-      auto_select: false,
-      cancel_on_tap_outside: true,
-      callback: (response) => {
-        if (!response.credential) {
-          onError("Google did not return a valid credential.");
-          return;
-        }
-
-        onCredential(response.credential);
-      }
-    });
+    initializeGoogleIdentityOnce({ onCredential, onError });
 
     if (buttonRef.current && !renderedRef.current) {
       renderedRef.current = true;

@@ -1,5 +1,6 @@
 import { createDeepgramSession } from "./deepgram.js";
 import { translateWithGemini } from "./gemini.js";
+import { detectRegionAccent, normalizeMixedSpeech } from "../utils/translationEnhancer.js";
 
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
 const MAX_TRANSCRIPT_HISTORY = 500;
@@ -9,6 +10,7 @@ const SENTENCE_DEBOUNCE_MS = 1000;
 const SILENCE_DEBOUNCE_MS = 1400;
 const TRANSLATION_RATE_LIMIT_DELAY_MS = 300;
 const MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3;
+const MAX_STYLE_MEMORY_ENTRIES = 20;
 const sessionHistoryStore = new Map();
 
 const createSessionId = () => {
@@ -112,6 +114,71 @@ const normalizeTranscript = (text = "") => cleanTranscriptText(text).toLowerCase
 const sentenceEnds = (text = "") => /[.!?]$/.test(text.trim());
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const EMOTION_MARKERS = {
+  happy: ["happy", "glad", "great", "good news", "thank", "thanks", "appreciate", "wonderful"],
+  angry: ["angry", "upset", "mad", "stop", "unacceptable", "never again", "terrible", "frustrated"],
+  sad: ["sad", "sorry", "miss", "lost", "hurt", "worried", "afraid", "unfortunately"],
+  excited: ["wow", "amazing", "excellent", "can't wait", "cannot wait", "finally", "fantastic"],
+  professional: ["meeting", "client", "deadline", "invoice", "project", "proposal", "contract", "business", "kindly", "please confirm"]
+};
+
+const EMOTION_PROFILES = {
+  happy: "Keep the translation warm, friendly, and naturally positive.",
+  angry: "Keep the urgency and firmness, but avoid adding insults or extra aggression.",
+  sad: "Use a gentle, empathetic tone without exaggerating the emotion.",
+  excited: "Keep the translation energetic and lively while staying natural.",
+  professional: "Use polished, concise business language with a respectful tone.",
+  neutral: "Keep the tone natural and faithful to the speaker."
+};
+
+const normalizeProfileText = (text = "") =>
+  text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const countMarkerMatches = (normalizedText, markers) =>
+  markers.reduce((count, marker) => count + (normalizedText.includes(normalizeProfileText(marker)) ? 1 : 0), 0);
+
+const detectEmotionProfile = (text = "") => {
+  const normalizedText = normalizeProfileText(text);
+  const scores = Object.fromEntries(
+    Object.entries(EMOTION_MARKERS).map(([tone, markers]) => [tone, countMarkerMatches(normalizedText, markers)])
+  );
+
+  if ((text.match(/!/g) || []).length >= 2) scores.excited += 2;
+  if (/[A-Z]{4,}/.test(text)) scores.angry += 1;
+
+  const [tone, score] = Object.entries(scores).sort(([, leftScore], [, rightScore]) => rightScore - leftScore)[0];
+  const resolvedTone = score > 0 ? tone : "neutral";
+
+  return {
+    tone: resolvedTone,
+    instruction: EMOTION_PROFILES[resolvedTone] || EMOTION_PROFILES.neutral,
+    confidence: Math.min(1, Number((score / 4).toFixed(2)))
+  };
+};
+
+const buildTranslationContext = ({ sentence, direction, detectedLanguage }) => {
+  const accentProfile = detectRegionAccent({
+    text: sentence,
+    sourceLang: detectedLanguage || direction.source,
+    targetLang: direction.target,
+    targetLanguages: direction.targets
+  });
+  const emotionProfile = detectEmotionProfile(sentence);
+  const mixedSpeech = normalizeMixedSpeech(sentence);
+
+  return {
+    accentProfile,
+    emotionProfile,
+    mixedSpeech,
+    confidence: Number((((accentProfile.confidence || 0) + (emotionProfile.confidence || 0)) / 2).toFixed(2))
+  };
+};
+
 const appendSentenceChunk = (sentence = "", chunk = "") => {
   const cleanChunk = cleanTranscriptText(chunk);
   if (!cleanChunk) return sentence;
@@ -157,6 +224,7 @@ export const createInterpreterSession = async ({
   let translationTimer = null;
   let consecutiveTranslationFailures = 0;
   const lastSuccessfulTranslations = new Map();
+  const styleMemoryByLanguage = new Map();
   const sessionId = createSessionId();
 
   const clearTranslationTimer = () => {
@@ -174,9 +242,20 @@ export const createInterpreterSession = async ({
     consecutiveTranslationFailures = 0;
   };
 
-  const noteTranslationSuccess = (language, translatedText) => {
+  const noteTranslationSuccess = (language, translatedText, translationContext) => {
     consecutiveTranslationFailures = 0;
     lastSuccessfulTranslations.set(language, translatedText);
+    const previousMemory = styleMemoryByLanguage.get(language) || {};
+    const recentTranslations = [...(previousMemory.recentTranslations || []), translatedText.slice(0, 180)].slice(-MAX_STYLE_MEMORY_ENTRIES);
+
+    styleMemoryByLanguage.set(language, {
+      lastTranslation: translatedText.slice(0, 220),
+      recentTranslations,
+      tone: translationContext?.emotionProfile?.tone || "neutral",
+      region: translationContext?.accentProfile?.region || "General",
+      mode: translationContext?.accentProfile?.mode || "neutral mode",
+      confidence: translationContext?.confidence || 0
+    });
   };
 
   const noteTranslationFailure = (language, error) => {
@@ -195,8 +274,12 @@ export const createInterpreterSession = async ({
     }
   };
 
-  const translateLanguageWithRecovery = async ({ language, translationInput, direction }) => {
+  const translateLanguageWithRecovery = async ({ language, translationInput, direction, translationContext }) => {
     let lastError = null;
+    const languageTranslationContext = {
+      ...translationContext,
+      styleMemory: styleMemoryByLanguage.get(language) || null
+    };
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
       if (attempt > 0) {
@@ -211,7 +294,8 @@ export const createInterpreterSession = async ({
           apiKey: env.geminiApiKey,
           text: translationInput,
           sourceLang: direction.source,
-          targetLang: language
+          targetLang: language,
+          translationContext: languageTranslationContext
         });
         const responseTimeMs = Date.now() - attemptStartedAt;
         const safeTranslatedText = String(translatedText || "").trim();
@@ -220,11 +304,14 @@ export const createInterpreterSession = async ({
           targetLang: language,
           attempt: attempt + 1,
           responseTimeMs,
-          empty: !safeTranslatedText
+          empty: !safeTranslatedText,
+          region: languageTranslationContext.accentProfile?.region,
+          tone: languageTranslationContext.emotionProfile?.tone,
+          confidence: languageTranslationContext.confidence
         });
 
         if (safeTranslatedText) {
-          noteTranslationSuccess(language, safeTranslatedText);
+          noteTranslationSuccess(language, safeTranslatedText, languageTranslationContext);
           return safeTranslatedText;
         }
 
@@ -244,7 +331,12 @@ export const createInterpreterSession = async ({
 
     const fallbackTranslation = String(lastSuccessfulTranslations.get(language) || "").trim();
     if (fallbackTranslation) {
-      console.warn("Using previous successful translation fallback", { targetLang: language });
+      const fallbackStyle = styleMemoryByLanguage.get(language);
+      console.warn("Using previous successful translation fallback", {
+        targetLang: language,
+        tone: fallbackStyle?.tone,
+        region: fallbackStyle?.region
+      });
     }
 
     return fallbackTranslation;
@@ -268,6 +360,7 @@ export const createInterpreterSession = async ({
     const translationInput = prepareTextForTranslation(sentence);
     const translations = {};
     const translationOutputs = [];
+    const translationContext = buildTranslationContext({ sentence, direction, detectedLanguage });
 
     if (shouldTranslate) {
       const targetQueue = direction.targets.slice(0, MAX_TARGET_LANGUAGES);
@@ -277,7 +370,7 @@ export const createInterpreterSession = async ({
           await delay(TRANSLATION_RATE_LIMIT_DELAY_MS);
         }
 
-        const translatedText = await translateLanguageWithRecovery({ language, translationInput, direction });
+        const translatedText = await translateLanguageWithRecovery({ language, translationInput, direction, translationContext });
         const safeTranslatedText = String(translatedText || "").trim();
         translationOutputs.push({ lang: language, text: safeTranslatedText });
 
