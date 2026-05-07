@@ -75,8 +75,6 @@ export const createDeepgramSession = ({
 
     connection.on("open", () => {
       isOpen = true;
-      console.log("Deepgram connected");
-      console.log("Deepgram stream started");
       keepAliveTimer = setInterval(() => {
         if (isOpen && isConnectionOpen(connection) && connection?.sendKeepAlive) {
           connection.sendKeepAlive();
@@ -98,7 +96,6 @@ export const createDeepgramSession = ({
         return;
       }
 
-      console.log("Transcript received");
       onTranscript?.({
         text: transcript,
         isFinal: Boolean(message.is_final),

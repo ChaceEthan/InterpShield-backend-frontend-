@@ -28,7 +28,7 @@ import {
 import { AnimatePresence, motion } from "motion/react";
 import { io, type Socket } from "socket.io-client";
 
-type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings";
+type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
 type SessionStatus = "idle" | "connecting" | "listening" | "stopping" | "error";
 type Plan = "free" | "pro";
@@ -47,6 +47,7 @@ interface UserSettings {
   preferredSourceLang?: string;
   preferredTargetLang?: string;
   preferredTargetLanguages?: string[];
+  preferredProvider?: string;
   saveTranscript?: boolean;
   saveAudio?: boolean;
   speakerDetection?: boolean;
@@ -74,6 +75,7 @@ interface AppUser {
   picture?: string;
   plan: Plan;
   provider: string;
+  role?: "admin" | "user";
   settings?: UserSettings;
 }
 
@@ -135,6 +137,11 @@ interface DubbingQueueItem {
   createdAt: number;
 }
 
+interface ProviderHealthStatus {
+  status: 'healthy' | 'cooldown';
+  cooldownUntil: number;
+}
+
 interface PartialTranscriptPayload {
   text: string;
   detectedLanguage?: string;
@@ -173,7 +180,7 @@ declare global {
 const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const TRANSCRIPT_HISTORY_STORAGE_KEY = "interp_history";
-const MAX_TRANSCRIPT_HISTORY_ENTRIES = 500;
+const MAX_TRANSCRIPT_HISTORY_ENTRIES = 40;
 const MAX_TARGET_LANGUAGES = 3;
 const LIVE_TEXT_WINDOW_CHARS = 900;
 const LIVE_SEGMENT_WINDOW = 6;
@@ -363,18 +370,21 @@ const normalizeTargetLanguages = (languages?: unknown, fallback = DEFAULT_TARGET
   return validCodes.has(fallback) ? [fallback] : DEFAULT_TARGET_LANGUAGES;
 };
 
+const isVisibleTranslationText = (text = "") =>
+  Boolean(text.trim()) && !/\b(temporar(?:il)y unavailable|temporar(?:il)y failed|translation unavailable|provider failed)\b/i.test(text);
+
 const normalizeTranslationMap = (translations?: unknown, fallbackText = "", fallbackLang = DEFAULT_TARGET_LANGUAGES[0]) => {
   const normalized: Record<string, string> = {};
 
   if (translations && typeof translations === "object" && !Array.isArray(translations)) {
     for (const [language, translatedText] of Object.entries(translations as Record<string, unknown>)) {
       const text = String(translatedText || "").trim();
-      if (language && text) normalized[language] = text;
+      if (language && isVisibleTranslationText(text)) normalized[language] = text;
     }
   }
 
   const cleanFallbackText = fallbackText.trim();
-  if (Object.keys(normalized).length === 0 && cleanFallbackText) {
+  if (Object.keys(normalized).length === 0 && isVisibleTranslationText(cleanFallbackText)) {
     normalized[fallbackLang] = cleanFallbackText;
   }
 
@@ -385,10 +395,10 @@ const orderedTranslationEntries = (translations: Record<string, string>, targetL
   const knownLanguages = normalizeTargetLanguages(targetLanguages);
   const orderedEntries = knownLanguages
     .map((language) => [language, translations[language]?.trim() || ""] as const)
-    .filter(([, translatedText]) => Boolean(translatedText));
+    .filter(([, translatedText]) => isVisibleTranslationText(translatedText));
 
   for (const [language, translatedText] of Object.entries(translations)) {
-    if (!knownLanguages.includes(language) && translatedText.trim()) orderedEntries.push([language, translatedText.trim()]);
+    if (!knownLanguages.includes(language) && isVisibleTranslationText(translatedText)) orderedEntries.push([language, translatedText.trim()]);
   }
 
   return orderedEntries.slice(0, MAX_TARGET_LANGUAGES);
@@ -962,12 +972,20 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [alert, setAlert] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [adminStats, setAdminStats] = useState<any>(null);
+  const [providerHealth, setProviderHealth] = useState<Record<string, ProviderHealthStatus>>({
+    gemini: { status: 'healthy', cooldownUntil: 0 },
+    openai: { status: 'healthy', cooldownUntil: 0 }
+  });
+  const [latencyHistory, setLatencyHistory] = useState<Array<{provider: string, latency: number, time: number}>>([]);
+  const [aiDegraded, setAiDegraded] = useState(false);
   const [savedHistory, setSavedHistory] = useState<HistoryItem[]>([]);
   const [billingCycle, setBillingCycle] = useState<"monthly" | "yearly">("monthly");
   const [microphones, setMicrophones] = useState<MediaDeviceInfo[]>([]);
 
   const [mode, setMode] = useState<Mode>("translate");
   const [sourceLang, setSourceLang] = useState("en");
+  const [preferredProvider, setPreferredProvider] = useState<string>("auto");
   const [targetLanguages, setTargetLanguages] = useState<string[]>(DEFAULT_TARGET_LANGUAGES);
   const [privateMode, setPrivateMode] = useState(true);
   const [shareableMode, setShareableMode] = useState(false);
@@ -1023,6 +1041,8 @@ export default function App() {
     translate: boolean;
     twoWay: boolean;
     mimeType: string;
+    preferredProvider?: string;
+    userPlan?: Plan;
   } | null>(null);
   const shouldRestartSessionOnReconnectRef = useRef(false);
   const sequenceRef = useRef(0);
@@ -1031,6 +1051,7 @@ export default function App() {
   const lastFinalOriginalRef = useRef("");
   const lastFinalTranslationRef = useRef("");
   const lastCompletedTranslationRef = useRef("");
+  const lastTranslationOriginalRef = useRef("");
   const pendingFinalTranscriptRef = useRef<Pick<TranscriptHistoryEntry, "original" | "timestamp" | "sourceLang" | "targetLang" | "targetLanguages"> | null>(null);
   const activeTranslationIdRef = useRef("");
   const audioChunkMsRef = useRef(700);
@@ -1139,6 +1160,7 @@ export default function App() {
 
     setSourceLang(settings.preferredSourceLang || "en");
     setTargetLanguages(normalizeTargetLanguages(settings.preferredTargetLanguages, settings.preferredTargetLang || DEFAULT_TARGET_LANGUAGES[0]));
+    setPreferredProvider(settings.preferredProvider || "auto");
     setPrivateMode(settings.privateMode ?? true);
     setShareableMode(Boolean(settings.shareableMode));
     setSaveTranscript(settings.saveTranscript ?? true);
@@ -1266,7 +1288,7 @@ export default function App() {
     const original = entry.original.trim();
     const translated = entry.translated.trim();
 
-    if (!original || !translated || /unavailable/i.test(translated)) return;
+    if (!original || !isVisibleTranslationText(translated)) return;
 
     setHistory((current) => {
       const historySignature = `${entry.timestamp}|${original}|${translated}`;
@@ -1345,6 +1367,7 @@ export default function App() {
     dubbingSpeakingRef.current = false;
     activeDubbingUtteranceIdRef.current = "";
     activeDubbingLanguageRef.current = "";
+    lastTranslationOriginalRef.current = "";
     if (subtitleThrottleTimerRef.current) {
       window.clearTimeout(subtitleThrottleTimerRef.current);
       subtitleThrottleTimerRef.current = null;
@@ -1386,7 +1409,6 @@ export default function App() {
     socketRef.current = socket;
 
     socket.on("connect", () => {
-      console.log("Socket connected");
       setAlert((current) => (current === "Unable to reach InterpShield. Please try again." ? null : current));
 
       if (shouldRestartSessionOnReconnectRef.current && activeSessionPayloadRef.current) {
@@ -1414,7 +1436,6 @@ export default function App() {
       const recorder = mediaRecorderRef.current;
       if (recorder?.state === "inactive") {
         recorder.start(audioChunkMsRef.current);
-        console.log("Mic started");
         sessionStartedAtRef.current = Date.now();
         setSessionSeconds(0);
       }
@@ -1429,7 +1450,25 @@ export default function App() {
     });
     socket.on("warning", ({ message }: { message?: string }) => {
       const warning = message || "";
+
+      if (warning === "AI_PROVIDER_DEGRADED") {
+        setAiDegraded(true);
+        return;
+      }
+
+      if (warning.startsWith("PROVIDER_RECOVERED:")) {
+        const names = warning.split(":")[1].split(",").map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(" and ");
+        setAlert(`${names} service has recovered. High-quality AI processing restored.`);
+
+        // Clear global degraded status if all are healthy
+        setAiDegraded(false);
+        return;
+      }
+
       if (warning.includes("session limit") || warning.includes("silence")) setAlert(warning);
+    });
+    socket.on("provider_health", (health: Record<string, ProviderHealthStatus>) => {
+      setProviderHealth(health);
     });
     const handleSessionError = ({ message }: { message?: string }) => {
       sessionActionInFlightRef.current = false;
@@ -1440,6 +1479,12 @@ export default function App() {
     socket.on("session_error", handleSessionError);
     socket.on("app-error", handleSessionError);
 
+    const trackLatency = (latency?: number, provider?: string) => {
+      if (typeof latency === "number" && provider) {
+        setLatencyHistory(prev => [...prev, { provider, latency, time: Date.now() }].slice(-100));
+      }
+    };
+
     socket.on("transcript_partial", ({ text, detectedLanguage }: { text?: string; detectedLanguage?: string }) => {
       const originalText = text?.trim() || "";
       if (!originalText || originalText === lastInterimRef.current) return;
@@ -1448,11 +1493,12 @@ export default function App() {
       schedulePartialTranscript({ text: originalText, detectedLanguage });
     });
 
-    socket.on("transcript_final", ({ text, detectedLanguage, latencyMs, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages }: { text?: string; detectedLanguage?: string; latencyMs?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[] }) => {
+    socket.on("transcript_final", ({ text, detectedLanguage, latencyMs, provider, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages }: { text?: string; detectedLanguage?: string; latencyMs?: number; provider?: string; sourceLang?: string; targetLang?: string; targetLanguages?: string[] }) => {
       const originalText = text?.trim() || "";
       if (!originalText || originalText === lastFinalOriginalRef.current) return;
       if (detectedLanguage) setDetectedLanguage(detectedLanguage);
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
+      trackLatency(latencyMs, provider);
 
       lastInterimRef.current = "";
       lastFinalOriginalRef.current = originalText;
@@ -1463,6 +1509,12 @@ export default function App() {
       }
       const pendingTargetLanguages = normalizeTargetLanguages(eventTargetLanguages, eventTargetLang || targetLangRef.current);
       const timestamp = new Date().toISOString();
+      const lastTranslationOriginal = lastTranslationOriginalRef.current;
+      const normalizedFinalOriginal = originalText.toLowerCase().replace(/\s+/g, " ").trim();
+      const normalizedTranslationOriginal = lastTranslationOriginal.toLowerCase().replace(/\s+/g, " ").trim();
+      const keepStreamingTranslation =
+        normalizedTranslationOriginal &&
+        (normalizedFinalOriginal.includes(normalizedTranslationOriginal) || normalizedTranslationOriginal.includes(normalizedFinalOriginal));
       const pendingEntry = {
         original: originalText,
         timestamp,
@@ -1478,8 +1530,10 @@ export default function App() {
       setLiveText("");
       setFinalText((current) => appendTextWindow(current, originalText));
       setOriginalSegments((current) => [...current, originalText].slice(-MAX_LIVE_SEGMENTS));
-      setFinalTranslations({});
-      lastFinalTranslationRef.current = "";
+      if (!keepStreamingTranslation) {
+        setFinalTranslations({});
+        lastFinalTranslationRef.current = "";
+      }
       lastCompletedTranslationRef.current = "";
 
       if (modeRef.current === "transcribe") {
@@ -1489,8 +1543,20 @@ export default function App() {
       setStatus("listening");
     });
 
-    socket.on("translation_update", ({ text, translations, latencyMs, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete }: { text?: string; translations?: Record<string, string>; latencyMs?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean }) => {
+    socket.on("result", (payload: any) => {
+      if (payload.type === "admin_stats") {
+        setAdminStats(payload.stats);
+      }
+    });
+
+    socket.on("translation_update", ({ original, text, translations, latencyMs, provider, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete }: { original?: string; text?: string; translations?: Record<string, string>; latencyMs?: number; provider?: string; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean }) => {
       const pendingTranscript = pendingFinalTranscriptRef.current;
+      const updateOriginal = original?.trim() || "";
+
+      if (pendingTranscript && updateOriginal && updateOriginal !== pendingTranscript.original) {
+        return;
+      }
+
       const nextTargetLanguages = normalizeTargetLanguages(eventTargetLanguages || pendingTranscript?.targetLanguages || targetLanguagesRef.current, eventTargetLang || pendingTranscript?.targetLang || targetLangRef.current);
       const nextTranslations = normalizeTranslationMap(translations, text || "", eventTargetLang || nextTargetLanguages[0]);
       const nextTranslation = formatTranslationsText(nextTranslations, nextTargetLanguages);
@@ -1499,7 +1565,9 @@ export default function App() {
 
       if (!nextTranslation || (!isComplete && nextTranslationSignature === lastFinalTranslationRef.current)) return;
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
+      trackLatency(latencyMs, provider);
 
+      lastTranslationOriginalRef.current = updateOriginal || pendingTranscript?.original || lastFinalOriginalRef.current;
       lastFinalTranslationRef.current = nextTranslationSignature;
       setFinalTranslations(nextTranslations);
 
@@ -1511,7 +1579,7 @@ export default function App() {
         setFinalTranslationText((current) => [current, nextTranslation].filter(Boolean).join("\n\n").trim().slice(-3500));
         setTranslatedSegments((current) => [...current, nextTranslation].slice(-MAX_LIVE_SEGMENTS));
         appendTranscriptHistory({
-          original: pendingTranscript?.original || lastFinalOriginalRef.current,
+          original: pendingTranscript?.original || updateOriginal || lastFinalOriginalRef.current,
           translated: nextTranslation,
           translations: nextTranslations,
           timestamp: pendingTranscript?.timestamp || new Date().toISOString(),
@@ -1564,7 +1632,7 @@ export default function App() {
       return;
     }
 
-    const entries = orderedTranslationEntries(finalTranslations, targetLanguages).filter(([, translatedText]) => !/unavailable/i.test(translatedText));
+    const entries = orderedTranslationEntries(finalTranslations, targetLanguages).filter(([, translatedText]) => isVisibleTranslationText(translatedText));
     if (entries.length === 0) return;
 
     const translationId = activeTranslationIdRef.current || "current";
@@ -1784,7 +1852,9 @@ export default function App() {
         targetLanguages: activeTargetLanguages,
         translate: modeRef.current !== "transcribe",
         twoWay,
-        mimeType: mimeType || "audio/webm"
+        mimeType: mimeType || "audio/webm",
+        preferredProvider,
+        userPlan: user?.plan || "free"
       };
       activeSessionPayloadRef.current = sessionPayload;
       shouldRestartSessionOnReconnectRef.current = false;
@@ -1860,6 +1930,7 @@ export default function App() {
     lastFinalOriginalRef.current = "";
     lastFinalTranslationRef.current = "";
     lastCompletedTranslationRef.current = "";
+    lastTranslationOriginalRef.current = "";
     activeTranslationIdRef.current = "";
     pendingFinalTranscriptRef.current = null;
     spokenDubbingKeysRef.current.clear();
@@ -1880,7 +1951,7 @@ export default function App() {
   };
 
   const saveHistoryAsPdf = () => {
-    const stableHistory = history.filter((entry) => entry.original.trim() && entry.translated.trim() && !/unavailable/i.test(entry.translated));
+    const stableHistory = history.filter((entry) => entry.original.trim() && isVisibleTranslationText(entry.translated));
 
     if (stableHistory.length === 0) {
       setAlert("No transcript history to export.");
@@ -1923,6 +1994,50 @@ export default function App() {
     void updateSettings(settings);
   };
 
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const getProviderStatusLabel = (provider: string, baseLabel: string) => {
+    const health = providerHealth[provider];
+    if (!health || health.status === 'healthy') return `${baseLabel} ready`;
+
+    const remainingSec = Math.ceil((health.cooldownUntil - now) / 1000);
+    return remainingSec > 0
+      ? `${baseLabel} cooling down (${remainingSec}s)`
+      : `${baseLabel} ready`;
+  };
+
+  const LatencyGraph = ({ data }: { data: typeof latencyHistory }) => {
+    const providers = ["gemini", "openai"];
+    return (
+      <div className="mt-4 space-y-4">
+        {providers.map(p => {
+          const pData = data.filter(d => d.provider === p).slice(-24);
+          if (pData.length === 0) return null;
+          const maxLat = Math.max(...pData.map(d => d.latency), 1200);
+          return (
+            <div key={p} className="space-y-1.5">
+               <div className="flex justify-between text-[10px] font-black uppercase tracking-widest text-slate-500">
+                 <span className="flex items-center gap-1.5"><div className="h-1.5 w-1.5 rounded-full bg-blue-500" />{p} performance</span>
+                 <span className="text-slate-400">{pData[pData.length - 1].latency}ms</span>
+               </div>
+               <div className="flex h-12 w-full items-end gap-0.5 rounded-lg border border-white/5 bg-slate-950/50 p-1">
+                  {pData.map((d, i) => (
+                    <div key={i} className="flex-1 rounded-t-[1px] bg-blue-500/30 transition-all hover:bg-blue-400"
+                         style={{ height: `${Math.max(4, (d.latency / maxLat) * 100)}%` }}
+                         title={`${d.latency}ms`} />
+                  ))}
+               </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
   const renderTopNav = () => (
     <header className="sticky top-0 z-30 border-b border-white/10 bg-slate-950/82 px-4 py-3 backdrop-blur-xl">
       <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-3">
@@ -1937,6 +2052,7 @@ export default function App() {
         </button>
 
         <nav className="flex flex-wrap items-center gap-2 text-sm font-semibold text-slate-400">
+          {user?.role === 'admin' && <button onClick={() => navigate("admin")} className="rounded-lg px-3 py-2 hover:bg-white/5 hover:text-white">Admin</button>}
           <button onClick={() => navigate("pricing")} className="flex items-center gap-2 rounded-lg bg-blue-500 px-4 py-2 font-black text-white hover:bg-blue-400">
             <Crown className="h-4 w-4" />
             Get Pro
@@ -2045,6 +2161,17 @@ export default function App() {
       </aside>
 
       <section className="space-y-5">
+        <AnimatePresence>
+          {aiDegraded && (
+            <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
+              <div className="flex items-center gap-3 rounded-lg border border-blue-500/20 bg-blue-500/10 px-4 py-3 text-sm text-blue-100">
+                <AlertTriangle className="h-4 w-4 shrink-0 text-blue-400" />
+                <p><b>System Status:</b> High demand detected. Fallback AI processing is active to maintain low latency.</p>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         <GlassPanel className="p-4">
           <TargetLanguageTriangle sourceLang={sourceLang} targetLanguages={targetLanguages} disabled={isRecording} onSourceChange={setSourceLang} onToggleTarget={toggleTargetLanguage} onSwap={swapLanguages} />
           <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-4">
@@ -2284,6 +2411,95 @@ export default function App() {
     </main>
   );
 
+  const renderAdmin = () => {
+    const barData = adminStats ? [
+      { name: 'Gemini', cost: adminStats.gemini.cost, requests: adminStats.gemini.requests },
+      { name: 'OpenAI', cost: adminStats.openai.cost, requests: adminStats.openai.requests }
+    ] : [];
+
+    const lineData = adminStats?.history || [];
+
+    const totalCost = adminStats ? adminStats.gemini.cost + adminStats.openai.cost : 0;
+    const budgetUsage = adminStats ? (totalCost / adminStats.budget) * 100 : 0;
+    const maxBarCost = Math.max(...barData.map((entry) => entry.cost), 0.001);
+    const recentLineData = lineData.slice(-24);
+    const maxHistoryCost = Math.max(...recentLineData.map((entry: any) => Number(entry.gemini || 0) + Number(entry.openai || 0)), 0.001);
+
+    return (
+      <main className="mx-auto w-full max-w-6xl px-5 py-8">
+        <div className="mb-6 flex items-center justify-between">
+          <h1 className="text-4xl font-black text-white">Admin Dashboard</h1>
+          <div className="text-right">
+            <p className="text-xs font-bold uppercase tracking-widest text-slate-500">Global Budget</p>
+            <p className="text-xl font-black text-white">${totalCost.toFixed(2)} / ${adminStats?.budget?.toFixed(2)}</p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+          <GlassPanel className="p-6 md:col-span-2">
+            <p className="mb-6 text-sm font-bold uppercase tracking-widest text-slate-500">API Cost Breakdown (USD)</p>
+            <div className="grid h-64 grid-cols-1 gap-6 md:grid-cols-[220px_1fr]">
+              <div className="flex items-end gap-5 rounded-lg border border-white/5 bg-slate-950/50 p-4">
+                {barData.map((entry) => (
+                  <div key={entry.name} className="flex flex-1 flex-col items-center gap-2">
+                    <div className="flex h-40 w-full items-end rounded bg-slate-900">
+                      <div
+                        className={`w-full rounded-t transition-all duration-500 ${entry.name === "Gemini" ? "bg-blue-500" : "bg-emerald-500"}`}
+                        style={{ height: `${Math.max(4, (entry.cost / maxBarCost) * 100)}%` }}
+                      />
+                    </div>
+                    <p className="text-xs font-black text-white">{entry.name}</p>
+                    <p className="text-[11px] text-slate-500">${entry.cost.toFixed(4)} / {entry.requests} req</p>
+                  </div>
+                ))}
+              </div>
+
+              <div className="rounded-lg border border-white/5 bg-slate-950/50 p-4">
+                <div className="mb-3 flex items-center justify-between text-[10px] font-black uppercase tracking-widest text-slate-500">
+                  <span>24H Spend</span>
+                  <span>${maxHistoryCost.toFixed(4)} peak</span>
+                </div>
+                <div className="flex h-44 items-end gap-1">
+                  {recentLineData.length > 0 ? (
+                    recentLineData.map((entry: any, index: number) => {
+                      const total = Number(entry.gemini || 0) + Number(entry.openai || 0);
+                      return (
+                        <div
+                          key={`${entry.timestamp || index}`}
+                          className="flex-1 rounded-t bg-blue-400/40 transition-all"
+                          style={{ height: `${Math.max(3, (total / maxHistoryCost) * 100)}%` }}
+                          title={`${entry.timestamp || ""} $${total.toFixed(4)}`}
+                        />
+                      );
+                    })
+                  ) : (
+                    <div className="flex h-full w-full items-center justify-center text-sm text-slate-600">No usage history yet.</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </GlassPanel>
+
+          <GlassPanel className="flex flex-col justify-center p-6">
+            <p className="mb-2 text-sm font-bold uppercase tracking-widest text-slate-500">Monthly Budget Usage</p>
+            <div className="relative pt-1">
+              <div className="mb-4 flex items-center justify-between">
+                <div>
+                  <span className="inline-block rounded-full bg-blue-500/20 px-2 py-1 text-xs font-semibold uppercase text-blue-400">
+                    {budgetUsage.toFixed(1)}% consumed
+                  </span>
+                </div>
+              </div>
+              <div className="mb-4 flex h-2 overflow-hidden rounded bg-slate-800 text-xs">
+                <div style={{ width: `${Math.min(100, budgetUsage)}%` }} className={`shadow-none transition-all duration-500 flex flex-col text-center whitespace-nowrap text-white justify-center ${budgetUsage > 90 ? 'bg-red-500' : budgetUsage > 75 ? 'bg-amber-500' : 'bg-blue-500'}`}></div>
+              </div>
+            </div>
+          </GlassPanel>
+        </div>
+      </main>
+    );
+  };
+
   const renderSettings = () => (
     <main className="mx-auto w-full max-w-6xl px-5 py-8">
       <div className="mb-6">
@@ -2348,11 +2564,27 @@ export default function App() {
             <SelectControl label="Summary language" value={summaryLanguage} onChange={(value) => { setSummaryLanguage(value); persistSetting("summaryLanguage", value); }}>
               {LANGUAGES.map((language) => <option key={language.code} value={language.code}>{language.name}</option>)}
             </SelectControl>
+            <div className="relative">
+              <SelectControl label="AI Provider Preference" value={preferredProvider} onChange={(value) => { if (!isPro && value !== "auto") { setAlert("Manual provider override is a Pro feature."); return; } setPreferredProvider(value); persistSetting("preferredProvider", value); }}>
+                <option value="auto">Auto (Plan optimized)</option>
+                <option value="gemini" title={providerHealth.gemini.status === 'cooldown' ? `Rate limit active. Cooldown expires at ${new Date(providerHealth.gemini.cooldownUntil).toLocaleTimeString()}` : 'Provider is healthy'}>
+                  {getProviderStatusLabel('gemini', 'Gemini')}
+                </option>
+                <option value="openai" title={providerHealth.openai.status === 'cooldown' ? `Rate limit active. Cooldown expires at ${new Date(providerHealth.openai.cooldownUntil).toLocaleTimeString()}` : 'Provider is healthy'}>
+                  {getProviderStatusLabel('openai', 'OpenAI')}
+                </option>
+              </SelectControl>
+              {!isPro && <Lock className="absolute right-9 top-[38px] h-3.5 w-3.5 text-amber-300/40" />}
+            </div>
             <ToggleRow label="Scene detection" value={sceneDetection} onChange={(value) => { setSceneDetection(value); persistSetting("sceneDetection", value); }} />
             <ToggleRow label="Action item extraction" value={actionItemExtraction} onChange={(value) => { setActionItemExtraction(value); persistSetting("actionItemExtraction", value); }} />
             <ToggleRow label="Per-speaker summary" value={perSpeakerSummary} onChange={(value) => { setPerSpeakerSummary(value); persistSetting("perSpeakerSummary", value); }} />
             <ToggleRow label="Sentiment tracking" value={sentimentTracking} onChange={(value) => { setSentimentTracking(value); persistSetting("sentimentTracking", value); }} />
             <ToggleRow label="Keywords extraction" value={keywordsExtraction} onChange={(value) => { setKeywordsExtraction(value); persistSetting("keywordsExtraction", value); }} />
+            <div className="mt-4 border-t border-white/5 pt-4">
+              <p className="text-[10px] font-black uppercase tracking-widest text-slate-500">Live AI Latency</p>
+              <LatencyGraph data={latencyHistory} />
+            </div>
           </div>
         </GlassPanel>
 
@@ -2386,6 +2618,7 @@ export default function App() {
       {view === "signup" && <AuthPage mode="signup" authProvider={authProvider} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleError={setAuthError} onNavigate={navigate} />}
       {view === "dashboard" && isAuthed && renderDashboard()}
       {view === "pricing" && renderPricing()}
+      {view === "admin" && user?.role === 'admin' && renderAdmin()}
       {view === "history" && isAuthed && renderHistory()}
       {view === "help" && renderHelp()}
       {view === "settings" && isAuthed && renderSettings()}

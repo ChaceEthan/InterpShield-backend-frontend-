@@ -2,7 +2,13 @@
 import { createDeepgramSession } from "./deepgram.js";
 import { translateWithGemini } from "./gemini.js";
 import { translateWithOpenAI } from "./openai.js";
-import { detectLocalSourceLanguage, detectRegionAccent, normalizeMixedSpeech, resolveLocalTranslation } from "../utils/translationEnhancer.js";
+import {
+  detectLocalSourceLanguage,
+  detectRegionAccent,
+  enhanceTranslation,
+  normalizeMixedSpeech,
+  resolveLocalTranslation
+} from "../utils/translationEnhancer.js";
 
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
 const MAX_TRANSCRIPT_HISTORY = 500;
@@ -12,22 +18,56 @@ const SENTENCE_DEBOUNCE_MS = 360;
 const SHORT_PAUSE_DEBOUNCE_MS = 700;
 const SILENCE_DEBOUNCE_MS = 700;
 const LOCAL_LANGUAGE_CONFIDENCE_THRESHOLD = 0.7;
-const MAX_ACTIVE_TRANSLATIONS = 2;
-const MAX_QUEUE_SIZE = 10;
-const STALE_JOB_TIMEOUT = 6000;
+const TRANSLATION_LANE_FAST_LOCAL = "fastLocal";
+const TRANSLATION_LANE_PROVIDER = "provider";
+const FAST_LOCAL_LANGUAGE_CODES = new Set(["rw", "rn", "sw", "luganda"]);
+const FAST_LOCAL_MAX_ACTIVE_TRANSLATIONS = 8;
+const PROVIDER_MAX_ACTIVE_TRANSLATIONS = 4;
+const MAX_TRANSLATION_LANE_QUEUE_SIZE = 10;
+const STALE_JOB_TIMEOUT = 5500;
 const TRANSLATION_RATE_LIMIT_DELAY_MS = 80;
+const CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS = 3000;
+const LATENCY_WINDOW_SIZE = 5;
 const MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3;
+
+// Admin Dashboard Tracking (Simulated Persistent Store)
+const globalUsageStats = {
+  gemini: { tokens: 0, cost: 0, requests: 0 },
+  openai: { tokens: 0, cost: 0, requests: 0 },
+  history: [], // Hourly cost buckets for line chart
+  lastUpdate: Date.now()
+};
+const MONTHLY_BUDGET = 100.00; // Example $100 budget
+const alertedThresholds = new Set();
+const ESTIMATED_RATES = { gemini: 0.000125 / 1000, openai: 0.03 / 1000 };
+
+/**
+ * Clears all global usage statistics and alert memory for the new billing month.
+ */
+export const resetGlobalBudget = () => {
+  globalUsageStats.gemini = { tokens: 0, cost: 0, requests: 0 };
+  globalUsageStats.openai = { tokens: 0, cost: 0, requests: 0 };
+  globalUsageStats.history = [];
+  globalUsageStats.lastUpdate = Date.now();
+  alertedThresholds.clear();
+};
+
 const MAX_STYLE_MEMORY_ENTRIES = 20;
-const MAX_TRANSLATION_CACHE_ENTRIES = 180;
+const MAX_TRANSLATION_CACHE_ENTRIES = 1200;
+const FAST_LOCAL_TRANSLATION_CACHE_TTL_MS = 25 * 60 * 1000;
+const PROVIDER_TRANSLATION_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
+const PARTIAL_TRANSLATION_PREVIEW_THROTTLE_MS = 140;
+const ADMIN_STATS_EMIT_MS = 10000;
 const TRANSLATION_ATTEMPT_TIMEOUT_MS = 2500;
-const PROVIDER_FAILURE_THRESHOLD = 2;
-const PROVIDER_COOLDOWN_MS = 30000;
+const PROVIDER_FALLBACK_STAGGER_MS = 450;
+const PROVIDER_FAILURE_THRESHOLD = 3;
+const PROVIDER_COOLDOWN_MS = 45000;
 const SESSION_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
 const SESSION_HEALTH_CHECK_MS = 2500;
 const MAX_STALE_TRANSLATION_JOBS = 40;
 const MAX_PENDING_SENTENCE_CHARS = 1400;
-const SAFE_FALLBACK_TRANSLATION = "Translation temporarily unavailable.";
 const sessionHistoryStore = new Map();
+const sharedTranslationCache = new Map();
 
 const createSessionId = () => {
   if (globalThis.crypto?.randomUUID) {
@@ -163,6 +203,60 @@ const sentenceEnds = (text = "") => /[.!?]$/.test(text.trim());
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const wordCount = (text = "") => text.split(/\s+/).filter(Boolean).length;
 
+const normalizeInterpreterLanguageCode = (language = "") => {
+  const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
+  if (!normalized) return "";
+  if (normalized === "lg" || normalized === "lg-ug" || normalized === "lug" || normalized === "luganda") return "luganda";
+  if (normalized.startsWith("rw")) return "rw";
+  if (normalized.startsWith("rn")) return "rn";
+  if (normalized.startsWith("sw")) return "sw";
+  if (normalized.startsWith("en")) return "en";
+  return normalized.split("-")[0] || normalized;
+};
+
+const isFastLocalLaneLanguage = ({ sourceLang = "", targetLang = "" } = {}) => {
+  const source = normalizeInterpreterLanguageCode(sourceLang);
+  const target = normalizeInterpreterLanguageCode(targetLang);
+
+  if (FAST_LOCAL_LANGUAGE_CODES.has(target)) return true;
+  if (target === "en" && FAST_LOCAL_LANGUAGE_CODES.has(source)) return true;
+  return source === "en" && target === "en";
+};
+
+const triggerBackgroundRetry = (params) => {
+  const { job, language, translateInLane, emitUpdate, retryTimers } = params;
+  const jitteredDelay = 1500 + Math.random() * 2000;
+
+  const retryTimer = setTimeout(async () => {
+    retryTimers?.delete(retryTimer);
+    if (!job || job.stale) return;
+
+    try {
+      const result = await translateInLane({
+        language,
+        translationInput: job.translationInput,
+        direction: job.direction,
+        translationContext: job.translationContext,
+        jobId: job.id
+      });
+
+      const translatedText = String(result?.text || result || "").trim();
+      if (translatedText && !job.stale) {
+        job.translations[language] = translatedText;
+        emitUpdate?.(translatedText, result?.provider || "retry");
+      }
+    } catch (error) {
+      void error;
+    }
+  }, jitteredDelay);
+  retryTimer.unref?.();
+
+  retryTimers?.add(retryTimer);
+};
+
+const translationLaneForLanguage = ({ sourceLang = "", targetLang = "" } = {}) =>
+  isFastLocalLaneLanguage({ sourceLang, targetLang }) ? TRANSLATION_LANE_FAST_LOCAL : TRANSLATION_LANE_PROVIDER;
+
 const trimTextWindow = (text = "", maxChars = MAX_PENDING_SENTENCE_CHARS) => {
   const cleanText = cleanTranscriptText(text);
   if (cleanText.length <= maxChars) return cleanText;
@@ -181,17 +275,87 @@ const withTimeout = (promise, timeoutMs, message) => {
   });
 };
 
-const translationCacheKey = ({ source, target, text }) =>
-  [source || "auto", target || "", normalizeTranscript(text)].join("|");
+const hashTranslationCacheInput = (value = "") => {
+  let hash = 2166136261;
+  const input = String(value || "");
 
-const rememberCachedTranslation = (cache, key, value) => {
-  if (!key || !value) return;
-  if (cache.has(key)) cache.delete(key);
-  cache.set(key, value);
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
+};
+
+const translationCacheKey = ({ source, target, text }) =>
+  hashTranslationCacheInput(
+    [
+      normalizeInterpreterLanguageCode(source) || source || "auto",
+      normalizeInterpreterLanguageCode(target) || target || "",
+      normalizeTranscript(text)
+    ].join("|")
+  );
+
+const translationCacheTtlMs = ({ source, target } = {}) =>
+  isFastLocalLaneLanguage({ sourceLang: source, targetLang: target })
+    ? FAST_LOCAL_TRANSLATION_CACHE_TTL_MS
+    : PROVIDER_TRANSLATION_CACHE_TTL_MS;
+
+const isProviderFailureText = (text = "") =>
+  /\b(temporar(?:il)y unavailable|temporar(?:il)y failed|translation unavailable|provider failed|timed out|timeout)\b/i.test(String(text || ""));
+
+const isCacheableTranslation = ({ text = "", sourceText = "", provider = "" } = {}) => {
+  const cleanText = cleanTranscriptText(text);
+  if (!cleanText || isProviderFailureText(cleanText)) return false;
+  if (provider === "failed" || provider === "source") return false;
+  if (!hasMeaningfulTranslationText(cleanText)) return false;
+  if (sourceText && normalizeTranscript(cleanText) === normalizeTranscript(sourceText) && provider !== "local") return false;
+  return true;
+};
+
+const pruneTranslationCache = (cache = sharedTranslationCache) => {
+  const now = Date.now();
+
+  for (const [key, entry] of cache.entries()) {
+    if (!entry?.expiresAt || entry.expiresAt <= now) cache.delete(key);
+  }
 
   while (cache.size > MAX_TRANSLATION_CACHE_ENTRIES) {
     cache.delete(cache.keys().next().value);
   }
+};
+
+const readCachedTranslation = (cache, key) => {
+  const entry = cache.get(key);
+  if (!entry) return "";
+
+  if (entry.expiresAt <= Date.now()) {
+    cache.delete(key);
+    return "";
+  }
+
+  cache.delete(key);
+  cache.set(key, entry);
+  return entry.text;
+};
+
+const rememberCachedTranslation = (cache, key, value, metadata = {}) => {
+  if (!key || !isCacheableTranslation({ text: value, sourceText: metadata.sourceText, provider: metadata.provider })) return;
+  if (cache.has(key)) cache.delete(key);
+  cache.set(key, {
+    text: cleanTranscriptText(value),
+    provider: metadata.provider || "unknown",
+    createdAt: Date.now(),
+    expiresAt: Date.now() + translationCacheTtlMs({ source: metadata.source, target: metadata.target })
+  });
+
+  pruneTranslationCache(cache);
+};
+
+const sourceLanguageFallbackText = ({ text = "", sourceLang = "" } = {}) => {
+  const cleanText = cleanTranscriptText(text);
+  const source = normalizeInterpreterLanguageCode(sourceLang) || String(sourceLang || "source").trim().toLowerCase() || "source";
+  return cleanText ? `[${source.toUpperCase()}] ${cleanText}` : "";
 };
 
 const adaptiveDebounceDelay = (sentence = "") => {
@@ -292,11 +456,11 @@ const resolveDirection = ({ sourceLang, targetLang, targetLanguages, detectedLan
   return { source: detectedLanguage || sourceLang, target: targets[0], targets };
 };
 
-const shouldRetryGeminiAttempt = (error) => !/timed out|stale/i.test(String(error?.message || error || ""));
-
 export const createInterpreterSession = async ({
   env,
   sourceLang,
+  userPlan = "free",
+  preferredProvider = "auto",
   targetLang,
   targetLanguages,
   shouldTranslate,
@@ -304,6 +468,7 @@ export const createInterpreterSession = async ({
   onReady,
   onWarning,
   onError,
+  onProviderHealth,
   onResult,
   onClosed
 }) => {
@@ -314,26 +479,101 @@ export const createInterpreterSession = async ({
   const sessionTargetLanguages = normalizeTargetLanguages(targetLanguages, targetLang);
   let currentDirection = { source: sourceLang, target: sessionTargetLanguages[0], targets: sessionTargetLanguages };
   let currentDetectedLanguage = null;
+
+  const trackUsage = (provider, tokens = 150) => {
+    const stats = globalUsageStats[provider];
+    if (!stats) return;
+    stats.requests += 1;
+    stats.tokens += tokens;
+    stats.cost += tokens * (ESTIMATED_RATES[provider] || 0);
+    globalUsageStats.lastUpdate = Date.now();
+  };
+
   let translationTimer = null;
   let consecutiveTranslationFailures = 0;
   const lastSuccessfulTranslations = new Map();
   const styleMemoryByLanguage = new Map();
-  const translationCache = new Map();
+  const translationCache = sharedTranslationCache;
   const staleTranslationJobs = new Set();
-  const translationQueue = [];
-  const activeTranslationTasks = new Map();
-  const activeTranslationJobs = new Map();
+  const translationJobs = new Map();
+  const backgroundRetryTimers = new Set();
+  const translationLanes = {};
+  const createTranslationLane = ({ group, language }) => ({
+    id: `${group}:${language || "default"}`,
+    group,
+    language,
+    label: `${group === TRANSLATION_LANE_FAST_LOCAL ? "FAST_LOCAL" : "AI_PROVIDER"}:${language || "default"}`,
+    queue: [],
+    activeTasks: new Map(),
+    maxActive: group === TRANSLATION_LANE_FAST_LOCAL ? FAST_LOCAL_MAX_ACTIVE_TRANSLATIONS : PROVIDER_MAX_ACTIVE_TRANSLATIONS,
+    maxQueueSize: MAX_TRANSLATION_LANE_QUEUE_SIZE,
+    drainScheduled: false,
+    latencyHistory: [],
+    tripped: false
+  });
+  const getTranslationLane = ({ sourceLang: laneSourceLang = "", targetLang: laneTargetLang = "" } = {}) => {
+    const group = translationLaneForLanguage({ sourceLang: laneSourceLang, targetLang: laneTargetLang });
+    const language = normalizeInterpreterLanguageCode(laneTargetLang) || String(laneTargetLang || "default").trim().toLowerCase() || "default";
+    const laneId = `${group}:${language}`;
+
+    if (!translationLanes[laneId]) {
+      translationLanes[laneId] = createTranslationLane({ group, language });
+    }
+
+    return translationLanes[laneId];
+  };
   const localSourceMemory = {
     language: null,
     confidence: 0,
     transcriptHistory: []
   };
-  let drainScheduled = false;
   let translationJobSequence = 0;
+  let lastStreamingPreviewAt = 0;
+  let lastStreamingPreviewSignature = "";
+  let lastAdminStatsAt = 0;
   const sessionId = createSessionId();
   const providerHealth = {
-    gemini: { failures: 0, cooldownUntil: 0 },
-    openai: { failures: 0, cooldownUntil: 0 }
+    gemini: { failures: 0, cooldownUntil: 0, lastSuccessAt: 0 },
+    openai: { failures: 0, cooldownUntil: 0, lastSuccessAt: 0 }
+  };
+
+  let lastHealthState = "";
+
+  const emitProviderHealth = () => {
+    const geminiAvailable = Boolean(env.geminiApiKey && providerAvailable("gemini"));
+    const openaiAvailable = Boolean(env.openaiApiKey && providerAvailable("openai"));
+    const current = {
+      gemini: {
+        status: geminiAvailable ? "healthy" : "cooldown",
+        cooldownUntil: providerHealth.gemini.cooldownUntil
+      },
+      openai: {
+        status: openaiAvailable ? "healthy" : "cooldown",
+        cooldownUntil: providerHealth.openai.cooldownUntil
+      }
+    };
+    const stateStr = JSON.stringify(current);
+    if (stateStr === lastHealthState) return;
+    lastHealthState = stateStr;
+    onProviderHealth?.(current);
+  };
+
+  const notifyAdmin = async (message) => {
+    const webhookUrl = env.adminWebhookUrl;
+    if (!webhookUrl) return;
+
+    try {
+      await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content: `InterpShield Alert: ${message}`,
+          text: `InterpShield Alert: ${message}`
+        })
+      });
+    } catch (error) {
+      void error;
+    }
   };
 
   const clearTranslationTimer = () => {
@@ -349,17 +589,40 @@ export const createInterpreterSession = async ({
     lastInterimTranscript = "";
     lastTranslatedTranscript = "";
     consecutiveTranslationFailures = 0;
-    drainScheduled = false;
-    for (const job of translationQueue) {
+    for (const job of translationJobs.values()) {
       staleTranslationJobs.add(job.id);
       job.stale = true;
+      job.pendingLanguages?.clear?.();
+      job.runningLanguages?.clear?.();
     }
-    for (const task of activeTranslationTasks.values()) {
-      staleTranslationJobs.add(task.jobId);
+    translationJobs.clear();
+    for (const lane of Object.values(translationLanes)) {
+      lane.queue.length = 0;
+      lane.activeTasks.clear();
+      lane.drainScheduled = false;
     }
-    translationQueue.length = 0;
-    activeTranslationJobs.clear();
-    activeTranslationTasks.clear();
+    for (const retryTimer of backgroundRetryTimers) {
+      clearTimeout(retryTimer);
+    }
+    backgroundRetryTimers.clear();
+  };
+
+  const updateLaneLatency = (lane, latency) => {
+    // We primarily monitor the Provider lane for AI-related slowness
+    if (lane.group !== TRANSLATION_LANE_PROVIDER) return;
+
+    lane.latencyHistory.push(latency);
+    if (lane.latencyHistory.length > LATENCY_WINDOW_SIZE) lane.latencyHistory.shift();
+
+    const avg = lane.latencyHistory.reduce((a, b) => a + b, 0) / lane.latencyHistory.length;
+    const previouslyTripped = lane.tripped;
+    lane.tripped = lane.latencyHistory.length >= 3 && avg > CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS;
+
+    if (lane.tripped && !previouslyTripped) {
+      onWarning?.("AI_PROVIDER_DEGRADED");
+      emitProviderHealth();
+      notifyAdmin(`Circuit breaker tripped for ${lane.label}. Average latency exceeded ${CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS}ms.`);
+    }
   };
 
   const trimStaleTranslationJobs = () => {
@@ -378,33 +641,61 @@ export const createInterpreterSession = async ({
     if (!health) return;
     health.failures = 0;
     health.cooldownUntil = 0;
+    health.lastSuccessAt = Date.now();
   };
 
   const noteProviderFailure = (provider, error) => {
     const health = providerHealth[provider];
     if (!health) return;
+    void error;
 
     health.failures += 1;
     if (health.failures < PROVIDER_FAILURE_THRESHOLD) return;
 
     health.cooldownUntil = Date.now() + PROVIDER_COOLDOWN_MS;
-    console.warn("Translation provider cooldown started", {
-      provider,
-      failures: health.failures,
-      cooldownMs: PROVIDER_COOLDOWN_MS,
-      error: error?.message || error || "Provider failed"
-    });
+    emitProviderHealth();
   };
 
   const refreshProviderCooldowns = () => {
     const now = Date.now();
+    let recovered = [];
 
-    for (const health of Object.values(providerHealth)) {
+    for (const [name, health] of Object.entries(providerHealth)) {
       if (health.cooldownUntil && now >= health.cooldownUntil) {
+        recovered.push(name);
         health.failures = 0;
         health.cooldownUntil = 0;
       }
     }
+
+    if (recovered.length > 0) {
+      onWarning?.(`PROVIDER_RECOVERED:${recovered.join(",")}`);
+    }
+
+    emitProviderHealth();
+  };
+
+  const getHealthyProviders = () => {
+    refreshProviderCooldowns();
+    const providers = Object.entries(providerHealth)
+      .filter(([name, health]) => {
+        const hasKey = name === "gemini" ? env.geminiApiKey : env.openaiApiKey;
+        return hasKey && Date.now() >= health.cooldownUntil;
+      });
+
+    return providers.sort((a, b) => {
+      if (a[1].failures !== b[1].failures) return a[1].failures - b[1].failures;
+
+      let primaryChoice = userPlan === "pro" ? "openai" : "gemini";
+      if (userPlan === "pro" && preferredProvider && preferredProvider !== "auto") {
+        primaryChoice = preferredProvider;
+      }
+
+      if (a[0] === primaryChoice && b[0] !== primaryChoice) return -1;
+      if (b[0] === primaryChoice && a[0] !== primaryChoice) return 1;
+
+      return b[1].lastSuccessAt - a[1].lastSuccessAt;
+    }).map(([name]) => name);
   };
 
   const rememberLocalSourceLanguage = ({ text = "", language, confidence = 0 } = {}) => {
@@ -464,200 +755,236 @@ export const createInterpreterSession = async ({
 
   const noteTranslationFailure = (language, error) => {
     consecutiveTranslationFailures += 1;
-    console.warn("Translation failure", {
-      targetLang: language,
-      failures: consecutiveTranslationFailures,
-      error: error?.message || error || "No valid translation returned"
-    });
+    void language;
+    void error;
 
     if (consecutiveTranslationFailures >= MAX_CONSECUTIVE_TRANSLATION_FAILURES) {
-      console.warn("Translation state reset after repeated failures", {
-        failures: consecutiveTranslationFailures
-      });
-      resetTranslationState();
+      consecutiveTranslationFailures = 0;
     }
   };
 
-  const translateLanguageWithRecovery = async ({ language, translationInput, direction, translationContext, jobId }) => {
-    let lastError = null;
-    const languageTranslationContext = {
-      ...translationContext,
-      styleMemory: styleMemoryByLanguage.get(language) || null
-    };
+  const languageTranslationContextFor = (language, translationContext) => ({
+    ...translationContext,
+    styleMemory: styleMemoryByLanguage.get(language) || null
+  });
+
+  const resolveFastLocalTranslation = ({ language, translationInput, direction }) => {
+    const localTranslation = resolveLocalTranslation({ text: translationInput, sourceLang: direction.source, targetLang: language });
+    if (localTranslation) return localTranslation;
+
+    const source = normalizeInterpreterLanguageCode(direction.source);
+    const target = normalizeInterpreterLanguageCode(language);
+
+    if (source && source === target) {
+      return enhanceTranslation({ text: cleanTranscriptText(translationInput), targetLang: language });
+    }
+
+    if (target === "en" && FAST_LOCAL_LANGUAGE_CODES.has(source)) {
+      const mixedSpeech = normalizeMixedSpeech(translationInput);
+      if (mixedSpeech.isMixed) return cleanTranscriptText(mixedSpeech.normalizedText);
+    }
+
+    return "";
+  };
+
+  const translateFastLocalLanguage = async ({ language, translationInput, direction, translationContext }) => {
+    const languageTranslationContext = languageTranslationContextFor(language, translationContext);
     const cacheKey = translationCacheKey({ source: direction.source, target: language, text: translationInput });
-    const cachedTranslation = translationCache.get(cacheKey);
+    const cachedTranslation = readCachedTranslation(translationCache, cacheKey);
 
     if (cachedTranslation) {
-      console.log("Translation cache hit", { targetLang: language });
       noteTranslationSuccess(language, cachedTranslation, languageTranslationContext);
-      return cachedTranslation;
+      return { text: cachedTranslation, provider: "cache" };
     }
 
-    const localTranslation = resolveLocalTranslation({ text: translationInput, sourceLang: direction.source, targetLang: language });
+    const localTranslation = String(resolveFastLocalTranslation({ language, translationInput, direction }) || "").trim();
     if (localTranslation) {
-      console.log("Local instant translation hit", {
-        sourceLang: direction.source,
-        targetLang: language,
-        latencyTargetMs: 100
-      });
       noteTranslationSuccess(language, localTranslation, languageTranslationContext);
-      rememberCachedTranslation(translationCache, cacheKey, localTranslation);
-      return localTranslation;
+      rememberCachedTranslation(translationCache, cacheKey, localTranslation, {
+        source: direction.source,
+        target: language,
+        sourceText: translationInput,
+        provider: "local"
+      });
+      return { text: localTranslation, provider: "local" };
     }
 
-    if (env.geminiApiKey && providerAvailable("gemini")) {
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        if (staleTranslationJobs.has(jobId)) {
-          lastError = new Error("Translation job became stale");
-          break;
-        }
+    return { text: sourceLanguageFallbackText({ text: translationInput, sourceLang: direction.source }), provider: "source" };
+  };
 
-        if (attempt > 0) {
-          console.log("Retrying Gemini translation", { targetLang: language, attempt: attempt + 1 });
-          await delay(TRANSLATION_RATE_LIMIT_DELAY_MS);
-        }
+  const providerRunner = (provider) => (provider === "gemini" ? translateWithGemini : translateWithOpenAI);
 
-        const attemptStartedAt = Date.now();
-
-        try {
-          const translatedText = await withTimeout(
-            translateWithGemini({
-              apiKey: env.geminiApiKey,
-              text: translationInput,
-              sourceLang: direction.source,
-              targetLang: language,
-              translationContext: languageTranslationContext
-            }),
-            TRANSLATION_ATTEMPT_TIMEOUT_MS,
-            `Gemini translation timed out for ${language}`
-          );
-          const responseTimeMs = Date.now() - attemptStartedAt;
-          const safeTranslatedText = String(translatedText || "").trim();
-
-          console.log("Gemini translation response", {
-            provider: "gemini",
-            targetLang: language,
-            attempt: attempt + 1,
-            responseTimeMs,
-            empty: !safeTranslatedText,
-            region: languageTranslationContext.accentProfile?.region,
-            tone: languageTranslationContext.emotionProfile?.tone,
-            confidence: languageTranslationContext.confidence
-          });
-
-          if (safeTranslatedText) {
-            noteProviderSuccess("gemini");
-            noteTranslationSuccess(language, safeTranslatedText, languageTranslationContext);
-            rememberCachedTranslation(translationCache, cacheKey, safeTranslatedText);
-            return safeTranslatedText;
-          }
-
-          lastError = new Error("Empty Gemini translation response");
-          noteProviderFailure("gemini", lastError);
-        } catch (error) {
-          lastError = error;
-          noteProviderFailure("gemini", error);
-          console.warn("Gemini translation attempt failed", {
-            provider: "gemini",
-            targetLang: language,
-            attempt: attempt + 1,
-            responseTimeMs: Date.now() - attemptStartedAt,
-            error: error?.message || error
-          });
-
-          if (!shouldRetryGeminiAttempt(error)) {
-            break;
-          }
-        }
-      }
-    } else {
-      console.warn("Skipping Gemini translation provider", {
-        targetLang: language,
-        reason: env.geminiApiKey ? "cooldown" : "missing_api_key"
-      });
+  const runProviderTranslationAttempt = async ({ provider, language, translationInput, direction, languageTranslationContext, jobId }) => {
+    if (staleTranslationJobs.has(jobId)) {
+      return {
+        provider,
+        stale: true,
+        error: new Error("Translation job became stale")
+      };
     }
 
-    if (env.openaiApiKey && providerAvailable("openai") && !staleTranslationJobs.has(jobId)) {
-      await delay(TRANSLATION_RATE_LIMIT_DELAY_MS);
-      const attemptStartedAt = Date.now();
+    await delay(TRANSLATION_RATE_LIMIT_DELAY_MS);
+    if (staleTranslationJobs.has(jobId)) {
+      return {
+        provider,
+        stale: true,
+        error: new Error("Translation job became stale")
+      };
+    }
 
-      try {
-        const translatedText = await withTimeout(
-          translateWithOpenAI({
-            apiKey: env.openaiApiKey,
-            text: translationInput,
-            sourceLang: direction.source,
-            targetLang: language,
-            translationContext: languageTranslationContext
-          }),
-          TRANSLATION_ATTEMPT_TIMEOUT_MS,
-          `OpenAI translation timed out for ${language}`
-        );
-        const responseTimeMs = Date.now() - attemptStartedAt;
-        const safeTranslatedText = String(translatedText || "").trim();
+    const providerName = provider === "gemini" ? "Gemini" : "OpenAI";
+    const attemptStartedAt = Date.now();
 
-        console.log("OpenAI fallback translation response", {
-          provider: "openai",
+    try {
+      const translatedText = await withTimeout(
+        providerRunner(provider)({
+          apiKey: provider === "gemini" ? env.geminiApiKey : env.openaiApiKey,
+          text: translationInput,
+          sourceLang: direction.source,
           targetLang: language,
-          responseTimeMs,
-          empty: !safeTranslatedText,
-          region: languageTranslationContext.accentProfile?.region,
-          tone: languageTranslationContext.emotionProfile?.tone,
-          confidence: languageTranslationContext.confidence
-        });
+          translationContext: languageTranslationContext
+        }),
+        TRANSLATION_ATTEMPT_TIMEOUT_MS,
+        `${providerName} translation timed out for ${language}`
+      );
+      const responseTimeMs = Date.now() - attemptStartedAt;
+      const safeTranslatedText = String(translatedText || "").trim();
 
-        if (safeTranslatedText) {
-          noteProviderSuccess("openai");
-          noteTranslationSuccess(language, safeTranslatedText, languageTranslationContext);
-          rememberCachedTranslation(translationCache, cacheKey, safeTranslatedText);
-          return safeTranslatedText;
-        }
-
-        lastError = new Error("Empty OpenAI translation response");
-        noteProviderFailure("openai", lastError);
-      } catch (error) {
-        lastError = error;
-        noteProviderFailure("openai", error);
-        console.warn("OpenAI fallback translation failed", {
-          provider: "openai",
-          targetLang: language,
-          responseTimeMs: Date.now() - attemptStartedAt,
-          error: error?.message || error
-        });
+      if (safeTranslatedText) {
+        trackUsage(provider, 150);
+        return {
+          provider,
+          translatedText: safeTranslatedText,
+          responseTimeMs
+        };
       }
-    } else if (env.openaiApiKey) {
-      console.warn("Skipping OpenAI fallback provider", {
-        targetLang: language,
-        reason: providerAvailable("openai") ? "stale_job" : "cooldown"
+
+      return {
+        provider,
+        responseTimeMs,
+        error: new Error(`Empty ${providerName} translation response`)
+      };
+    } catch (error) {
+      return {
+        provider,
+        error,
+        responseTimeMs: Date.now() - attemptStartedAt
+      };
+    }
+  };
+
+  const waitForNextProviderResult = (pendingAttempts) =>
+    Promise.race(pendingAttempts.map((promise, index) => promise.then((result) => ({ result, index }))));
+
+  const translateProviderLanguageWithRecovery = async ({ language, translationInput, direction, translationContext, jobId }) => {
+    let lastError = null;
+    const languageTranslationContext = languageTranslationContextFor(language, translationContext);
+    const cacheKey = translationCacheKey({ source: direction.source, target: language, text: translationInput });
+    const cachedTranslation = readCachedTranslation(translationCache, cacheKey);
+
+    if (cachedTranslation) {
+      noteTranslationSuccess(language, cachedTranslation, languageTranslationContext);
+      return { text: cachedTranslation, provider: "cache" };
+    }
+
+    const healthyProviders = getHealthyProviders();
+
+    const pendingAttempts = [];
+    const startProvider = (provider) =>
+      runProviderTranslationAttempt({
+        provider,
+        language,
+        translationInput,
+        direction,
+        languageTranslationContext,
+        jobId
       });
+    const consumeProviderResult = (result) => {
+      if (!result) return "";
+      if (result.stale) {
+        lastError = result.error;
+        return "";
+      }
+
+      if (result.translatedText) {
+        noteProviderSuccess(result.provider);
+        noteTranslationSuccess(language, result.translatedText, languageTranslationContext);
+        rememberCachedTranslation(translationCache, cacheKey, result.translatedText, {
+          source: direction.source,
+          target: language,
+          sourceText: translationInput,
+          provider: result.provider
+        });
+        return { text: result.translatedText, provider: result.provider };
+      }
+
+      lastError = result.error || new Error(`${result.provider || "Provider"} did not return a translation`);
+      if (result.provider) noteProviderFailure(result.provider, lastError);
+      return { text: "", provider: result.provider };
+    };
+
+    for (let i = 0; i < healthyProviders.length; i++) {
+      const provider = healthyProviders[i];
+
+      if (i === 0) {
+        pendingAttempts.push(startProvider(provider));
+        continue;
+      }
+
+      if (pendingAttempts.length > 0) {
+        const raced = await Promise.race([
+          pendingAttempts[0].then((result) => ({ type: "result", result })),
+          delay(PROVIDER_FALLBACK_STAGGER_MS).then(() => ({ type: "stagger" }))
+        ]);
+
+        if (raced.type === "result") {
+          pendingAttempts.shift();
+          const translatedText = consumeProviderResult(raced.result);
+          if (translatedText?.text) return translatedText;
+        }
+      }
+
+      if (!staleTranslationJobs.has(jobId)) pendingAttempts.push(startProvider(provider));
+    }
+
+    while (pendingAttempts.length > 0 && !staleTranslationJobs.has(jobId)) {
+      const { result, index } = await waitForNextProviderResult(pendingAttempts);
+      pendingAttempts.splice(index, 1);
+      const translatedText = consumeProviderResult(result);
+      if (translatedText?.text) return translatedText;
     }
 
     noteTranslationFailure(language, lastError);
 
-    const fallbackTranslation = String(lastSuccessfulTranslations.get(language) || "").trim();
-    if (fallbackTranslation) {
-      const fallbackStyle = styleMemoryByLanguage.get(language);
-      console.warn("Using previous successful translation fallback", {
-        targetLang: language,
-        tone: fallbackStyle?.tone,
-        region: fallbackStyle?.region
-      });
-      return fallbackTranslation;
+    const failureCachedTranslation = readCachedTranslation(translationCache, cacheKey);
+    if (failureCachedTranslation) {
+      noteTranslationSuccess(language, failureCachedTranslation, languageTranslationContext);
+      return { text: failureCachedTranslation, provider: "cache" };
     }
 
-    console.warn("Using safe translation fallback", {
-      targetLang: language,
-      error: lastError?.message || lastError || "No provider returned a valid translation"
-    });
-    return SAFE_FALLBACK_TRANSLATION;
+    const fallbackTranslation = String(lastSuccessfulTranslations.get(language) || "").trim();
+    if (fallbackTranslation) {
+      return { text: fallbackTranslation, provider: "fallback" };
+    }
+
+    return { text: sourceLanguageFallbackText({ text: translationInput, sourceLang: direction.source }), provider: "source" };
   };
 
   const translationTaskKey = (jobId, language) => `${jobId}:${language}`;
+  const allTranslationLanes = () => Object.values(translationLanes);
 
   const removeTranslationJob = (jobId) => {
-    const queueIndex = translationQueue.findIndex((queuedJob) => queuedJob.id === jobId);
-    if (queueIndex >= 0) translationQueue.splice(queueIndex, 1);
-    activeTranslationJobs.delete(jobId);
+    for (const lane of allTranslationLanes()) {
+      for (let index = lane.queue.length - 1; index >= 0; index -= 1) {
+        if (lane.queue[index]?.jobId === jobId) lane.queue.splice(index, 1);
+      }
+
+      for (const [taskKey, task] of lane.activeTasks.entries()) {
+        if (task.jobId === jobId) lane.activeTasks.delete(taskKey);
+      }
+    }
+
+    translationJobs.delete(jobId);
   };
 
   const markTranslationJobStale = (job, reason) => {
@@ -665,47 +992,116 @@ export const createInterpreterSession = async ({
 
     job.stale = true;
     staleTranslationJobs.add(job.id);
-    job.pendingLanguages.length = 0;
+    job.pendingLanguages.clear();
     job.runningLanguages.clear();
     removeTranslationJob(job.id);
 
-    for (const [taskKey, task] of activeTranslationTasks.entries()) {
-      if (task.jobId === job.id) activeTranslationTasks.delete(taskKey);
-    }
-
-    console.warn("Translation job discarded", {
-      jobId: job.id,
-      reason,
-      queueDepth: translationQueue.length,
-      activeTranslations: activeTranslationTasks.size
-    });
+    void reason;
   };
 
-  const pruneTranslationQueue = () => {
-    while (translationQueue.length > MAX_QUEUE_SIZE) {
-      const newestIndex = translationQueue.length - 1;
-      let dropIndex = translationQueue.findIndex(
-        (job, index) => index < newestIndex && job.runningLanguages.size === 0 && !job.isFinalizedSentence
+  const discardQueuedTranslationTask = (lane, task, reason) => {
+    if (!task || task.stale) return;
+
+    task.stale = true;
+    const { job, language } = task;
+
+    if (job && !job.stale && !staleTranslationJobs.has(job.id)) {
+      job.pendingLanguages.delete(language);
+      job.runningLanguages.delete(language);
+      job.completedLanguages.add(language);
+    }
+
+    void reason;
+
+    finalizeTranslationJobIfReady(job);
+  };
+
+  const pruneTranslationLaneQueue = (lane) => {
+    while (lane.queue.length > lane.maxQueueSize) {
+      const newestIndex = lane.queue.length - 1;
+      let dropIndex = lane.queue.findIndex(
+        (task, index) => index < newestIndex && task.job?.runningLanguages?.size === 0 && !task.job?.isFinalizedSentence
       );
 
       if (dropIndex < 0) {
-        dropIndex = translationQueue.findIndex((job, index) => index < newestIndex && job.runningLanguages.size === 0);
+        dropIndex = lane.queue.findIndex((task, index) => index < newestIndex && task.job?.runningLanguages?.size === 0);
       }
 
       if (dropIndex < 0) dropIndex = 0;
 
-      const [droppedJob] = translationQueue.splice(dropIndex, 1);
-      markTranslationJobStale(droppedJob, "queue_overflow");
+      const [droppedTask] = lane.queue.splice(dropIndex, 1);
+      discardQueuedTranslationTask(lane, droppedTask, "lane_queue_overflow");
     }
   };
 
-  const translationOutputsForJob = (job) =>
-    job.direction.targets
+  const translationOutputsForTranslations = (direction, translations = {}) =>
+    direction.targets
       .map((language) => {
-        const text = job.translations[language];
+        const text = translations[language];
         return text ? { lang: language, text } : null;
       })
       .filter(Boolean);
+
+  const translationOutputsForJob = (job) =>
+    translationOutputsForTranslations(job.direction, job.translations);
+
+  const emitStreamingTranslationPreview = ({ sentence = "", direction, detectedLanguage }) => {
+    if (!shouldTranslate || !direction?.targets?.length) return;
+
+    const cleanSentence = cleanTranscriptText(sentence);
+    if (!cleanSentence || !hasMeaningfulTranslationText(cleanSentence)) return;
+
+    const now = Date.now();
+    if (now - lastStreamingPreviewAt < PARTIAL_TRANSLATION_PREVIEW_THROTTLE_MS) return;
+
+    const translationInput = prepareTextForTranslation(cleanSentence);
+    const translations = {};
+
+    for (const language of direction.targets.slice(0, MAX_TARGET_LANGUAGES)) {
+      const cacheKey = translationCacheKey({ source: direction.source, target: language, text: translationInput });
+      const cachedTranslation = readCachedTranslation(translationCache, cacheKey);
+      const laneGroup = translationLaneForLanguage({ sourceLang: direction.source, targetLang: language });
+      let translatedText = cachedTranslation;
+
+      if (!translatedText && laneGroup === TRANSLATION_LANE_FAST_LOCAL) {
+        translatedText = resolveFastLocalTranslation({ language, translationInput, direction });
+      }
+
+      if (!translatedText) {
+        translatedText = sourceLanguageFallbackText({ text: translationInput, sourceLang: direction.source });
+      }
+
+      if (translatedText) translations[language] = translatedText;
+    }
+
+    const translatedText = translations[direction.target] || Object.values(translations).find(Boolean) || "";
+    if (!translatedText) return;
+
+    const signature = `${normalizeTranscript(cleanSentence)}|${JSON.stringify(translations)}`;
+    if (signature === lastStreamingPreviewSignature) return;
+
+    lastStreamingPreviewAt = now;
+    lastStreamingPreviewSignature = signature;
+
+    onResult?.({
+      original: cleanSentence,
+      originalText: cleanSentence,
+      translatedText,
+      translations,
+      translationOutputs: translationOutputsForTranslations(direction, translations),
+      isFinal: true,
+      isTranslationPartial: true,
+      isStreamingPreview: true,
+      translationComplete: false,
+      sourceLang: direction.source,
+      targetLang: direction.target,
+      targetLanguages: direction.targets,
+      detectedLanguage,
+      latencyMs: 0,
+      provider: "stream",
+      mode: "production"
+    });
+  };
 
   const rememberTranscriptEntry = (job, translatedText) => {
     if (!translatedText) return;
@@ -736,7 +1132,7 @@ export const createInterpreterSession = async ({
     touchSessionHistory(sessionId);
   };
 
-  const emitTranslationUpdate = (job, language, translatedText) => {
+  const emitTranslationUpdate = (job, language, translatedText, provider) => {
     if (!translatedText || job.stale || staleTranslationJobs.has(job.id)) return;
 
     job.translations[language] = translatedText;
@@ -756,13 +1152,14 @@ export const createInterpreterSession = async ({
       targetLanguages: job.direction.targets,
       detectedLanguage: job.detectedLanguage,
       latencyMs: Date.now() - job.startedAt,
+      provider,
       mode: "production"
     });
   };
 
   const finalizeTranslationJobIfReady = (job) => {
     if (!job || job.completed || job.stale || staleTranslationJobs.has(job.id)) return;
-    if (job.pendingLanguages.length > 0 || job.runningLanguages.size > 0) return;
+    if (job.pendingLanguages.size > 0 || job.runningLanguages.size > 0) return;
 
     job.completed = true;
     removeTranslationJob(job.id);
@@ -770,6 +1167,7 @@ export const createInterpreterSession = async ({
     trimStaleTranslationJobs();
 
     const translatedText = job.translations[job.direction.target] || Object.values(job.translations).find(Boolean) || "";
+    const provider = job.lastProviderUsed || "unknown";
     lastTranslatedTranscript = job.normalizedSentence;
 
     if (translatedText) {
@@ -789,48 +1187,68 @@ export const createInterpreterSession = async ({
       targetLanguages: job.direction.targets,
       detectedLanguage: job.detectedLanguage,
       latencyMs: Date.now() - job.startedAt,
+      provider,
       mode: "production"
     });
   };
 
-  const scheduleTranslationDrain = () => {
-    if (drainScheduled) return;
-    drainScheduled = true;
+  const scheduleTranslationLaneDrain = (lane) => {
+    if (!lane || lane.drainScheduled) return;
+    lane.drainScheduled = true;
 
     setTimeout(() => {
-      drainScheduled = false;
-      drainTranslationQueue();
+      lane.drainScheduled = false;
+      drainTranslationLane(lane);
     }, 0).unref?.();
   };
 
-  const finishTranslationTask = (job, language, taskKey) => {
-    const activeTask = activeTranslationTasks.get(taskKey);
+  const scheduleTranslationDrain = (laneId) => {
+    if (laneId) {
+      scheduleTranslationLaneDrain(translationLanes[laneId]);
+      return;
+    }
+
+    for (const lane of allTranslationLanes()) {
+      scheduleTranslationLaneDrain(lane);
+    }
+  };
+
+  const finishTranslationTask = (lane, job, language, taskKey) => {
+    const activeTask = lane.activeTasks.get(taskKey);
     if (!activeTask) return false;
 
-    activeTranslationTasks.delete(taskKey);
+    updateLaneLatency(lane, Date.now() - activeTask.startedAt);
+    lane.activeTasks.delete(taskKey);
     job.runningLanguages.delete(language);
     job.completedLanguages.add(language);
     return true;
   };
 
-  const startTranslationTask = (job, language) => {
-    const taskKey = translationTaskKey(job.id, language);
-    if (activeTranslationTasks.has(taskKey) || job.runningLanguages.has(language) || job.completedLanguages.has(language)) return;
+  const startTranslationTask = (lane, task) => {
+    const { job, language } = task;
+    const taskKey = task.id;
+    if (!job || job.stale || staleTranslationJobs.has(job.id)) return;
+    if (lane.activeTasks.has(taskKey) || job.runningLanguages.has(language) || job.completedLanguages.has(language)) return;
+    if (!job.pendingLanguages.has(language)) return;
 
     job.startedAt = job.startedAt || Date.now();
+    job.pendingLanguages.delete(language);
     job.runningLanguages.add(language);
-    activeTranslationJobs.set(job.id, job);
-    activeTranslationTasks.set(taskKey, {
+    task.startedAt = Date.now();
+    lane.activeTasks.set(taskKey, {
+      ...task,
       jobId: job.id,
       language,
-      startedAt: Date.now()
+      startedAt: task.startedAt
     });
 
     void (async () => {
-      let translatedText = "";
+      let result = null;
+      const translateInLane =
+        lane.group === TRANSLATION_LANE_FAST_LOCAL ? translateFastLocalLanguage : translateProviderLanguageWithRecovery;
 
       try {
-        translatedText = await translateLanguageWithRecovery({
+        result = await translateInLane({
           language,
           translationInput: job.translationInput,
           direction: job.direction,
@@ -838,95 +1256,163 @@ export const createInterpreterSession = async ({
           jobId: job.id
         });
       } catch (error) {
-        noteTranslationFailure(language, error);
-        console.warn("Translation task failed unexpectedly", {
-          jobId: job.id,
-          targetLang: language,
-          error: error?.message || error
-        });
+        if (lane.group === TRANSLATION_LANE_PROVIDER) noteTranslationFailure(language, error);
       }
 
-      if (!finishTranslationTask(job, language, taskKey)) {
-        scheduleTranslationDrain();
+      const translatedText = result?.text || "";
+      const provider = result?.provider || (lane.group === TRANSLATION_LANE_FAST_LOCAL ? "local" : "unknown");
+      job.lastProviderUsed = provider;
+
+      if (!finishTranslationTask(lane, job, language, taskKey)) {
+        scheduleTranslationDrain(lane.id);
         return;
       }
 
       if (!job.stale && !staleTranslationJobs.has(job.id)) {
         const safeTranslatedText = String(translatedText || "").trim();
-        if (safeTranslatedText) emitTranslationUpdate(job, language, safeTranslatedText);
+
+        if (safeTranslatedText) {
+          emitTranslationUpdate(job, language, safeTranslatedText, provider);
+
+          const isFallback = provider === "source" ||
+                            safeTranslatedText === job.translationInput ||
+                            safeTranslatedText === lastSuccessfulTranslations.get(language);
+
+          if (isFallback && lane.group === TRANSLATION_LANE_PROVIDER) {
+            triggerBackgroundRetry({
+              job,
+              language,
+              translateInLane,
+              retryTimers: backgroundRetryTimers,
+              emitUpdate: (retryText, retryProvider) => emitTranslationUpdate(job, language, retryText, retryProvider)
+            });
+          }
+        } else if (lane.group === TRANSLATION_LANE_PROVIDER) {
+          triggerBackgroundRetry({
+            job,
+            language,
+            translateInLane,
+            retryTimers: backgroundRetryTimers,
+            emitUpdate: (retryText, retryProvider) => emitTranslationUpdate(job, language, retryText, retryProvider)
+          });
+        }
+
         finalizeTranslationJobIfReady(job);
       }
 
-      scheduleTranslationDrain();
+      scheduleTranslationDrain(lane.id);
     })();
   };
 
-  const nextTranslationTask = () => {
-    for (const job of translationQueue) {
-      if (job.stale || job.completed || staleTranslationJobs.has(job.id)) continue;
-      if (job.pendingLanguages.length === 0 && job.runningLanguages.size === 0) {
+  const nextTranslationTask = (lane) => {
+    while (lane.queue.length > 0) {
+      const task = lane.queue.shift();
+      const { job, language } = task;
+
+      if (task.stale || !job || job.stale || job.completed || staleTranslationJobs.has(job.id)) continue;
+      if (job.completedLanguages.has(language) || job.runningLanguages.has(language) || !job.pendingLanguages.has(language)) {
         finalizeTranslationJobIfReady(job);
         continue;
       }
 
-      const nextLanguage = job.pendingLanguages.shift();
-      if (!nextLanguage) continue;
-
-      return { job, language: nextLanguage };
+      return task;
     }
 
     return null;
   };
 
-  const cleanupStaleTranslationWork = () => {
+  const cleanupStaleTranslationWork = (laneToClean) => {
     const now = Date.now();
+    const lanes = laneToClean ? [laneToClean] : allTranslationLanes();
 
-    for (const [taskKey, task] of activeTranslationTasks.entries()) {
-      if (now - task.startedAt < STALE_JOB_TIMEOUT) continue;
+    for (const lane of lanes) {
+      for (const [taskKey, task] of lane.activeTasks.entries()) {
+        if (now - task.startedAt < STALE_JOB_TIMEOUT) continue;
 
-      const job = activeTranslationJobs.get(task.jobId);
-      activeTranslationTasks.delete(taskKey);
+        const job = task.job || translationJobs.get(task.jobId);
+        lane.activeTasks.delete(taskKey);
+        task.stale = true;
 
-      if (job) {
-        job.runningLanguages.delete(task.language);
-        job.completedLanguages.add(task.language);
-        noteTranslationFailure(task.language, new Error("Translation task became stale"));
-        finalizeTranslationJobIfReady(job);
+        if (job) {
+          job.runningLanguages.delete(task.language);
+          job.completedLanguages.add(task.language);
+          if (lane.group === TRANSLATION_LANE_PROVIDER) noteTranslationFailure(task.language, new Error("Translation task became stale"));
+          finalizeTranslationJobIfReady(job);
+        }
+
       }
 
-      console.warn("Translation worker auto-reset after stale task", {
-        jobId: task.jobId,
-        targetLang: task.language,
-        activeForMs: now - task.startedAt
-      });
-    }
+      for (let index = lane.queue.length - 1; index >= 0; index -= 1) {
+        const task = lane.queue[index];
+        if (!task?.createdAt || now - task.createdAt < STALE_JOB_TIMEOUT * 2) continue;
 
-    for (const job of [...translationQueue]) {
-      if (job.startedAt || now - job.createdAt < STALE_JOB_TIMEOUT * 2) continue;
-      markTranslationJobStale(job, "queued_too_long");
+        lane.queue.splice(index, 1);
+        discardQueuedTranslationTask(lane, task, "queued_too_long");
+      }
     }
   };
 
-  function drainTranslationQueue() {
-    cleanupStaleTranslationWork();
-    refreshProviderCooldowns();
-    pruneTranslationQueue();
+  function drainTranslationLane(lane) {
+    cleanupStaleTranslationWork(lane);
+    if (lane.group === TRANSLATION_LANE_PROVIDER) refreshProviderCooldowns();
+    pruneTranslationLaneQueue(lane);
 
-    while (activeTranslationTasks.size < MAX_ACTIVE_TRANSLATIONS) {
-      const nextTask = nextTranslationTask();
+    while (lane.activeTasks.size < lane.maxActive) {
+      const nextTask = nextTranslationTask(lane);
       if (!nextTask) break;
-      startTranslationTask(nextTask.job, nextTask.language);
+      startTranslationTask(lane, nextTask);
+    }
+  }
+
+  function drainTranslationQueue() {
+    for (const lane of allTranslationLanes()) {
+      drainTranslationLane(lane);
     }
   }
 
   const enqueueTranslationJob = (job) => {
-    translationQueue.push(job);
-    pruneTranslationQueue();
-    scheduleTranslationDrain();
+    translationJobs.set(job.id, job);
+    const lanesToDrain = new Set();
+
+    job.direction.targets.slice(0, MAX_TARGET_LANGUAGES).forEach((language) => {
+      const instantLocal = resolveLocalTranslation({
+        text: job.translationInput,
+        sourceLang: job.direction.source,
+        targetLang: language
+      });
+
+      if (instantLocal) {
+        emitTranslationUpdate(job, language, instantLocal, "local");
+      }
+
+      const lane = getTranslationLane({ sourceLang: job.direction.source, targetLang: language });
+
+      lane.queue.push({
+        id: translationTaskKey(job.id, language),
+        jobId: job.id,
+        job,
+        language,
+        laneId: lane.id,
+        createdAt: job.createdAt,
+        startedAt: 0,
+        stale: false
+      });
+      lanesToDrain.add(lane.id);
+    });
+
+    for (const laneId of lanesToDrain) {
+      const lane = translationLanes[laneId];
+      pruneTranslationLaneQueue(lane);
+      scheduleTranslationDrain(lane.id);
+    }
+
+    if (lanesToDrain.size === 0) {
+      finalizeTranslationJobIfReady(job);
+    }
   };
 
   const hasQueuedTranslationForSentence = (normalizedSentence) =>
-    translationQueue.some((job) => !job.stale && !job.completed && job.normalizedSentence === normalizedSentence);
+    [...translationJobs.values()].some((job) => !job.stale && !job.completed && job.normalizedSentence === normalizedSentence);
 
   const emitStableSentence = async () => {
     clearTranslationTimer();
@@ -995,7 +1481,7 @@ export const createInterpreterSession = async ({
       detectedLanguage: effectiveDetectedLanguage,
       translationContext,
       translations: {},
-      pendingLanguages: direction.targets.slice(0, MAX_TARGET_LANGUAGES),
+      pendingLanguages: new Set(direction.targets.slice(0, MAX_TARGET_LANGUAGES)),
       runningLanguages: new Set(),
       completedLanguages: new Set(),
       createdAt: startedAt,
@@ -1034,9 +1520,8 @@ export const createInterpreterSession = async ({
     const delay = Number.isFinite(delayOverride) ? delayOverride : adaptiveDebounceDelay(currentSentence);
     translationTimer = setTimeout(() => {
       void emitStableSentence().catch((error) => {
-        console.error("Translation processing failed:", error?.message || error);
+        void error;
         resetTranslationState();
-        onWarning?.("Translation temporarily failed; continuing session.");
       });
     }, delay);
     translationTimer.unref?.();
@@ -1048,6 +1533,16 @@ export const createInterpreterSession = async ({
     trimStaleTranslationJobs();
     cleanupStaleTranslationWork();
     drainTranslationQueue();
+    pruneTranslationCache(translationCache);
+
+    const now = Date.now();
+    if (now - lastAdminStatsAt >= ADMIN_STATS_EMIT_MS) {
+      lastAdminStatsAt = now;
+      onResult?.({
+        type: "admin_stats",
+        stats: { ...globalUsageStats, budget: MONTHLY_BUDGET }
+      });
+    }
 
     if (currentSentence.length > MAX_PENDING_SENTENCE_CHARS) {
       currentSentence = trimTextWindow(currentSentence);
@@ -1104,6 +1599,11 @@ export const createInterpreterSession = async ({
           targetLanguages: direction.targets,
           detectedLanguage: effectiveDetectedLanguage
         });
+        emitStreamingTranslationPreview({
+          sentence: previewText,
+          direction,
+          detectedLanguage: effectiveDetectedLanguage
+        });
         return;
       }
 
@@ -1119,7 +1619,7 @@ export const createInterpreterSession = async ({
         confidence: localDetection.confidence
       });
       currentSentence = trimTextWindow(appendSentenceChunk(currentSentence, displayText));
-      scheduleStableTranslation();
+      scheduleStableTranslation(0);
     }
   });
 
@@ -1131,16 +1631,22 @@ export const createInterpreterSession = async ({
   session.stop = () => {
     clearTranslationTimer();
     clearInterval(sessionHealthMonitor);
-    for (const job of [...translationQueue]) {
+    for (const job of [...translationJobs.values()]) {
       markTranslationJobStale(job, "session_stop");
     }
-    for (const task of activeTranslationTasks.values()) {
-      staleTranslationJobs.add(task.jobId);
+    for (const lane of allTranslationLanes()) {
+      for (const task of lane.activeTasks.values()) {
+        staleTranslationJobs.add(task.jobId);
+      }
+      lane.queue.length = 0;
+      lane.activeTasks.clear();
+      lane.drainScheduled = false;
     }
-    translationQueue.length = 0;
-    activeTranslationTasks.clear();
-    activeTranslationJobs.clear();
-    drainScheduled = false;
+    for (const retryTimer of backgroundRetryTimers) {
+      clearTimeout(retryTimer);
+    }
+    backgroundRetryTimers.clear();
+    translationJobs.clear();
     trimStaleTranslationJobs();
     touchSessionHistory(sessionId);
     stopDeepgramSession?.();

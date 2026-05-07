@@ -35,8 +35,6 @@ const normalizeTargetLanguages = (targetLanguages, fallbackTargetLang = "es") =>
 
 export const registerInterpreterSocket = (io, env, getPublicConfig) => {
   io.on("connection", (socket) => {
-    console.log("Socket connected:", socket.id);
-
     let session = null;
     let sessionTimer = null;
     let lastSequence = -1;
@@ -76,6 +74,11 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     socket.emit("server-config", getPublicConfig());
 
     const emitInterpreterResult = (result) => {
+      if (result?.type === "admin_stats") {
+        socket.emit("result", result);
+        return;
+      }
+
       if (!result?.isFinal) {
         socket.emit("transcript_partial", {
           text: result.originalText,
@@ -101,6 +104,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
             targetLang: result.targetLang,
             targetLanguages: result.targetLanguages || [result.targetLang],
             latencyMs: result.latencyMs,
+            provider: result.provider,
+            streaming: Boolean(result.isStreamingPreview),
             partial: Boolean(result.isTranslationPartial),
             complete: Boolean(result.isTranslationComplete)
           });
@@ -135,7 +140,9 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           sourceLang: result.sourceLang,
           targetLang: result.targetLang,
           targetLanguages: result.targetLanguages || [result.targetLang],
-          latencyMs: result.latencyMs
+          latencyMs: result.latencyMs,
+          provider: result.provider,
+          complete: Boolean(result.isTranslationComplete)
         });
       }
 
@@ -151,7 +158,6 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       const shouldTranslate = payload.translate !== false;
       const twoWay = Boolean(payload.twoWay);
       lastSequence = -1;
-      console.log("Interpreter session starts", { socketId: socket.id, sourceLang, targetLang, targetLanguages, shouldTranslate, twoWay });
 
       try {
         if (!env.deepgramApiKey) {
@@ -161,6 +167,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         session = await createInterpreterSession({
           env,
           sourceLang,
+          userPlan: payload.userPlan || "free",
+          preferredProvider: payload.preferredProvider || "auto",
           targetLang,
           targetLanguages,
           shouldTranslate,
@@ -171,6 +179,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           },
           onWarning: (message) => socket.emit("warning", { message }),
           onError: (message) => socket.emit("session_error", { message }),
+          onProviderHealth: (health) => socket.emit("provider_health", health),
           onClosed: () => socket.emit("session:closed"),
           onResult: emitInterpreterResult
         });

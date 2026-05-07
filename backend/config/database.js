@@ -32,7 +32,6 @@ export const connectDatabase = async (env) => {
     throw new Error(`MongoDB connection failed: ${message}`);
   }
 
-  console.log("MongoDB connected");
   return mongoose.connection;
 };
 

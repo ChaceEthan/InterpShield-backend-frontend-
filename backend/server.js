@@ -129,10 +129,7 @@ const startServer = async () => {
       retryDatabaseConnection.unref?.();
     }
 
-    server.listen(env.port, () => {
-      console.log(`Server running on port ${env.port}`);
-      console.log(`Local backend URL: http://localhost:${env.port}`);
-    });
+    server.listen(env.port);
   } catch (error) {
     console.error("Failed to start InterpShield backend:", error?.message || error);
     process.exit(1);
