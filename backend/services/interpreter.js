@@ -1,5 +1,7 @@
+// @ts-nocheck
 import { createDeepgramSession } from "./deepgram.js";
 import { translateWithGemini } from "./gemini.js";
+import { translateWithOpenAI } from "./openai.js";
 import { detectRegionAccent, normalizeMixedSpeech, resolveLocalTranslation } from "../utils/translationEnhancer.js";
 
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
@@ -15,6 +17,9 @@ const MAX_STYLE_MEMORY_ENTRIES = 20;
 const MAX_TRANSLATION_CACHE_ENTRIES = 180;
 const TRANSLATION_ATTEMPT_TIMEOUT_MS = 8500;
 const TRANSLATION_JOB_TIMEOUT_MS = 16000;
+const PROVIDER_FAILURE_THRESHOLD = 2;
+const PROVIDER_COOLDOWN_MS = 30000;
+const SAFE_FALLBACK_TRANSLATION = "Translation temporarily unavailable.";
 const sessionHistoryStore = new Map();
 
 const createSessionId = () => {
@@ -273,6 +278,10 @@ export const createInterpreterSession = async ({
   let activeTranslationJobId = 0;
   let translationJobSequence = 0;
   const sessionId = createSessionId();
+  const providerHealth = {
+    gemini: { failures: 0, cooldownUntil: 0 },
+    openai: { failures: 0, cooldownUntil: 0 }
+  };
 
   const clearTranslationTimer = () => {
     if (translationTimer) {
@@ -289,6 +298,34 @@ export const createInterpreterSession = async ({
     consecutiveTranslationFailures = 0;
     translationInFlight = false;
     activeTranslationStartedAt = 0;
+  };
+
+  const providerAvailable = (provider) => {
+    const health = providerHealth[provider];
+    return Boolean(health) && Date.now() >= health.cooldownUntil;
+  };
+
+  const noteProviderSuccess = (provider) => {
+    const health = providerHealth[provider];
+    if (!health) return;
+    health.failures = 0;
+    health.cooldownUntil = 0;
+  };
+
+  const noteProviderFailure = (provider, error) => {
+    const health = providerHealth[provider];
+    if (!health) return;
+
+    health.failures += 1;
+    if (health.failures < PROVIDER_FAILURE_THRESHOLD) return;
+
+    health.cooldownUntil = Date.now() + PROVIDER_COOLDOWN_MS;
+    console.warn("Translation provider cooldown started", {
+      provider,
+      failures: health.failures,
+      cooldownMs: PROVIDER_COOLDOWN_MS,
+      error: error?.message || error || "Provider failed"
+    });
   };
 
   const noteTranslationSuccess = (language, translatedText, translationContext) => {
@@ -338,45 +375,96 @@ export const createInterpreterSession = async ({
       return cachedTranslation;
     }
 
-    const localTranslation = resolveLocalTranslation({ text: translationInput, targetLang: language });
-    if (localTranslation) {
-      console.log("Local translation fast path", { targetLang: language });
-      noteTranslationSuccess(language, localTranslation, languageTranslationContext);
-      rememberCachedTranslation(translationCache, cacheKey, localTranslation);
-      return localTranslation;
+    if (env.geminiApiKey && providerAvailable("gemini")) {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (staleTranslationJobs.has(jobId)) {
+          lastError = new Error("Translation job became stale");
+          break;
+        }
+
+        if (attempt > 0) {
+          console.log("Retrying Gemini translation", { targetLang: language, attempt: attempt + 1 });
+          await delay(TRANSLATION_RATE_LIMIT_DELAY_MS);
+        }
+
+        const attemptStartedAt = Date.now();
+
+        try {
+          const translatedText = await withTimeout(
+            translateWithGemini({
+              apiKey: env.geminiApiKey,
+              text: translationInput,
+              sourceLang: direction.source,
+              targetLang: language,
+              translationContext: languageTranslationContext
+            }),
+            TRANSLATION_ATTEMPT_TIMEOUT_MS,
+            `Gemini translation timed out for ${language}`
+          );
+          const responseTimeMs = Date.now() - attemptStartedAt;
+          const safeTranslatedText = String(translatedText || "").trim();
+
+          console.log("Gemini translation response", {
+            provider: "gemini",
+            targetLang: language,
+            attempt: attempt + 1,
+            responseTimeMs,
+            empty: !safeTranslatedText,
+            region: languageTranslationContext.accentProfile?.region,
+            tone: languageTranslationContext.emotionProfile?.tone,
+            confidence: languageTranslationContext.confidence
+          });
+
+          if (safeTranslatedText) {
+            noteProviderSuccess("gemini");
+            noteTranslationSuccess(language, safeTranslatedText, languageTranslationContext);
+            rememberCachedTranslation(translationCache, cacheKey, safeTranslatedText);
+            return safeTranslatedText;
+          }
+
+          lastError = new Error("Empty Gemini translation response");
+          noteProviderFailure("gemini", lastError);
+        } catch (error) {
+          lastError = error;
+          noteProviderFailure("gemini", error);
+          console.warn("Gemini translation attempt failed", {
+            provider: "gemini",
+            targetLang: language,
+            attempt: attempt + 1,
+            responseTimeMs: Date.now() - attemptStartedAt,
+            error: error?.message || error
+          });
+        }
+      }
+    } else {
+      console.warn("Skipping Gemini translation provider", {
+        targetLang: language,
+        reason: env.geminiApiKey ? "cooldown" : "missing_api_key"
+      });
     }
 
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      if (staleTranslationJobs.has(jobId)) {
-        lastError = new Error("Translation job became stale");
-        break;
-      }
-
-      if (attempt > 0) {
-        console.log("Retrying Gemini translation", { targetLang: language, attempt: attempt + 1 });
-        await delay(TRANSLATION_RATE_LIMIT_DELAY_MS);
-      }
-
+    if (env.openaiApiKey && providerAvailable("openai") && !staleTranslationJobs.has(jobId)) {
+      await delay(TRANSLATION_RATE_LIMIT_DELAY_MS);
       const attemptStartedAt = Date.now();
 
       try {
         const translatedText = await withTimeout(
-          translateWithGemini({
-            apiKey: env.geminiApiKey,
+          translateWithOpenAI({
+            apiKey: env.openaiApiKey,
             text: translationInput,
             sourceLang: direction.source,
             targetLang: language,
             translationContext: languageTranslationContext
           }),
           TRANSLATION_ATTEMPT_TIMEOUT_MS,
-          `Gemini translation timed out for ${language}`
+          `OpenAI translation timed out for ${language}`
         );
         const responseTimeMs = Date.now() - attemptStartedAt;
         const safeTranslatedText = String(translatedText || "").trim();
 
-        console.log("Gemini translation response", {
+        console.log("OpenAI fallback translation response", {
+          provider: "openai",
           targetLang: language,
-          attempt: attempt + 1,
           responseTimeMs,
           empty: !safeTranslatedText,
           region: languageTranslationContext.accentProfile?.region,
@@ -385,21 +473,37 @@ export const createInterpreterSession = async ({
         });
 
         if (safeTranslatedText) {
+          noteProviderSuccess("openai");
           noteTranslationSuccess(language, safeTranslatedText, languageTranslationContext);
           rememberCachedTranslation(translationCache, cacheKey, safeTranslatedText);
           return safeTranslatedText;
         }
 
-        lastError = new Error("Empty translation response");
+        lastError = new Error("Empty OpenAI translation response");
+        noteProviderFailure("openai", lastError);
       } catch (error) {
         lastError = error;
-        console.warn("Gemini translation attempt failed", {
+        noteProviderFailure("openai", error);
+        console.warn("OpenAI fallback translation failed", {
+          provider: "openai",
           targetLang: language,
-          attempt: attempt + 1,
           responseTimeMs: Date.now() - attemptStartedAt,
           error: error?.message || error
         });
       }
+    } else if (env.openaiApiKey) {
+      console.warn("Skipping OpenAI fallback provider", {
+        targetLang: language,
+        reason: providerAvailable("openai") ? "stale_job" : "cooldown"
+      });
+    }
+
+    const localTranslation = resolveLocalTranslation({ text: translationInput, targetLang: language });
+    if (localTranslation) {
+      console.warn("Using local translation enhancer fallback", { targetLang: language });
+      noteTranslationSuccess(language, localTranslation, languageTranslationContext);
+      rememberCachedTranslation(translationCache, cacheKey, localTranslation);
+      return localTranslation;
     }
 
     noteTranslationFailure(language, lastError);
@@ -412,9 +516,14 @@ export const createInterpreterSession = async ({
         tone: fallbackStyle?.tone,
         region: fallbackStyle?.region
       });
+      return fallbackTranslation;
     }
 
-    return fallbackTranslation;
+    console.warn("Using safe translation fallback", {
+      targetLang: language,
+      error: lastError?.message || lastError || "No provider returned a valid translation"
+    });
+    return SAFE_FALLBACK_TRANSLATION;
   };
 
   const emitStableSentence = async () => {

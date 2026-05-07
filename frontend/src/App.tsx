@@ -33,6 +33,7 @@ type Mode = "transcribe" | "translate" | "dubbing";
 type SessionStatus = "idle" | "connecting" | "listening" | "stopping" | "error";
 type Plan = "free" | "pro";
 type SummaryLength = "short" | "standard" | "long";
+type AuthProvider = "manual" | "google";
 
 interface Language {
   code: string;
@@ -81,10 +82,12 @@ interface AppConfig {
   services: {
     deepgram: boolean;
     gemini: boolean;
+    openai?: boolean;
   };
   backend: boolean;
   hasDeepgramKey: boolean;
   hasGeminiKey: boolean;
+  hasOpenAIKey?: boolean;
   hasGoogleClientId: boolean;
   mode: "production" | "unavailable";
   maxSessionSeconds: number;
@@ -750,10 +753,12 @@ const TargetLanguageTriangle = ({
 );
 
 const GoogleSignIn = ({
+  disabled = false,
   loading,
   onCredential,
   onError
 }: {
+  disabled?: boolean;
   loading: boolean;
   onCredential: (credential: string) => void;
   onError: (message: string) => void;
@@ -802,7 +807,7 @@ const GoogleSignIn = ({
 
   if (!GOOGLE_CLIENT_ID) {
     return (
-      <button type="button" onClick={() => onError("Google Sign-In is not configured for this deployment.")} className="flex w-full items-center justify-center gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm font-black text-slate-800 shadow-lg shadow-slate-950/20 transition hover:-translate-y-0.5 hover:bg-slate-50">
+      <button type="button" disabled={disabled || loading} onClick={() => onError("Google Sign-In is not configured for this deployment.")} className="flex w-full items-center justify-center gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm font-black text-slate-800 shadow-lg shadow-slate-950/20 transition hover:-translate-y-0.5 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60">
         <GoogleIcon />
         Continue with Google
       </button>
@@ -810,7 +815,7 @@ const GoogleSignIn = ({
   }
 
   return (
-    <div className="relative flex min-h-11 w-full items-center justify-center overflow-hidden rounded-lg bg-white shadow-lg shadow-slate-950/20 transition hover:-translate-y-0.5">
+    <div className={`relative flex min-h-11 w-full items-center justify-center overflow-hidden rounded-lg bg-white shadow-lg shadow-slate-950/20 transition hover:-translate-y-0.5 ${disabled ? "pointer-events-none opacity-60" : ""}`}>
       {(!loaded || loading) && (
         <button type="button" disabled className="flex w-full items-center justify-center gap-3 px-4 py-3 text-sm font-black text-slate-800 disabled:cursor-wait">
           <GoogleIcon />
@@ -824,7 +829,7 @@ const GoogleSignIn = ({
 
 const AuthPage = ({
   mode,
-  loading,
+  authProvider,
   error,
   onSubmit,
   onGoogle,
@@ -832,7 +837,7 @@ const AuthPage = ({
   onNavigate
 }: {
   mode: "login" | "signup";
-  loading: boolean;
+  authProvider: AuthProvider | null;
   error: string | null;
   onSubmit: (payload: { name?: string; email: string; password: string }) => void;
   onGoogle: (credential: string) => void;
@@ -843,6 +848,9 @@ const AuthPage = ({
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const isSignup = mode === "signup";
+  const authBusy = Boolean(authProvider);
+  const manualLoading = authProvider === "manual";
+  const googleLoading = authProvider === "google";
 
   return (
     <main className="mx-auto grid min-h-[calc(100vh-76px)] w-full max-w-6xl grid-cols-1 gap-8 px-5 py-10 lg:grid-cols-[1fr_420px] lg:items-center">
@@ -867,31 +875,32 @@ const AuthPage = ({
           className="space-y-4"
           onSubmit={(event) => {
             event.preventDefault();
+            if (authBusy) return;
             onSubmit({ name, email, password });
           }}
         >
           {isSignup && (
             <label className="block">
               <span className="text-xs font-bold uppercase tracking-widest text-slate-500">Name</span>
-              <input value={name} onChange={(event) => setName(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-blue-500/50" placeholder="Isaac David" />
+              <input value={name} onChange={(event) => setName(event.target.value)} disabled={authBusy} className="mt-2 w-full rounded-lg border border-white/10 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-blue-500/50 disabled:cursor-wait disabled:opacity-70" placeholder="Isaac David" />
             </label>
           )}
 
           <label className="block">
             <span className="text-xs font-bold uppercase tracking-widest text-slate-500">Email</span>
-            <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-blue-500/50" placeholder="you@example.com" required />
+            <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} disabled={authBusy} className="mt-2 w-full rounded-lg border border-white/10 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-blue-500/50 disabled:cursor-wait disabled:opacity-70" placeholder="you@example.com" required />
           </label>
 
           <label className="block">
             <span className="text-xs font-bold uppercase tracking-widest text-slate-500">Password</span>
-            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-blue-500/50" placeholder="Minimum 6 characters" required />
+            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} disabled={authBusy} className="mt-2 w-full rounded-lg border border-white/10 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-blue-500/50 disabled:cursor-wait disabled:opacity-70" placeholder="Minimum 6 characters" required />
           </label>
 
           {error && <div className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-100">{error}</div>}
 
-          <button disabled={loading} className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-500 px-4 py-3 text-sm font-black text-slate-950 transition hover:bg-white disabled:cursor-wait disabled:opacity-70">
+          <button disabled={authBusy} className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-500 px-4 py-3 text-sm font-black text-slate-950 transition hover:bg-white disabled:cursor-wait disabled:opacity-70">
             <KeyRound className="h-4 w-4" />
-            {loading ? "Please wait..." : isSignup ? "Sign up" : "Login"}
+            {manualLoading ? "Please wait..." : isSignup ? "Sign up" : "Login"}
           </button>
         </form>
 
@@ -901,9 +910,9 @@ const AuthPage = ({
           <span className="h-px flex-1 bg-white/10" />
         </div>
 
-        <GoogleSignIn loading={loading} onCredential={onGoogle} onError={onGoogleError} />
+        <GoogleSignIn disabled={authBusy && !googleLoading} loading={googleLoading} onCredential={onGoogle} onError={onGoogleError} />
 
-        <button onClick={() => onNavigate(isSignup ? "login" : "signup")} className="mt-4 w-full rounded-lg border border-white/10 px-4 py-3 text-sm font-bold text-slate-300 hover:bg-white/5">
+        <button type="button" disabled={authBusy} onClick={() => onNavigate(isSignup ? "login" : "signup")} className="mt-4 w-full rounded-lg border border-white/10 px-4 py-3 text-sm font-bold text-slate-300 hover:bg-white/5 disabled:cursor-wait disabled:opacity-60">
           {isSignup ? "Already have an account? Login" : "New here? Create an account"}
         </button>
       </GlassPanel>
@@ -919,7 +928,7 @@ export default function App() {
   });
   const [token, setToken] = useState<string | null>(() => readStoredToken());
   const [config, setConfig] = useState<AppConfig | null>(null);
-  const [authLoading, setAuthLoading] = useState(false);
+  const [authProvider, setAuthProvider] = useState<AuthProvider | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const [alert, setAlert] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1000,6 +1009,7 @@ export default function App() {
   const dubbingSpeakingRef = useRef(false);
   const spokenDubbingKeysRef = useRef<Set<string>>(new Set());
   const sessionActionInFlightRef = useRef(false);
+  const authRequestRef = useRef<AuthProvider | null>(null);
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro";
@@ -1407,7 +1417,7 @@ export default function App() {
       return;
     }
 
-    const entries = orderedTranslationEntries(finalTranslations, targetLanguages);
+    const entries = orderedTranslationEntries(finalTranslations, targetLanguages).filter(([, translatedText]) => !/unavailable/i.test(translatedText));
     if (entries.length === 0) return;
 
     for (const [language, translatedText] of entries) {
@@ -1430,7 +1440,10 @@ export default function App() {
   };
 
   const handleAuthSubmit = async (payload: { name?: string; email: string; password: string }) => {
-    setAuthLoading(true);
+    if (authRequestRef.current) return;
+
+    authRequestRef.current = "manual";
+    setAuthProvider("manual");
     setAuthError(null);
 
     try {
@@ -1448,12 +1461,16 @@ export default function App() {
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Authentication failed.");
     } finally {
-      setAuthLoading(false);
+      authRequestRef.current = null;
+      setAuthProvider(null);
     }
   };
 
   const handleGoogleLogin = useCallback(async (credential: string) => {
-    setAuthLoading(true);
+    if (authRequestRef.current) return;
+
+    authRequestRef.current = "google";
+    setAuthProvider("google");
     setAuthError(null);
 
     try {
@@ -1465,7 +1482,8 @@ export default function App() {
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Google sign-in failed.");
     } finally {
-      setAuthLoading(false);
+      authRequestRef.current = null;
+      setAuthProvider(null);
     }
   }, []);
 
@@ -2190,8 +2208,8 @@ export default function App() {
       <div className="fixed inset-0 -z-10 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.14),transparent_30%),radial-gradient(circle_at_82%_14%,rgba(16,185,129,0.1),transparent_26%),linear-gradient(180deg,#020617,#0f172a_62%,#020617)]" />
       {renderTopNav()}
       {view === "landing" && renderLanding()}
-      {view === "login" && <AuthPage mode="login" loading={authLoading} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleError={setAuthError} onNavigate={navigate} />}
-      {view === "signup" && <AuthPage mode="signup" loading={authLoading} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleError={setAuthError} onNavigate={navigate} />}
+      {view === "login" && <AuthPage mode="login" authProvider={authProvider} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleError={setAuthError} onNavigate={navigate} />}
+      {view === "signup" && <AuthPage mode="signup" authProvider={authProvider} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleError={setAuthError} onNavigate={navigate} />}
       {view === "dashboard" && isAuthed && renderDashboard()}
       {view === "pricing" && renderPricing()}
       {view === "history" && isAuthed && renderHistory()}

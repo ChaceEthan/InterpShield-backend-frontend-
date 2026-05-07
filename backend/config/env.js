@@ -15,9 +15,11 @@ const placeholderValues = new Set([
   "undefined",
   "your_deepgram_api_key",
   "your_gemini_api_key",
+  "your_openai_key",
   "your_mongo_uri",
   "YOUR_DEEPGRAM_API_KEY_HERE",
-  "YOUR_GEMINI_API_KEY_HERE"
+  "YOUR_GEMINI_API_KEY_HERE",
+  "YOUR_OPENAI_API_KEY_HERE"
 ]);
 
 const readSecret = (value) => {
@@ -61,6 +63,7 @@ export const env = {
   mongoUri: readSecret(process.env.MONGO_URI),
   deepgramApiKey: readSecret(process.env.DEEPGRAM_API_KEY),
   geminiApiKey: readSecret(process.env.GEMINI_API_KEY),
+  openaiApiKey: readSecret(process.env.OPENAI_API_KEY),
   hasJwtSecret: Boolean(readSecret(process.env.JWT_SECRET)),
   jwtSecret: readSecret(process.env.JWT_SECRET),
   maxSessionSeconds: 3600,
@@ -73,11 +76,13 @@ export const getPublicConfig = () => ({
   status: "ok",
   services: {
     deepgram: true,
-    gemini: true
+    gemini: true,
+    openai: Boolean(env.openaiApiKey)
   },
   backend: true,
   hasDeepgramKey: Boolean(env.deepgramApiKey),
   hasGeminiKey: Boolean(env.geminiApiKey),
+  hasOpenAIKey: Boolean(env.openaiApiKey),
   mode: getMode(),
   maxSessionSeconds: env.maxSessionSeconds,
   audioChunkMs: env.audioChunkMs
@@ -94,6 +99,10 @@ export const warnAboutMissingConfig = () => {
 
   if (!env.geminiApiKey) {
     console.warn("GEMINI_API_KEY is missing. Translation is unavailable until it is configured.");
+  }
+
+  if (!env.openaiApiKey) {
+    console.warn("OPENAI_API_KEY is missing. OpenAI fallback translation is disabled.");
   }
 
   if (!env.hasJwtSecret) {
