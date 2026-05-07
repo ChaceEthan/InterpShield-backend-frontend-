@@ -128,6 +128,18 @@ interface TranscriptHistoryEntry {
   targetLanguages?: string[];
 }
 
+interface DubbingQueueItem {
+  translationId: string;
+  language: string;
+  text: string;
+  createdAt: number;
+}
+
+interface PartialTranscriptPayload {
+  text: string;
+  detectedLanguage?: string;
+}
+
 interface GoogleCredentialResponse {
   credential?: string;
   select_by?: string;
@@ -165,6 +177,13 @@ const MAX_TRANSCRIPT_HISTORY_ENTRIES = 500;
 const MAX_TARGET_LANGUAGES = 3;
 const LIVE_TEXT_WINDOW_CHARS = 900;
 const LIVE_SEGMENT_WINDOW = 6;
+const MAX_LIVE_SEGMENTS = 24;
+const VISIBLE_HISTORY_ITEMS = 80;
+const PARTIAL_SUBTITLE_THROTTLE_MS = 90;
+const HISTORY_PERSIST_DEBOUNCE_MS = 250;
+const MAX_DUBBING_QUEUE_ITEMS = 6;
+const MAX_SPOKEN_DUBBING_KEYS = 180;
+const DUBBING_UTTERANCE_TTL_MS = 45000;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
 const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
@@ -380,6 +399,11 @@ const appendTextWindow = (current: string, next: string, maxChars = LIVE_TEXT_WI
 };
 
 const languageFlag = (code: string) => LANGUAGE_FLAGS[code] || "🌐";
+const compactSetToLimit = (set: Set<string>, maxItems: number) => {
+  if (set.size <= maxItems) return set;
+  return new Set(Array.from(set).slice(-maxItems));
+};
+
 const speechLanguage = (code: string) => SPEECH_SYNTHESIS_LANGS[code] || code;
 
 const readStoredToken = () => sessionStorage.getItem("interp_shield_token") || localStorage.getItem("interp_shield_token");
@@ -1000,14 +1024,22 @@ export default function App() {
   const lastInterimRef = useRef("");
   const lastFinalOriginalRef = useRef("");
   const lastFinalTranslationRef = useRef("");
+  const lastCompletedTranslationRef = useRef("");
   const pendingFinalTranscriptRef = useRef<Pick<TranscriptHistoryEntry, "original" | "timestamp" | "sourceLang" | "targetLang" | "targetLanguages"> | null>(null);
   const activeTranslationIdRef = useRef("");
   const audioChunkMsRef = useRef(700);
   const interimTimerRef = useRef<number | null>(null);
+  const subtitleThrottleTimerRef = useRef<number | null>(null);
+  const lastSubtitleUpdateAtRef = useRef(0);
+  const pendingPartialTranscriptRef = useRef<PartialTranscriptPayload | null>(null);
+  const historyPersistTimerRef = useRef<number | null>(null);
   const historyEndRef = useRef<HTMLDivElement | null>(null);
-  const dubbingQueueRef = useRef<Array<{ language: string; text: string }>>([]);
+  const dubbingQueueRef = useRef<DubbingQueueItem[]>([]);
   const dubbingSpeakingRef = useRef(false);
+  const activeDubbingUtteranceIdRef = useRef("");
+  const activeDubbingLanguageRef = useRef("");
   const spokenDubbingKeysRef = useRef<Set<string>>(new Set());
+  const historySignatureRef = useRef("");
   const sessionActionInFlightRef = useRef(false);
   const authRequestRef = useRef<AuthProvider | null>(null);
 
@@ -1023,17 +1055,33 @@ export default function App() {
   const playNextDubbingUtterance = useCallback(() => {
     if (!("speechSynthesis" in window) || dubbingSpeakingRef.current) return;
 
+    const now = Date.now();
+    dubbingQueueRef.current = dubbingQueueRef.current
+      .filter((item) => now - item.createdAt <= DUBBING_UTTERANCE_TTL_MS)
+      .slice(-MAX_DUBBING_QUEUE_ITEMS);
+
+    if (!dubbingSpeakingRef.current && (window.speechSynthesis.speaking || window.speechSynthesis.pending)) {
+      window.speechSynthesis.cancel();
+    }
+
     const nextUtterance = dubbingQueueRef.current.shift();
     if (!nextUtterance) return;
 
     const utterance = new SpeechSynthesisUtterance(nextUtterance.text);
     utterance.lang = speechLanguage(nextUtterance.language);
+    const utteranceId = `${nextUtterance.translationId}:${nextUtterance.language}:${nextUtterance.createdAt}`;
+    activeDubbingUtteranceIdRef.current = utteranceId;
+    activeDubbingLanguageRef.current = nextUtterance.language;
     dubbingSpeakingRef.current = true;
 
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
+      if (activeDubbingUtteranceIdRef.current === utteranceId) {
+        activeDubbingUtteranceIdRef.current = "";
+        activeDubbingLanguageRef.current = "";
+      }
       dubbingSpeakingRef.current = false;
       window.setTimeout(() => playNextDubbingUtterance(), 0);
     };
@@ -1179,11 +1227,32 @@ export default function App() {
   }, [config?.audioChunkMs]);
 
   useEffect(() => {
-    localStorage.setItem(TRANSCRIPT_HISTORY_STORAGE_KEY, JSON.stringify(history));
+    if (historyPersistTimerRef.current) window.clearTimeout(historyPersistTimerRef.current);
+
+    historyPersistTimerRef.current = window.setTimeout(() => {
+      try {
+        localStorage.setItem(TRANSCRIPT_HISTORY_STORAGE_KEY, JSON.stringify(history.slice(-MAX_TRANSCRIPT_HISTORY_ENTRIES)));
+      } catch {
+        setAlert("Local transcript storage is full. Export or clear older history soon.");
+      } finally {
+        historyPersistTimerRef.current = null;
+      }
+    }, HISTORY_PERSIST_DEBOUNCE_MS);
+
+    return () => {
+      if (historyPersistTimerRef.current) {
+        window.clearTimeout(historyPersistTimerRef.current);
+        historyPersistTimerRef.current = null;
+      }
+    };
   }, [history]);
 
   useEffect(() => {
-    historyEndRef.current?.scrollIntoView({ block: "end" });
+    const frame = window.requestAnimationFrame(() => {
+      historyEndRef.current?.scrollIntoView({ block: "end" });
+    });
+
+    return () => window.cancelAnimationFrame(frame);
   }, [history.length]);
 
   const appendTranscriptHistory = useCallback((entry: Omit<TranscriptHistoryEntry, "id">) => {
@@ -1193,6 +1262,11 @@ export default function App() {
     if (!original || !translated || /unavailable/i.test(translated)) return;
 
     setHistory((current) => {
+      const historySignature = `${entry.timestamp}|${original}|${translated}`;
+      if (historySignature === historySignatureRef.current) return current;
+      if (current.some((historyEntry) => `${historyEntry.timestamp}|${historyEntry.original}|${historyEntry.translated}` === historySignature)) return current;
+
+      historySignatureRef.current = historySignature;
       const nextEntry: TranscriptHistoryEntry = {
         ...entry,
         id: `${entry.timestamp}-${current.length}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1203,6 +1277,47 @@ export default function App() {
       return [...current, nextEntry].slice(-MAX_TRANSCRIPT_HISTORY_ENTRIES);
     });
   }, []);
+
+  const flushPendingPartialTranscript = useCallback(() => {
+    const pending = pendingPartialTranscriptRef.current;
+    if (!pending) return;
+
+    pendingPartialTranscriptRef.current = null;
+    lastSubtitleUpdateAtRef.current = Date.now();
+    if (pending.detectedLanguage) setDetectedLanguage(pending.detectedLanguage);
+    setLiveText(pending.text);
+
+    if (interimTimerRef.current) window.clearTimeout(interimTimerRef.current);
+    interimTimerRef.current = window.setTimeout(() => {
+      setInterimOriginal(pending.text);
+      interimTimerRef.current = null;
+    }, 45);
+
+    setStatus("listening");
+  }, []);
+
+  const schedulePartialTranscript = useCallback(
+    (payload: PartialTranscriptPayload) => {
+      pendingPartialTranscriptRef.current = payload;
+
+      const elapsedMs = Date.now() - lastSubtitleUpdateAtRef.current;
+      if (elapsedMs >= PARTIAL_SUBTITLE_THROTTLE_MS) {
+        if (subtitleThrottleTimerRef.current) {
+          window.clearTimeout(subtitleThrottleTimerRef.current);
+          subtitleThrottleTimerRef.current = null;
+        }
+        flushPendingPartialTranscript();
+        return;
+      }
+
+      if (subtitleThrottleTimerRef.current) return;
+      subtitleThrottleTimerRef.current = window.setTimeout(() => {
+        subtitleThrottleTimerRef.current = null;
+        flushPendingPartialTranscript();
+      }, PARTIAL_SUBTITLE_THROTTLE_MS - elapsedMs);
+    },
+    [flushPendingPartialTranscript]
+  );
 
   const cleanupMedia = useCallback(() => {
     const recorder = mediaRecorderRef.current;
@@ -1221,6 +1336,17 @@ export default function App() {
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     dubbingQueueRef.current = [];
     dubbingSpeakingRef.current = false;
+    activeDubbingUtteranceIdRef.current = "";
+    activeDubbingLanguageRef.current = "";
+    if (subtitleThrottleTimerRef.current) {
+      window.clearTimeout(subtitleThrottleTimerRef.current);
+      subtitleThrottleTimerRef.current = null;
+    }
+    if (interimTimerRef.current) {
+      window.clearTimeout(interimTimerRef.current);
+      interimTimerRef.current = null;
+    }
+    pendingPartialTranscriptRef.current = null;
   }, []);
 
   const stopSession = useCallback(() => {
@@ -1310,16 +1436,9 @@ export default function App() {
     socket.on("transcript_partial", ({ text, detectedLanguage }: { text?: string; detectedLanguage?: string }) => {
       const originalText = text?.trim() || "";
       if (!originalText || originalText === lastInterimRef.current) return;
-      if (detectedLanguage) setDetectedLanguage(detectedLanguage);
 
       lastInterimRef.current = originalText;
-      setLiveText(originalText);
-      if (interimTimerRef.current) window.clearTimeout(interimTimerRef.current);
-      interimTimerRef.current = window.setTimeout(() => {
-        setInterimOriginal(originalText);
-        interimTimerRef.current = null;
-      }, 45);
-      setStatus("listening");
+      schedulePartialTranscript({ text: originalText, detectedLanguage });
     });
 
     socket.on("transcript_final", ({ text, detectedLanguage, latencyMs, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages }: { text?: string; detectedLanguage?: string; latencyMs?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[] }) => {
@@ -1330,6 +1449,11 @@ export default function App() {
 
       lastInterimRef.current = "";
       lastFinalOriginalRef.current = originalText;
+      pendingPartialTranscriptRef.current = null;
+      if (subtitleThrottleTimerRef.current) {
+        window.clearTimeout(subtitleThrottleTimerRef.current);
+        subtitleThrottleTimerRef.current = null;
+      }
       const pendingTargetLanguages = normalizeTargetLanguages(eventTargetLanguages, eventTargetLang || targetLangRef.current);
       const timestamp = new Date().toISOString();
       const pendingEntry = {
@@ -1341,13 +1465,15 @@ export default function App() {
       };
       pendingFinalTranscriptRef.current = pendingEntry;
       activeTranslationIdRef.current = `${timestamp}-${originalText.slice(0, 48)}`;
-      if (spokenDubbingKeysRef.current.size > 300) spokenDubbingKeysRef.current.clear();
+      spokenDubbingKeysRef.current = compactSetToLimit(spokenDubbingKeysRef.current, MAX_SPOKEN_DUBBING_KEYS);
+      dubbingQueueRef.current = dubbingQueueRef.current.slice(-Math.ceil(MAX_DUBBING_QUEUE_ITEMS / 2));
       setInterimOriginal("");
       setLiveText("");
       setFinalText((current) => appendTextWindow(current, originalText));
-      setOriginalSegments((current) => [...current, originalText].slice(-40));
+      setOriginalSegments((current) => [...current, originalText].slice(-MAX_LIVE_SEGMENTS));
       setFinalTranslations({});
       lastFinalTranslationRef.current = "";
+      lastCompletedTranslationRef.current = "";
 
       if (modeRef.current === "transcribe") {
         pendingFinalTranscriptRef.current = null;
@@ -1371,8 +1497,12 @@ export default function App() {
       setFinalTranslations(nextTranslations);
 
       if (isComplete) {
-        setFinalTranslationText((current) => [current, nextTranslation].filter(Boolean).join("\n\n").trim().slice(-5000));
-        setTranslatedSegments((current) => [...current, nextTranslation].slice(-40));
+        const completedSignature = `${activeTranslationIdRef.current || pendingTranscript?.timestamp || "current"}|${nextTranslationSignature}`;
+        if (completedSignature === lastCompletedTranslationRef.current) return;
+        lastCompletedTranslationRef.current = completedSignature;
+
+        setFinalTranslationText((current) => [current, nextTranslation].filter(Boolean).join("\n\n").trim().slice(-3500));
+        setTranslatedSegments((current) => [...current, nextTranslation].slice(-MAX_LIVE_SEGMENTS));
         appendTranscriptHistory({
           original: pendingTranscript?.original || lastFinalOriginalRef.current,
           translated: nextTranslation,
@@ -1387,7 +1517,15 @@ export default function App() {
     });
 
     return () => {
-      if (interimTimerRef.current) window.clearTimeout(interimTimerRef.current);
+      if (interimTimerRef.current) {
+        window.clearTimeout(interimTimerRef.current);
+        interimTimerRef.current = null;
+      }
+      if (subtitleThrottleTimerRef.current) {
+        window.clearTimeout(subtitleThrottleTimerRef.current);
+        subtitleThrottleTimerRef.current = null;
+      }
+      pendingPartialTranscriptRef.current = null;
       socket.disconnect();
       socketRef.current = null;
     };
@@ -1413,6 +1551,8 @@ export default function App() {
       window.speechSynthesis.cancel();
       dubbingQueueRef.current = [];
       dubbingSpeakingRef.current = false;
+      activeDubbingUtteranceIdRef.current = "";
+      activeDubbingLanguageRef.current = "";
       spokenDubbingKeysRef.current.clear();
       return;
     }
@@ -1420,13 +1560,21 @@ export default function App() {
     const entries = orderedTranslationEntries(finalTranslations, targetLanguages).filter(([, translatedText]) => !/unavailable/i.test(translatedText));
     if (entries.length === 0) return;
 
+    const translationId = activeTranslationIdRef.current || "current";
+    const now = Date.now();
+    dubbingQueueRef.current = dubbingQueueRef.current
+      .filter((item) => item.translationId === translationId || now - item.createdAt <= DUBBING_UTTERANCE_TTL_MS)
+      .slice(-MAX_DUBBING_QUEUE_ITEMS);
+
     for (const [language, translatedText] of entries) {
-      const dubbingKey = `${activeTranslationIdRef.current || "current"}:${language}:${translatedText}`;
+      const dubbingKey = `${translationId}:${language}:${translatedText}`;
       if (spokenDubbingKeysRef.current.has(dubbingKey)) continue;
       spokenDubbingKeysRef.current.add(dubbingKey);
-      dubbingQueueRef.current.push({ language, text: translatedText });
+      dubbingQueueRef.current.push({ translationId, language, text: translatedText, createdAt: now });
     }
 
+    spokenDubbingKeysRef.current = compactSetToLimit(spokenDubbingKeysRef.current, MAX_SPOKEN_DUBBING_KEYS);
+    dubbingQueueRef.current = dubbingQueueRef.current.slice(-MAX_DUBBING_QUEUE_ITEMS);
     playNextDubbingUtterance();
   }, [mode, finalTranslations, targetLanguages, playNextDubbingUtterance]);
 
@@ -1547,12 +1695,20 @@ export default function App() {
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
     lastFinalTranslationRef.current = "";
+    lastCompletedTranslationRef.current = "";
     pendingFinalTranscriptRef.current = null;
     activeTranslationIdRef.current = "";
     spokenDubbingKeysRef.current.clear();
     dubbingQueueRef.current = [];
     dubbingSpeakingRef.current = false;
+    activeDubbingUtteranceIdRef.current = "";
+    activeDubbingLanguageRef.current = "";
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    pendingPartialTranscriptRef.current = null;
+    if (subtitleThrottleTimerRef.current) {
+      window.clearTimeout(subtitleThrottleTimerRef.current);
+      subtitleThrottleTimerRef.current = null;
+    }
     if (interimTimerRef.current) {
       window.clearTimeout(interimTimerRef.current);
       interimTimerRef.current = null;
@@ -1604,9 +1760,8 @@ export default function App() {
         if (event.data.size < 128 || !socketRef.current?.connected) return;
 
         socketRef.current.emit("audio_chunk", event.data);
-        console.log("Audio chunk sent");
         sequenceRef.current += 1;
-        setChunkCount((current) => current + 1);
+        if (sequenceRef.current % 3 === 0) setChunkCount(sequenceRef.current);
       };
 
       recorder.onerror = () => {
@@ -1697,12 +1852,20 @@ export default function App() {
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
     lastFinalTranslationRef.current = "";
+    lastCompletedTranslationRef.current = "";
     activeTranslationIdRef.current = "";
     pendingFinalTranscriptRef.current = null;
     spokenDubbingKeysRef.current.clear();
     dubbingQueueRef.current = [];
     dubbingSpeakingRef.current = false;
+    activeDubbingUtteranceIdRef.current = "";
+    activeDubbingLanguageRef.current = "";
+    pendingPartialTranscriptRef.current = null;
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    if (subtitleThrottleTimerRef.current) {
+      window.clearTimeout(subtitleThrottleTimerRef.current);
+      subtitleThrottleTimerRef.current = null;
+    }
     if (interimTimerRef.current) {
       window.clearTimeout(interimTimerRef.current);
       interimTimerRef.current = null;
@@ -1717,31 +1880,35 @@ export default function App() {
       return;
     }
 
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const filename = `interp-history-${timestamp}.pdf`;
-    const formattedText = stableHistory
-      .map((entry) => {
-        const sourceLabel = entry.sourceLang.toUpperCase();
-        const translations = normalizeTranslationMap(entry.translations, entry.translated, entry.targetLang);
-        const translationLines = orderedTranslationEntries(translations, entry.targetLanguages || [entry.targetLang]).map(([language, translatedText]) => `${language.toUpperCase()}: ${translatedText}`);
+    try {
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const filename = `interp-history-${timestamp}.pdf`;
+      const formattedText = stableHistory
+        .map((entry) => {
+          const sourceLabel = entry.sourceLang.toUpperCase();
+          const translations = normalizeTranslationMap(entry.translations, entry.translated, entry.targetLang);
+          const translationLines = orderedTranslationEntries(translations, entry.targetLanguages || [entry.targetLang]).map(([language, translatedText]) => `${language.toUpperCase()}: ${translatedText}`);
 
-        return [
-          `[${formatHistoryTimestamp(entry.timestamp)}]`,
-          `${sourceLabel}: ${entry.original}`,
-          ...translationLines
-        ].join("\n");
-      })
-      .join("\n\n");
-    const blob = new Blob([formattedText], { type: "application/pdf" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
+          return [
+            `[${formatHistoryTimestamp(entry.timestamp)}]`,
+            `${sourceLabel}: ${entry.original}`,
+            ...translationLines
+          ].join("\n");
+        })
+        .join("\n\n");
+      const blob = new Blob([formattedText], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
 
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 500);
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 500);
+    } catch {
+      setAlert("Unable to export PDF right now. Your transcript history is still saved.");
+    }
   };
 
   const persistSetting = <K extends keyof UserSettings>(key: K, value: UserSettings[K]) => {
@@ -1966,7 +2133,7 @@ export default function App() {
               <p className="rounded-lg border border-white/10 bg-slate-950/50 p-4 text-sm text-slate-500">Final transcripts will stay here during long sessions and after refresh.</p>
             ) : (
               <div className="space-y-3">
-                {history.map((entry) => (
+                {history.slice(-VISIBLE_HISTORY_ITEMS).map((entry) => (
                   <div key={entry.id} className="rounded-lg border border-white/10 bg-slate-950/55 p-4">
                     <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-600">[{formatHistoryTimestamp(entry.timestamp)}]</p>
                     <p className="text-sm leading-6 text-slate-300"><span className="font-black text-slate-100">{entry.sourceLang.toUpperCase()}:</span> {entry.original || "No transcript text"}</p>

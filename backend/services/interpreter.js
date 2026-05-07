@@ -19,6 +19,11 @@ const TRANSLATION_ATTEMPT_TIMEOUT_MS = 8500;
 const TRANSLATION_JOB_TIMEOUT_MS = 16000;
 const PROVIDER_FAILURE_THRESHOLD = 2;
 const PROVIDER_COOLDOWN_MS = 30000;
+const SESSION_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
+const SESSION_HEALTH_CHECK_MS = 2500;
+const MAX_STALE_TRANSLATION_JOBS = 40;
+const MAX_PENDING_SENTENCE_CHARS = 1400;
+const QUEUED_TRANSLATION_RESCHEDULE_MS = 220;
 const SAFE_FALLBACK_TRANSLATION = "Translation temporarily unavailable.";
 const sessionHistoryStore = new Map();
 
@@ -30,8 +35,15 @@ const createSessionId = () => {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 };
 
-const rememberSessionHistory = (sessionId, transcriptHistory) => {
-  sessionHistoryStore.set(sessionId, transcriptHistory);
+const cleanupSessionHistoryStore = () => {
+  const now = Date.now();
+
+  for (const [sessionId, entry] of sessionHistoryStore.entries()) {
+    const updatedAt = entry?.updatedAt || 0;
+    if (updatedAt && now - updatedAt > SESSION_HISTORY_TTL_MS) {
+      sessionHistoryStore.delete(sessionId);
+    }
+  }
 
   while (sessionHistoryStore.size > MAX_STORED_SESSIONS) {
     const oldestSessionId = sessionHistoryStore.keys().next().value;
@@ -39,9 +51,34 @@ const rememberSessionHistory = (sessionId, transcriptHistory) => {
   }
 };
 
+const rememberSessionHistory = (sessionId, transcriptHistory) => {
+  sessionHistoryStore.set(sessionId, {
+    history: transcriptHistory,
+    updatedAt: Date.now()
+  });
+  cleanupSessionHistoryStore();
+};
+
+const touchSessionHistory = (sessionId) => {
+  const entry = sessionHistoryStore.get(sessionId);
+  if (!entry) return;
+
+  if (Array.isArray(entry)) {
+    sessionHistoryStore.set(sessionId, {
+      history: entry,
+      updatedAt: Date.now()
+    });
+    return;
+  }
+
+  entry.updatedAt = Date.now();
+};
+
 export const getInterpreterSessionHistory = (sessionId) => {
-  const history = sessionHistoryStore.get(sessionId);
-  return Array.isArray(history) ? history : [];
+  cleanupSessionHistoryStore();
+  const entry = sessionHistoryStore.get(sessionId);
+  if (Array.isArray(entry)) return entry;
+  return Array.isArray(entry?.history) ? entry.history : [];
 };
 
 const cleanTranscriptText = (text = "") => {
@@ -123,6 +160,12 @@ const normalizeTranscript = (text = "") => cleanTranscriptText(text).toLowerCase
 const sentenceEnds = (text = "") => /[.!?]$/.test(text.trim());
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const wordCount = (text = "") => text.split(/\s+/).filter(Boolean).length;
+
+const trimTextWindow = (text = "", maxChars = MAX_PENDING_SENTENCE_CHARS) => {
+  const cleanText = cleanTranscriptText(text);
+  if (cleanText.length <= maxChars) return cleanText;
+  return cleanText.slice(-maxChars).replace(/^\S+\s*/, "").trim();
+};
 
 const withTimeout = (promise, timeoutMs, message) => {
   let timeout = null;
@@ -247,6 +290,8 @@ const resolveDirection = ({ sourceLang, targetLang, targetLanguages, detectedLan
   return { source: detectedLanguage || sourceLang, target: targets[0], targets };
 };
 
+const shouldRetryGeminiAttempt = (error) => !/timed out|stale/i.test(String(error?.message || error || ""));
+
 export const createInterpreterSession = async ({
   env,
   sourceLang,
@@ -276,6 +321,7 @@ export const createInterpreterSession = async ({
   let translationInFlight = false;
   let activeTranslationStartedAt = 0;
   let activeTranslationJobId = 0;
+  let activeTranslationSnapshot = null;
   let translationJobSequence = 0;
   const sessionId = createSessionId();
   const providerHealth = {
@@ -298,6 +344,14 @@ export const createInterpreterSession = async ({
     consecutiveTranslationFailures = 0;
     translationInFlight = false;
     activeTranslationStartedAt = 0;
+    activeTranslationJobId = 0;
+    activeTranslationSnapshot = null;
+  };
+
+  const trimStaleTranslationJobs = () => {
+    while (staleTranslationJobs.size > MAX_STALE_TRANSLATION_JOBS) {
+      staleTranslationJobs.delete(staleTranslationJobs.values().next().value);
+    }
   };
 
   const providerAvailable = (provider) => {
@@ -326,6 +380,17 @@ export const createInterpreterSession = async ({
       cooldownMs: PROVIDER_COOLDOWN_MS,
       error: error?.message || error || "Provider failed"
     });
+  };
+
+  const refreshProviderCooldowns = () => {
+    const now = Date.now();
+
+    for (const health of Object.values(providerHealth)) {
+      if (health.cooldownUntil && now >= health.cooldownUntil) {
+        health.failures = 0;
+        health.cooldownUntil = 0;
+      }
+    }
   };
 
   const noteTranslationSuccess = (language, translatedText, translationContext) => {
@@ -434,6 +499,10 @@ export const createInterpreterSession = async ({
             responseTimeMs: Date.now() - attemptStartedAt,
             error: error?.message || error
           });
+
+          if (!shouldRetryGeminiAttempt(error)) {
+            break;
+          }
         }
       }
     } else {
@@ -530,6 +599,9 @@ export const createInterpreterSession = async ({
     clearTranslationTimer();
 
     if (translationInFlight) {
+      if (currentSentence.trim()) {
+        scheduleStableTranslation(QUEUED_TRANSLATION_RESCHEDULE_MS);
+      }
       return;
     }
 
@@ -549,6 +621,12 @@ export const createInterpreterSession = async ({
     translationJobSequence = jobId;
     activeTranslationJobId = jobId;
     activeTranslationStartedAt = startedAt;
+    activeTranslationSnapshot = {
+      sentence,
+      normalizedSentence,
+      direction,
+      detectedLanguage
+    };
     translationInFlight = true;
 
     try {
@@ -636,10 +714,20 @@ export const createInterpreterSession = async ({
         targetLanguages: direction.targets
       };
 
-      session.transcriptHistory.push(transcriptEntry);
+      const lastTranscriptEntry = session.transcriptHistory[session.transcriptHistory.length - 1];
+      const duplicateTranscriptEntry =
+        lastTranscriptEntry?.original === transcriptEntry.original &&
+        lastTranscriptEntry?.translated === transcriptEntry.translated &&
+        JSON.stringify(lastTranscriptEntry?.translations || {}) === JSON.stringify(transcriptEntry.translations || {});
+
+      if (!duplicateTranscriptEntry) {
+        session.transcriptHistory.push(transcriptEntry);
+      }
+
       if (session.transcriptHistory.length > MAX_TRANSCRIPT_HISTORY) {
         session.transcriptHistory.splice(0, session.transcriptHistory.length - MAX_TRANSCRIPT_HISTORY);
       }
+      touchSessionHistory(sessionId);
     }
 
     onResult?.({
@@ -659,9 +747,12 @@ export const createInterpreterSession = async ({
     });
     } finally {
       staleTranslationJobs.delete(jobId);
+      trimStaleTranslationJobs();
       if (activeTranslationJobId === jobId) {
         translationInFlight = false;
         activeTranslationStartedAt = 0;
+        activeTranslationJobId = 0;
+        activeTranslationSnapshot = null;
       }
 
       if (currentSentence.trim()) {
@@ -683,25 +774,48 @@ export const createInterpreterSession = async ({
     translationTimer.unref?.();
   };
 
-  const translationWatchdog = setInterval(() => {
-    if (!translationInFlight || !activeTranslationStartedAt) return;
+  const recoverStalledTranslationJob = (reason) => {
+    const stalledJobId = activeTranslationJobId;
+    const stalledForMs = activeTranslationStartedAt ? Date.now() - activeTranslationStartedAt : 0;
+    const stalledSentence = activeTranslationSnapshot?.sentence || "";
 
-    const activeForMs = Date.now() - activeTranslationStartedAt;
-    if (activeForMs < TRANSLATION_JOB_TIMEOUT_MS) return;
+    if (stalledJobId) staleTranslationJobs.add(stalledJobId);
+    if (stalledSentence) currentSentence = trimTextWindow(appendSentenceChunk(stalledSentence, currentSentence));
 
-    staleTranslationJobs.add(activeTranslationJobId);
     translationInFlight = false;
     activeTranslationStartedAt = 0;
-    console.warn("Translation watchdog cleared a stuck job", {
-      jobId: activeTranslationJobId,
-      activeForMs
+    activeTranslationJobId = 0;
+    activeTranslationSnapshot = null;
+    trimStaleTranslationJobs();
+
+    console.warn("Translation health monitor recovered a stalled job", {
+      jobId: stalledJobId,
+      reason,
+      activeForMs: stalledForMs
     });
 
     if (currentSentence.trim()) {
-      scheduleStableTranslation(120);
+      scheduleStableTranslation(QUEUED_TRANSLATION_RESCHEDULE_MS);
     }
-  }, 3000);
-  translationWatchdog.unref?.();
+  };
+
+  const sessionHealthMonitor = setInterval(() => {
+    cleanupSessionHistoryStore();
+    refreshProviderCooldowns();
+    trimStaleTranslationJobs();
+
+    if (currentSentence.length > MAX_PENDING_SENTENCE_CHARS) {
+      currentSentence = trimTextWindow(currentSentence);
+    }
+
+    if (!translationInFlight || !activeTranslationStartedAt) return;
+
+    const activeForMs = Date.now() - activeTranslationStartedAt;
+    if (activeForMs >= TRANSLATION_JOB_TIMEOUT_MS) {
+      recoverStalledTranslationJob("job_timeout");
+    }
+  }, SESSION_HEALTH_CHECK_MS);
+  sessionHealthMonitor.unref?.();
 
   const session = createDeepgramSession({
     apiKey: env.deepgramApiKey,
@@ -752,7 +866,7 @@ export const createInterpreterSession = async ({
       lastFinalTranscript = normalized;
       currentDirection = direction;
       currentDetectedLanguage = detectedLanguage;
-      currentSentence = appendSentenceChunk(currentSentence, displayText);
+      currentSentence = trimTextWindow(appendSentenceChunk(currentSentence, displayText));
       scheduleStableTranslation();
     }
   });
@@ -764,10 +878,14 @@ export const createInterpreterSession = async ({
   const stopDeepgramSession = session.stop;
   session.stop = () => {
     clearTranslationTimer();
-    clearInterval(translationWatchdog);
+    clearInterval(sessionHealthMonitor);
     staleTranslationJobs.add(activeTranslationJobId);
+    trimStaleTranslationJobs();
     translationInFlight = false;
     activeTranslationStartedAt = 0;
+    activeTranslationJobId = 0;
+    activeTranslationSnapshot = null;
+    touchSessionHistory(sessionId);
     stopDeepgramSession?.();
   };
 
