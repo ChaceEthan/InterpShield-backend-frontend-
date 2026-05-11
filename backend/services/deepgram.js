@@ -42,7 +42,7 @@ export const createDeepgramSession = ({
   let stopped = false;
   let keepAliveTimer = null;
   const queuedAudio = [];
-  const maxQueuedChunks = 8;
+  const maxQueuedChunks = 80;
 
   const clearKeepAlive = () => {
     if (keepAliveTimer) clearInterval(keepAliveTimer);

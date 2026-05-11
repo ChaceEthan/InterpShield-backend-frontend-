@@ -25,14 +25,15 @@ const FAST_LOCAL_LANGUAGE_CODES = new Set(["rw", "rn", "sw", "luganda"]);
 const FAST_LOCAL_MAX_ACTIVE_TRANSLATIONS = 8;
 const PROVIDER_MAX_ACTIVE_TRANSLATIONS = 2;
 const MAX_TRANSLATION_LANE_QUEUE_SIZE = 24;
-const QUEUED_JOB_TIMEOUT = 5000;
-const PROCESSING_JOB_TIMEOUT = 7000;
+const QUEUED_JOB_TIMEOUT = 45000;
+const PROCESSING_JOB_TIMEOUT = 90000;
+const SEQUENTIAL_JOB_HARD_TIMEOUT = 180000;
 const TRANSLATION_RATE_LIMIT_DELAY_MS = 80;
 const CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS = 3000;
 const LATENCY_WINDOW_SIZE = 5;
 const MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3;
 const MAX_PROVIDER_RETRY_ATTEMPTS = 1;
-const PROVIDER_RETRY_DELAY_MS = 260;
+const PROVIDER_RETRY_DELAY_MS = 900;
 
 // Admin Dashboard Tracking (Simulated Persistent Store)
 const globalUsageStats = {
@@ -63,8 +64,8 @@ const PROVIDER_TRANSLATION_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const PARTIAL_TRANSLATION_PREVIEW_THROTTLE_MS = 140;
 const ADMIN_STATS_EMIT_MS = 10000;
 const PROVIDER_TIMEOUT_MS = {
-  gemini: 8000,
-  openai: 7000
+  gemini: 25000,
+  openai: 22000
 };
 const PROVIDER_FAILURE_THRESHOLD = 3;
 const PROVIDER_COOLDOWN_MS = 45000;
@@ -342,7 +343,17 @@ const isSourceTaggedFallbackText = (text = "") => /^\[[a-z]{2,12}(?:-[a-z0-9]{2,
 const isSourceEchoTranslation = ({ text = "", sourceText = "" } = {}) => {
   const cleanText = cleanTranscriptText(text);
   if (!cleanText) return false;
-  return Boolean(sourceText && normalizeTranscript(cleanText) === normalizeTranscript(sourceText));
+  const source = cleanTranscriptText(sourceText);
+  if (!source || normalizeTranscript(cleanText) !== normalizeTranscript(source)) return false;
+
+  const cleanTokens = languageTokens(cleanText);
+  const sourceTokens = languageTokens(source);
+  const looksLikeNameOrEntity =
+    sourceTokens.length <= 3 &&
+    /^[\p{Lu}\p{N}][\p{L}\p{N}'’.-]*(?:\s+[\p{Lu}\p{N}][\p{L}\p{N}'’.-]*){0,2}$/u.test(source);
+  const shortConversationalFragment = sourceTokens.length <= 2 && cleanText.length <= 18;
+
+  return !(looksLikeNameOrEntity || shortConversationalFragment || cleanTokens.length <= 1);
 };
 
 const TARGET_LANGUAGE_MARKERS = {
@@ -1625,23 +1636,34 @@ export const createInterpreterSession = async ({
     };
 
     for (const provider of providerOrder) {
-      if (staleTranslationJobs.has(jobId)) break;
+      for (let attempt = 0; attempt <= MAX_PROVIDER_RETRY_ATTEMPTS; attempt += 1) {
+        if (staleTranslationJobs.has(jobId)) break;
 
-      const result = await runProviderTranslationAttempt({
-        provider,
-        language,
-        translationInput,
-        direction,
-        languageTranslationContext,
-        jobId
-      });
-      if (result?.stale) {
-        lastError = result.error;
-        return { text: "", provider, stale: true };
+        if (attempt > 0) {
+          translationMetrics.retryCount += 1;
+          await delay(PROVIDER_RETRY_DELAY_MS * attempt);
+          if (staleTranslationJobs.has(jobId)) break;
+        }
+
+        const result = await runProviderTranslationAttempt({
+          provider,
+          language,
+          translationInput,
+          direction,
+          languageTranslationContext,
+          jobId
+        });
+        if (result?.stale) {
+          lastError = result.error;
+          return { text: "", provider, stale: true };
+        }
+
+        const translatedText = consumeProviderResult(result);
+        if (translatedText?.text) return translatedText;
+
+        const retryable = Boolean(result?.error || result?.timedOut);
+        if (!retryable) break;
       }
-
-      const translatedText = consumeProviderResult(result);
-      if (translatedText?.text) return translatedText;
     }
 
     noteTranslationFailure(language, lastError);
@@ -2292,14 +2314,17 @@ export const createInterpreterSession = async ({
 
     for (const job of [...translationJobs.values()]) {
       if (!job || job.completed || job.stale || staleTranslationJobs.has(job.id)) continue;
+      const isActiveFifoJob = sessionTranslationQueue.activeJob?.id === job.id || activeSequentialTranslationJob?.id === job.id;
+      const activeAge = now - (job.activeLanguageStartedAt || job.startedAt || job.createdAt || now);
 
       const queuedTooLong =
         job.pendingLanguages?.size > 0 &&
         job.runningLanguages?.size === 0 &&
+        !isActiveFifoJob &&
         now - (job.createdAt || now) > QUEUED_JOB_TIMEOUT;
       const processingTooLong =
         job.runningLanguages?.size > 0 &&
-        now - (job.activeLanguageStartedAt || job.startedAt || job.createdAt || now) > PROCESSING_JOB_TIMEOUT;
+        activeAge > (isActiveFifoJob ? SEQUENTIAL_JOB_HARD_TIMEOUT : PROCESSING_JOB_TIMEOUT);
 
       if (queuedTooLong || processingTooLong) {
         markTranslationJobStale(job, queuedTooLong ? "queued_too_long" : "processing_timeout");

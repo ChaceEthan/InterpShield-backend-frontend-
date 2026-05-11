@@ -1,8 +1,8 @@
 // @ts-nocheck
-const MIN_AUDIO_CHUNK_BYTES = 96;
-const DUPLICATE_HASH_WINDOW = 3;
-const MIN_CHUNK_INTERVAL_MS = 75;
-const LOW_AUDIO_LEVEL = 0.004;
+const MIN_AUDIO_CHUNK_BYTES = 48;
+const DUPLICATE_HASH_WINDOW = 12;
+const MIN_CHUNK_INTERVAL_MS = 35;
+const LOW_AUDIO_LEVEL = 0.0015;
 const MAX_TRANSLATED_SPEECH_QUEUE = 24;
 const TRANSLATED_SPEECH_TTL_MS = 45000;
 
@@ -110,8 +110,12 @@ export const createAudioPipelineSession = ({
 
     const silenceConfidence = estimateSilenceConfidence({ buffer, audioLevel });
     const tooFast = lastAcceptedAt && receivedAt - lastAcceptedAt < MIN_CHUNK_INTERVAL_MS;
-    const likelySilentMicroChunk = Number.isFinite(audioLevel) && audioLevel < LOW_AUDIO_LEVEL && buffer.length < MIN_AUDIO_CHUNK_BYTES * 3;
-    const duplicateSpam = duplicateHashCount >= DUPLICATE_HASH_WINDOW;
+    const likelySilentMicroChunk =
+      Number.isFinite(audioLevel) &&
+      audioLevel < LOW_AUDIO_LEVEL &&
+      buffer.length < MIN_AUDIO_CHUNK_BYTES * 2 &&
+      silenceConfidence > 0.98;
+    const duplicateSpam = duplicateHashCount >= DUPLICATE_HASH_WINDOW && silenceConfidence > 0.98;
 
     if ((tooFast && likelySilentMicroChunk) || duplicateSpam) {
       droppedChunks += 1;

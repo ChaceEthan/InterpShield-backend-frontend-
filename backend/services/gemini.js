@@ -3,7 +3,7 @@ import { GoogleGenAI } from "@google/genai";
 import { LANGUAGE_NAMES, TARGET_LANGUAGE_INSTRUCTIONS } from "../data/languageMemory.js";
 import { enhanceTranslation } from "../utils/translationEnhancer.js";
 
-const GEMINI_TIMEOUT_MS = 8000;
+const GEMINI_TIMEOUT_MS = 25000;
 
 let client = null;
 let activeKey = null;

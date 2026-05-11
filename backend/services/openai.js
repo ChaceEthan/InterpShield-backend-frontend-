@@ -4,7 +4,26 @@ import { enhanceTranslation } from "../utils/translationEnhancer.js";
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_TRANSLATION_MODEL = "gpt-4o-mini";
-const OPENAI_TIMEOUT_MS = 7000;
+const OPENAI_TIMEOUT_MS = 22000;
+
+const mergeAbortSignals = (...signals) => {
+  const activeSignals = signals.filter(Boolean);
+  if (activeSignals.length === 0) return undefined;
+  if (activeSignals.length === 1) return activeSignals[0];
+
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+
+  for (const signal of activeSignals) {
+    if (signal.aborted) {
+      controller.abort();
+      return controller.signal;
+    }
+    signal.addEventListener?.("abort", abort, { once: true });
+  }
+
+  return controller.signal;
+};
 
 const normalizeForComparison = (value = "") =>
   value
@@ -124,7 +143,7 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
     
-    const mergedSignal = signal?.aborted ? signal : controller.signal;
+    const mergedSignal = mergeAbortSignals(signal, controller.signal);
 
     const response = await fetch(OPENAI_API_URL, {
       method: "POST",
