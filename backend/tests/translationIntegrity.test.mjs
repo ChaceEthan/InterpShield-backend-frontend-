@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { isTranslationDisplayable } from "../services/interpreter.js";
 import { resolveLocalTranslation } from "../utils/translationEnhancer.js";
+import { createAudioPipelineSession, upsertCallRoomParticipant, removeCallRoomParticipant } from "../services/audioPipeline.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const interpreterSource = readFileSync(resolve(__dirname, "../services/interpreter.js"), "utf8");
@@ -74,3 +75,35 @@ assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLan
 assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "sw" }), "unaweza kunipa kitabu chako");
 assert.equal(resolveLocalTranslation({ text: "Urashobora kumpa igitabo cyawe?", sourceLang: "rw", targetLang: "en" }), "can you give me your book");
 assert.equal(resolveLocalTranslation({ text: "Unaweza kunipa kitabu chako?", sourceLang: "sw", targetLang: "en" }), "can you give me your book");
+
+const audioPipeline = createAudioPipelineSession({
+  sessionId: "test-session",
+  roomId: "test-room",
+  participantId: "participant-1",
+  sourceLang: "en",
+  targetLanguages: ["es", "rw"]
+});
+const acceptedAudio = audioPipeline.preprocessAudioChunk(Buffer.alloc(512, 7), { sequence: 1, audioLevel: 0.02 });
+assert.equal(acceptedAudio.accepted, true);
+const droppedAudio = audioPipeline.preprocessAudioChunk(Buffer.alloc(8), { sequence: 2, audioLevel: 0 });
+assert.equal(droppedAudio.accepted, false);
+const speechRoutes = audioPipeline.queueTranslatedSpeech({
+  original: source,
+  sourceLang: "en",
+  targetLanguages: ["es"],
+  translations: { es: "Me puedes dar tu libro, por favor" }
+});
+assert.equal(speechRoutes.length, 1);
+assert.equal(speechRoutes[0].targetLang, "es");
+
+const rooms = new Map();
+const room = upsertCallRoomParticipant(rooms, {
+  roomId: "call-1",
+  participantId: "participant-1",
+  socketId: "socket-1",
+  sourceLang: "en",
+  targetLanguages: ["rw"]
+});
+assert.equal(room.participants.size, 1);
+removeCallRoomParticipant(rooms, "call-1", "participant-1");
+assert.equal(rooms.size, 0);

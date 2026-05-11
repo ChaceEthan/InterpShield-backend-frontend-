@@ -1,9 +1,15 @@
 // @ts-nocheck
 import { verifyToken } from "../services/authService.js";
 import { createInterpreterSession, isTranslationDisplayable } from "../services/interpreter.js";
+import {
+  createAudioPipelineSession,
+  removeCallRoomParticipant,
+  upsertCallRoomParticipant
+} from "../services/audioPipeline.js";
 
 const MAX_TARGET_LANGUAGES = 3;
 const LOG_TEXT_PREVIEW_CHARS = 96;
+const callRooms = new Map();
 
 const logSocketTranslationEvent = (event, payload = {}) => {
   const safePayload = {};
@@ -110,6 +116,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     let session = null;
     let sessionTimer = null;
     let lastSequence = -1;
+    let audioPipeline = null;
+    let roomMetadata = null;
 
     try {
       const token = socket.handshake.auth?.token;
@@ -124,9 +132,20 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     const stopSession = () => {
       const activeSession = socket.data.interpreterSession || session;
       activeSession?.stop?.();
+      audioPipeline?.stop?.();
+
+      if (roomMetadata?.roomId && roomMetadata?.participantId) {
+        removeCallRoomParticipant(callRooms, roomMetadata.roomId, roomMetadata.participantId);
+        socket.leave(roomMetadata.roomId);
+      }
+
       session = null;
+      audioPipeline = null;
+      roomMetadata = null;
       socket.data.interpreterSession = null;
       socket.data.deepgramStream = null;
+      socket.data.audioPipeline = null;
+      socket.data.callRoom = null;
 
       if (sessionTimer) {
         clearTimeout(sessionTimer);
@@ -159,6 +178,15 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         socket.emit("translation_update", payload);
         socket.emit("translation_result", payload);
         socket.emit("translated_text", payload);
+        const speechRoutes = audioPipeline?.queueTranslatedSpeech?.({
+          original: payload.original,
+          translations: payload.translations,
+          sourceLang: payload.sourceLang,
+          targetLanguages: payload.targetLanguages
+        });
+        if (speechRoutes?.length) {
+          socket.data.translatedSpeechRoutes = speechRoutes;
+        }
       };
 
       if (result?.type === "admin_stats") {
@@ -246,12 +274,15 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       const targetLang = targetLanguages[0];
       const shouldTranslate = payload.translate !== false;
       const twoWay = Boolean(payload.twoWay);
+      const roomId = String(payload.roomId || payload.callRoomId || "").trim();
+      const participantId = String(payload.participantId || socket.id).trim();
       lastSequence = -1;
 
       try {
         if (!env.deepgramApiKey) {
           throw new Error("Missing Deepgram API key");
         }
+        let callRoomInfo = null;
 
         session = await createInterpreterSession({
           env,
@@ -274,6 +305,45 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         });
         socket.data.interpreterSession = session;
         socket.data.deepgramStream = session;
+        roomMetadata = roomId
+          ? {
+              roomId,
+              participantId,
+              sourceLang,
+              targetLanguages
+            }
+          : null;
+
+        if (roomMetadata) {
+          socket.join(roomMetadata.roomId);
+          const callRoom = upsertCallRoomParticipant(callRooms, {
+            roomId: roomMetadata.roomId,
+            participantId: roomMetadata.participantId,
+            socketId: socket.id,
+            sourceLang,
+            targetLanguages
+          });
+          socket.data.callRoom = {
+            id: callRoom?.id,
+            participantCount: callRoom?.participants?.size || 1
+          };
+          callRoomInfo = {
+            id: callRoom?.id,
+            participantId: roomMetadata.participantId,
+            participantCount: callRoom?.participants?.size || 1
+          };
+        }
+
+        audioPipeline = createAudioPipelineSession({
+          sessionId: session.sessionId,
+          roomId,
+          participantId,
+          sourceLang,
+          targetLanguages,
+          mimeType: payload.mimeType || "audio/webm",
+          audioProfile: payload.audioProfile || {}
+        });
+        socket.data.audioPipeline = audioPipeline.getSnapshot();
 
         sessionTimer = setTimeout(() => {
           stopSession();
@@ -282,7 +352,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         }, env.maxSessionSeconds * 1000);
         sessionTimer.unref?.();
 
-        ack?.({ ok: true, mode: "production", sessionId: session.sessionId, targetLanguages });
+        ack?.({ ok: true, mode: "production", sessionId: session.sessionId, targetLanguages, room: callRoomInfo });
       } catch (error) {
         console.error("Interpreter session start failed:", error?.message || error);
         const message = startErrorMessage(error);
@@ -303,7 +373,19 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         const audioBuffer = audioPayloadToBuffer(payload);
         if (audioBuffer.length < 64) return;
 
-        session.sendAudio(audioBuffer);
+        const processedAudio = audioPipeline?.preprocessAudioChunk(audioBuffer, {
+          sequence: Number.isFinite(sequence) ? sequence : undefined,
+          audioLevel: Number(payload?.audioLevel),
+          receivedAt: Number(payload?.capturedAt) || Date.now()
+        }) || { accepted: true, buffer: audioBuffer };
+
+        if (!processedAudio.accepted) {
+          socket.data.audioPipeline = audioPipeline?.getSnapshot?.() || socket.data.audioPipeline;
+          return;
+        }
+
+        session.sendAudio(processedAudio.buffer);
+        socket.data.audioPipeline = audioPipeline?.getSnapshot?.() || socket.data.audioPipeline;
       } catch {
         socket.emit("warning", { message: "Invalid audio chunk received." });
       }

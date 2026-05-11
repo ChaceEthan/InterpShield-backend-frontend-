@@ -139,6 +139,12 @@ interface DubbingQueueItem {
   createdAt: number;
 }
 
+interface EnhancedAudioStream {
+  stream: MediaStream;
+  audioContext: AudioContext | null;
+  getAudioLevel: () => number;
+}
+
 interface ProviderHealthStatus {
   status: 'healthy' | 'cooldown';
   cooldownUntil: number;
@@ -193,6 +199,9 @@ const HISTORY_PERSIST_DEBOUNCE_MS = 250;
 const MAX_DUBBING_QUEUE_ITEMS = 6;
 const MAX_SPOKEN_DUBBING_KEYS = 180;
 const DUBBING_UTTERANCE_TTL_MS = 45000;
+const MIN_MEDIA_CHUNK_BYTES = 192;
+const MIN_AUDIO_CHUNK_INTERVAL_MS = 90;
+const DUBBING_QUEUE_SETTLE_MS = 180;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
 const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
@@ -632,36 +641,67 @@ const buildAudioConstraints = ({
   if (supportedConstraints.sampleRate) audio.sampleRate = { ideal: 48000 };
   if (supportedConstraints.channelCount) audio.channelCount = { ideal: 1 };
   if (supportedConstraints.sampleSize) audio.sampleSize = { ideal: 16 };
-
   if (microphoneId !== "default") audio.deviceId = { exact: microphoneId };
   return audio;
 };
 
-const createAmplifiedAudioStream = (stream: MediaStream): { stream: MediaStream; audioContext: AudioContext | null } => {
+const createAmplifiedAudioStream = (stream: MediaStream): EnhancedAudioStream => {
   const AudioContextCtor = typeof window !== "undefined" ? window.AudioContext || window.webkitAudioContext : null;
-  if (!AudioContextCtor) return { stream, audioContext: null };
+  if (!AudioContextCtor) return { stream, audioContext: null, getAudioLevel: () => 0 };
 
   try {
     const audioContext = new AudioContextCtor();
     const source = audioContext.createMediaStreamSource(stream);
+    const highPass = audioContext.createBiquadFilter();
+    const lowPass = audioContext.createBiquadFilter();
     const gainNode = audioContext.createGain();
     const compressor = audioContext.createDynamicsCompressor();
+    const analyser = audioContext.createAnalyser();
     const destination = audioContext.createMediaStreamDestination();
+    let smoothedLevel = 0;
 
-    gainNode.gain.value = 1.2;
-    compressor.threshold.value = -24;
-    compressor.knee.value = 24;
-    compressor.ratio.value = 3;
+    highPass.type = "highpass";
+    highPass.frequency.value = 85;
+    highPass.Q.value = 0.7;
+
+    lowPass.type = "lowpass";
+    lowPass.frequency.value = 7600;
+    lowPass.Q.value = 0.8;
+
+    gainNode.gain.value = 1.35;
+    compressor.threshold.value = -30;
+    compressor.knee.value = 28;
+    compressor.ratio.value = 4.5;
     compressor.attack.value = 0.003;
-    compressor.release.value = 0.25;
+    compressor.release.value = 0.22;
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.72;
+    const timeDomainData = new Uint8Array(analyser.fftSize);
 
-    source.connect(gainNode);
-    gainNode.connect(compressor);
-    compressor.connect(destination);
+    source.connect(highPass);
+    highPass.connect(lowPass);
+    lowPass.connect(compressor);
+    compressor.connect(gainNode);
+    gainNode.connect(analyser);
+    analyser.connect(destination);
 
-    return { stream: destination.stream, audioContext };
+    const getAudioLevel = () => {
+      analyser.getByteTimeDomainData(timeDomainData);
+      let sumSquares = 0;
+
+      for (let index = 0; index < timeDomainData.length; index += 1) {
+        const centeredSample = (timeDomainData[index] - 128) / 128;
+        sumSquares += centeredSample * centeredSample;
+      }
+
+      const rms = Math.sqrt(sumSquares / timeDomainData.length);
+      smoothedLevel = smoothedLevel * 0.75 + rms * 0.25;
+      return smoothedLevel;
+    };
+
+    return { stream: destination.stream, audioContext, getAudioLevel };
   } catch {
-    return { stream, audioContext: null };
+    return { stream, audioContext: null, getAudioLevel: () => 0 };
   }
 };
 
@@ -1191,11 +1231,20 @@ export default function App() {
     translate: boolean;
     twoWay: boolean;
     mimeType: string;
+    roomId?: string;
+    participantId?: string;
+    audioProfile?: {
+      noiseSuppression: boolean;
+      echoCancellation: boolean;
+      autoGainControl: boolean;
+      webAudio: boolean;
+    };
     preferredProvider?: string;
     userPlan?: Plan;
   } | null>(null);
   const shouldRestartSessionOnReconnectRef = useRef(false);
   const sequenceRef = useRef(0);
+  const lastAudioChunkSentAtRef = useRef(0);
   const sessionStartedAtRef = useRef<number | null>(null);
   const lastInterimRef = useRef("");
   const lastFinalOriginalRef = useRef("");
@@ -1215,6 +1264,7 @@ export default function App() {
   const dubbingSpeakingRef = useRef(false);
   const activeDubbingUtteranceIdRef = useRef("");
   const activeDubbingLanguageRef = useRef("");
+  const lastDubbingTextRef = useRef("");
   const spokenDubbingKeysRef = useRef<Set<string>>(new Set());
   const historySignatureRef = useRef("");
   const persistedHistorySignaturesRef = useRef<Set<string>>(new Set());
@@ -1234,6 +1284,14 @@ export default function App() {
   const maxSessionSeconds = config?.maxSessionSeconds || 3600;
   const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
 
+  const stopDubbingPlayback = useCallback((clearQueue = true) => {
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    if (clearQueue) dubbingQueueRef.current = [];
+    dubbingSpeakingRef.current = false;
+    activeDubbingUtteranceIdRef.current = "";
+    activeDubbingLanguageRef.current = "";
+  }, []);
+
   const playNextDubbingUtterance = useCallback(() => {
     if (!("speechSynthesis" in window) || dubbingSpeakingRef.current) return;
 
@@ -1251,6 +1309,9 @@ export default function App() {
 
     const utterance = new SpeechSynthesisUtterance(nextUtterance.text);
     utterance.lang = speechLanguage(nextUtterance.language);
+    utterance.rate = nextUtterance.text.length > 140 ? 0.94 : 0.98;
+    utterance.pitch = 1;
+    utterance.volume = 0.92;
     const utteranceId = `${nextUtterance.translationId}:${nextUtterance.language}:${nextUtterance.createdAt}`;
     activeDubbingUtteranceIdRef.current = utteranceId;
     activeDubbingLanguageRef.current = nextUtterance.language;
@@ -1265,7 +1326,8 @@ export default function App() {
         activeDubbingLanguageRef.current = "";
       }
       dubbingSpeakingRef.current = false;
-      window.setTimeout(() => playNextDubbingUtterance(), 0);
+      const pauseMs = /[.!?]$/.test(nextUtterance.text.trim()) ? 220 : 360;
+      window.setTimeout(() => playNextDubbingUtterance(), pauseMs);
     };
 
     utterance.onend = finish;
@@ -1548,9 +1610,8 @@ export default function App() {
     activeSessionPayloadRef.current = null;
     shouldRestartSessionOnReconnectRef.current = false;
     sessionStartedAtRef.current = null;
-    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
-    dubbingQueueRef.current = [];
-    dubbingSpeakingRef.current = false;
+    lastAudioChunkSentAtRef.current = 0;
+    stopDubbingPlayback(true);
     activeDubbingUtteranceIdRef.current = "";
     activeDubbingLanguageRef.current = "";
     lastTranslationOriginalRef.current = "";
@@ -1563,7 +1624,7 @@ export default function App() {
       interimTimerRef.current = null;
     }
     pendingPartialTranscriptRef.current = null;
-  }, []);
+  }, [stopDubbingPlayback]);
 
   const stopSession = useCallback(() => {
     if (status === "stopping") return;
@@ -1676,6 +1737,9 @@ export default function App() {
       if (!originalText || originalText === lastInterimRef.current) return;
 
       lastInterimRef.current = originalText;
+      if (modeRef.current === "dubbing" && (window.speechSynthesis?.speaking || window.speechSynthesis?.pending)) {
+        stopDubbingPlayback(true);
+      }
       schedulePartialTranscript({ text: originalText, detectedLanguage });
     });
 
@@ -1688,6 +1752,7 @@ export default function App() {
 
       lastInterimRef.current = "";
       lastFinalOriginalRef.current = originalText;
+      if (modeRef.current === "dubbing") stopDubbingPlayback(true);
       pendingPartialTranscriptRef.current = null;
       if (subtitleThrottleTimerRef.current) {
         window.clearTimeout(subtitleThrottleTimerRef.current);
@@ -1805,7 +1870,7 @@ export default function App() {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [token, user]);
+  }, [token, user, stopDubbingPlayback]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1824,11 +1889,8 @@ export default function App() {
     if (!("speechSynthesis" in window)) return;
 
     if (mode !== "dubbing") {
-      window.speechSynthesis.cancel();
-      dubbingQueueRef.current = [];
-      dubbingSpeakingRef.current = false;
-      activeDubbingUtteranceIdRef.current = "";
-      activeDubbingLanguageRef.current = "";
+      stopDubbingPlayback(true);
+      lastDubbingTextRef.current = "";
       spokenDubbingKeysRef.current.clear();
       return;
     }
@@ -1837,6 +1899,7 @@ export default function App() {
     if (entries.length === 0) return;
 
     const translationId = activeTranslationIdRef.current || "current";
+    if (!lastCompletedTranslationRef.current.startsWith(`${translationId}|`)) return;
     const now = Date.now();
     dubbingQueueRef.current = dubbingQueueRef.current
       .filter((item) => item.translationId === translationId || now - item.createdAt <= DUBBING_UTTERANCE_TTL_MS)
@@ -1845,14 +1908,18 @@ export default function App() {
     for (const [language, translatedText] of entries) {
       const dubbingKey = `${translationId}:${language}:${translatedText}`;
       if (spokenDubbingKeysRef.current.has(dubbingKey)) continue;
+      if (dubbingQueueRef.current.some((item) => item.language === language && item.text === translatedText)) continue;
       spokenDubbingKeysRef.current.add(dubbingKey);
       dubbingQueueRef.current.push({ translationId, language, text: translatedText, createdAt: now });
     }
 
     spokenDubbingKeysRef.current = compactSetToLimit(spokenDubbingKeysRef.current, MAX_SPOKEN_DUBBING_KEYS);
     dubbingQueueRef.current = dubbingQueueRef.current.slice(-MAX_DUBBING_QUEUE_ITEMS);
-    playNextDubbingUtterance();
-  }, [mode, finalTranslations, targetLanguages, playNextDubbingUtterance]);
+    const nextTextSignature = entries.map(([language, translatedText]) => `${language}:${translatedText}`).join("|");
+    if (nextTextSignature === lastDubbingTextRef.current) return;
+    lastDubbingTextRef.current = nextTextSignature;
+    window.setTimeout(() => playNextDubbingUtterance(), DUBBING_QUEUE_SETTLE_MS);
+  }, [mode, finalTranslations, targetLanguages, playNextDubbingUtterance, stopDubbingPlayback]);
 
   const applyAuthSession = (session: { token: string; user: AppUser }) => {
     setToken(session.token);
@@ -2033,10 +2100,24 @@ export default function App() {
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (event) => {
-        if (event.data.size < 128 || !socketRef.current?.connected) return;
+        if (event.data.size < MIN_MEDIA_CHUNK_BYTES || !socketRef.current?.connected) return;
 
-        socketRef.current.emit("audio_chunk", event.data);
         sequenceRef.current += 1;
+        const capturedAt = Date.now();
+        const audioLevel = enhancedAudio.getAudioLevel();
+        const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
+
+        if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.006) return;
+
+        lastAudioChunkSentAtRef.current = capturedAt;
+        socketRef.current.emit("audio_chunk", {
+          audio: event.data,
+          sequence: sequenceRef.current,
+          audioLevel,
+          chunkMs: audioChunkMsRef.current,
+          capturedAt,
+          mimeType: mimeType || "audio/webm"
+        });
         if (sequenceRef.current % 3 === 0) setChunkCount(sequenceRef.current);
       };
 
@@ -2055,6 +2136,14 @@ export default function App() {
         translate: modeRef.current !== "transcribe",
         twoWay,
         mimeType: mimeType || "audio/webm",
+        roomId: shareableMode ? `live:${user?.id || "guest"}` : undefined,
+        participantId: user?.id || socketRef.current?.id || "browser",
+        audioProfile: {
+          noiseSuppression,
+          echoCancellation,
+          autoGainControl,
+          webAudio: Boolean(enhancedAudio.audioContext)
+        },
         preferredProvider,
         userPlan: user?.plan || "free"
       };
@@ -2090,7 +2179,7 @@ export default function App() {
 
       setAlert("Microphone not detected");
     }
-  }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, refreshMicrophones, sourceLang, targetLang, targetLanguages, twoWay]);
+  }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, shareableMode, sourceLang, targetLang, targetLanguages, twoWay, user?.id, user?.plan]);
 
   const selectMode = (nextMode: Mode) => {
     if (isRecording) return;
@@ -2136,12 +2225,9 @@ export default function App() {
     activeTranslationIdRef.current = "";
     pendingFinalTranscriptRef.current = null;
     spokenDubbingKeysRef.current.clear();
-    dubbingQueueRef.current = [];
-    dubbingSpeakingRef.current = false;
-    activeDubbingUtteranceIdRef.current = "";
-    activeDubbingLanguageRef.current = "";
+    lastDubbingTextRef.current = "";
+    stopDubbingPlayback(true);
     pendingPartialTranscriptRef.current = null;
-    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     if (subtitleThrottleTimerRef.current) {
       window.clearTimeout(subtitleThrottleTimerRef.current);
       subtitleThrottleTimerRef.current = null;
