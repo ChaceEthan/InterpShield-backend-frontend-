@@ -8,8 +8,10 @@ const safeHistoryItem = (item) => ({
   title: item.title,
   sourceLang: item.sourceLang,
   targetLang: item.targetLang,
+  targetLanguages: item.targetLanguages,
   originalText: item.originalText,
   translatedText: item.translatedText,
+  translations: item.translations,
   durationSeconds: item.durationSeconds,
   createdAt: item.createdAt?.toISOString?.() || item.createdAt
 });
@@ -63,8 +65,12 @@ export const saveHistoryItem = async (userId, payload = {}, env) => {
     title: payload.title?.trim() || "Live interpreter session",
     sourceLang: payload.sourceLang || "en",
     targetLang: payload.targetLang || "es",
+    targetLanguages: Array.isArray(payload.targetLanguages) ? payload.targetLanguages.slice(0, 3) : undefined,
     originalText: payload.originalText || "",
     translatedText: payload.translatedText || "",
+    translations: payload.translations && typeof payload.translations === "object" && !Array.isArray(payload.translations)
+      ? payload.translations
+      : undefined,
     durationSeconds: Number(payload.durationSeconds || 0)
   });
 

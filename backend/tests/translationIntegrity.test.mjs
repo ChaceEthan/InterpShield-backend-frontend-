@@ -3,10 +3,12 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { isTranslationDisplayable } from "../services/interpreter.js";
+import { resolveLocalTranslation } from "../utils/translationEnhancer.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const interpreterSource = readFileSync(resolve(__dirname, "../services/interpreter.js"), "utf8");
 const socketSource = readFileSync(resolve(__dirname, "../sockets/interpreterSocket.js"), "utf8");
+const frontendSource = readFileSync(resolve(__dirname, "../../frontend/src/App.tsx"), "utf8");
 
 const source = "Can you please give me your book?";
 
@@ -54,5 +56,21 @@ for (const [name, text, targetLang] of acceptedTranslations) {
 
 assert.match(interpreterSource, /FAST_LOCAL_LANGUAGE_CODES\s*=\s*new Set\(\["rw",\s*"rn",\s*"sw",\s*"luganda"\]\)/);
 assert.match(interpreterSource, /normalized === "lg".*return "luganda"/s);
+assert.match(interpreterSource, /TRANSLATION_STARTED/);
+assert.match(interpreterSource, /TRANSLATION_PROVIDER/);
+assert.match(interpreterSource, /TRANSLATION_SUCCESS/);
+assert.match(interpreterSource, /TRANSLATION_FAILED/);
 assert.doesNotMatch(interpreterSource, /sourceLanguageFallbackText|provider:\s*"source"|\[[Ee][Nn]\]/);
 assert.match(socketSource, /isTranslationDisplayable/);
+assert.match(socketSource, /SOCKET_TRANSLATION_EMIT/);
+assert.match(socketSource, /translation_result/);
+assert.match(socketSource, /translated_text/);
+assert.match(frontendSource, /FRONTEND_TRANSLATION_RECEIVED/);
+assert.match(frontendSource, /translation_result/);
+assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "es" }), "Me puedes dar tu libro, por favor");
+assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "zh" }), "请把你的书给我");
+assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "rw" }), "urashobora kumpa igitabo cyawe");
+assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "rn" }), "urashobora kumpa igitabu cawe");
+assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "sw" }), "unaweza kunipa kitabu chako");
+assert.equal(resolveLocalTranslation({ text: "Urashobora kumpa igitabo cyawe?", sourceLang: "rw", targetLang: "en" }), "can you give me your book");
+assert.equal(resolveLocalTranslation({ text: "Unaweza kunipa kitabu chako?", sourceLang: "sw", targetLang: "en" }), "can you give me your book");

@@ -103,7 +103,7 @@ const buildSystemPrompt = ({ sourceLang, targetLang, translationContext }) => {
   ].join("\n");
 };
 
-export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang, translationContext }) => {
+export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang, translationContext, signal }) => {
   const cleanText = text?.trim();
 
   if (!cleanText || !apiKey) {
@@ -112,6 +112,7 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
 
   const response = await fetch(OPENAI_RESPONSES_URL, {
     method: "POST",
+    signal,
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json"

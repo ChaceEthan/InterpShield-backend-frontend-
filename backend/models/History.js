@@ -21,6 +21,10 @@ const historySchema = new mongoose.Schema(
       type: String,
       default: "es"
     },
+    targetLanguages: {
+      type: [String],
+      default: undefined
+    },
     originalText: {
       type: String,
       default: ""
@@ -28,6 +32,10 @@ const historySchema = new mongoose.Schema(
     translatedText: {
       type: String,
       default: ""
+    },
+    translations: {
+      type: mongoose.Schema.Types.Mixed,
+      default: undefined
     },
     durationSeconds: {
       type: Number,

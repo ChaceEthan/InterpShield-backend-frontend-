@@ -3,6 +3,33 @@ import { verifyToken } from "../services/authService.js";
 import { createInterpreterSession, isTranslationDisplayable } from "../services/interpreter.js";
 
 const MAX_TARGET_LANGUAGES = 3;
+const LOG_TEXT_PREVIEW_CHARS = 96;
+
+const logSocketTranslationEvent = (event, payload = {}) => {
+  const safePayload = {};
+
+  for (const [key, value] of Object.entries(payload || {})) {
+    if (value === undefined || value === null || value === "") continue;
+    safePayload[key] = typeof value === "string" && value.length > LOG_TEXT_PREVIEW_CHARS
+      ? `${value.slice(0, LOG_TEXT_PREVIEW_CHARS)}...`
+      : value;
+  }
+
+  console.info(`[${event}]`, safePayload);
+};
+
+const normalizeSocketLanguageCode = (language = "") => {
+  const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
+  if (!normalized) return "";
+  if (normalized === "ug" || normalized === "lg" || normalized === "lg-ug" || normalized === "lug" || normalized === "luganda") return "luganda";
+  if (normalized.startsWith("rw")) return "rw";
+  if (normalized.startsWith("rn")) return "rn";
+  if (normalized.startsWith("sw")) return "sw";
+  if (normalized.startsWith("zh")) return "zh";
+  if (normalized.startsWith("es")) return "es";
+  if (normalized.startsWith("en")) return "en";
+  return normalized.split("-")[0] || normalized;
+};
 
 const audioPayloadToBuffer = (audio) => {
   if (Buffer.isBuffer(audio)) return audio;
@@ -24,7 +51,7 @@ const normalizeTargetLanguages = (targetLanguages, fallbackTargetLang = "es") =>
   const uniqueLanguages = [];
 
   for (const language of requestedLanguages) {
-    const code = String(language || "").trim();
+    const code = normalizeSocketLanguageCode(language);
     if (!code || uniqueLanguages.includes(code)) continue;
     uniqueLanguages.push(code);
     if (uniqueLanguages.length === MAX_TARGET_LANGUAGES) break;
@@ -119,6 +146,21 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     socket.emit("server-config", getPublicConfig());
 
     const emitInterpreterResult = (result) => {
+      const emitTranslationPayload = (payload) => {
+        logSocketTranslationEvent("SOCKET_TRANSLATION_EMIT", {
+          socketId: socket.id,
+          sourceLang: payload.sourceLang,
+          targetLanguages: payload.targetLanguages,
+          provider: payload.provider,
+          partial: payload.partial,
+          complete: payload.complete,
+          text: payload.text
+        });
+        socket.emit("translation_update", payload);
+        socket.emit("translation_result", payload);
+        socket.emit("translated_text", payload);
+      };
+
       if (result?.type === "admin_stats") {
         socket.emit("result", result);
         return;
@@ -141,7 +183,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         const translations = safe.translations;
 
         if (Object.keys(translations).length > 0) {
-          socket.emit("translation_update", {
+          emitTranslationPayload({
             original: result.originalText,
             text: safe.translatedText,
             translations,
@@ -179,7 +221,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       const translations = safe.translations;
 
       if (Object.keys(translations).length > 0) {
-        socket.emit("translation_update", {
+        emitTranslationPayload({
           original: result.originalText,
           text: safe.translatedText,
           translations,
@@ -199,7 +241,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     const handleStartSession = async (payload = {}, ack) => {
       stopSession();
 
-      const sourceLang = payload.sourceLang || "en";
+      const sourceLang = normalizeSocketLanguageCode(payload.sourceLang || "en") || "en";
       const targetLanguages = normalizeTargetLanguages(payload.targetLanguages, payload.targetLang || "es");
       const targetLang = targetLanguages[0];
       const shouldTranslate = payload.translate !== false;

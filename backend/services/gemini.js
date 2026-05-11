@@ -30,6 +30,20 @@ const normalizeTranslatedText = ({ text, targetLang }) => {
   return enhanceTranslation({ text: cleanText, targetLang });
 };
 
+const extractGeminiText = (response = {}) => {
+  if (typeof response.text === "function") return String(response.text() || "").trim();
+  if (typeof response.text === "string") return response.text.trim();
+
+  const textParts = [];
+  for (const candidate of response.candidates || []) {
+    for (const part of candidate?.content?.parts || []) {
+      if (typeof part?.text === "string") textParts.push(part.text);
+    }
+  }
+
+  return textParts.join(" ").trim();
+};
+
 const contextInstructions = (translationContext = {}) => {
   const instructions = [];
   const accentProfile = translationContext.accentProfile;
@@ -111,7 +125,7 @@ const translateOnce = async ({ apiKey, text, sourceLang, targetLang, translation
     }
   });
 
-  const translatedText = normalizeTranslatedText({ text: response.text || "", targetLang });
+  const translatedText = normalizeTranslatedText({ text: extractGeminiText(response), targetLang });
   if (!translatedText) {
     throw new Error(`Gemini returned an empty translation for ${targetLanguage || targetLang}`);
   }

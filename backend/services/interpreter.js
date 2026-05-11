@@ -25,7 +25,7 @@ const FAST_LOCAL_LANGUAGE_CODES = new Set(["rw", "rn", "sw", "luganda"]);
 const FAST_LOCAL_MAX_ACTIVE_TRANSLATIONS = 8;
 const PROVIDER_MAX_ACTIVE_TRANSLATIONS = 4;
 const MAX_TRANSLATION_LANE_QUEUE_SIZE = 10;
-const STALE_JOB_TIMEOUT = 5500;
+const STALE_JOB_TIMEOUT = 12000;
 const TRANSLATION_RATE_LIMIT_DELAY_MS = 80;
 const CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS = 3000;
 const LATENCY_WINDOW_SIZE = 5;
@@ -61,7 +61,7 @@ const FAST_LOCAL_TRANSLATION_CACHE_TTL_MS = 25 * 60 * 1000;
 const PROVIDER_TRANSLATION_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const PARTIAL_TRANSLATION_PREVIEW_THROTTLE_MS = 140;
 const ADMIN_STATS_EMIT_MS = 10000;
-const TRANSLATION_ATTEMPT_TIMEOUT_MS = 2500;
+const TRANSLATION_ATTEMPT_TIMEOUT_MS = 7000;
 const PROVIDER_FALLBACK_STAGGER_MS = 450;
 const PROVIDER_FAILURE_THRESHOLD = 3;
 const PROVIDER_COOLDOWN_MS = 45000;
@@ -69,8 +69,23 @@ const SESSION_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
 const SESSION_HEALTH_CHECK_MS = 2500;
 const MAX_STALE_TRANSLATION_JOBS = 40;
 const MAX_PENDING_SENTENCE_CHARS = 1400;
+const LOG_TEXT_PREVIEW_CHARS = 96;
 const sessionHistoryStore = new Map();
 const sharedTranslationCache = new Map();
+
+const logTranslationEvent = (event, payload = {}, level = "info") => {
+  const safePayload = {};
+
+  for (const [key, value] of Object.entries(payload || {})) {
+    if (value === undefined || value === null || value === "") continue;
+    safePayload[key] = typeof value === "string" && value.length > LOG_TEXT_PREVIEW_CHARS
+      ? `${value.slice(0, LOG_TEXT_PREVIEW_CHARS)}...`
+      : value;
+  }
+
+  const logger = level === "warn" ? console.warn : console.info;
+  logger(`[${event}]`, safePayload);
+};
 
 const createSessionId = () => {
   if (globalThis.crypto?.randomUUID) {
@@ -190,7 +205,7 @@ const normalizeTargetLanguages = (targetLanguages, fallbackTargetLang = "es") =>
   const uniqueLanguages = [];
 
   for (const language of requestedLanguages) {
-    const code = String(language || "").trim();
+    const code = normalizeInterpreterLanguageCode(language) || String(language || "").trim().toLowerCase();
     if (!code || uniqueLanguages.includes(code)) continue;
     uniqueLanguages.push(code);
     if (uniqueLanguages.length === MAX_TARGET_LANGUAGES) break;
@@ -214,7 +229,7 @@ const normalizeInterpreterLanguageCode = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
   if (!normalized) return "";
   if (normalized === "auto") return "auto";
-  if (normalized === "lg" || normalized === "lg-ug" || normalized === "lug" || normalized === "luganda") return "luganda";
+  if (normalized === "ug" || normalized === "lg" || normalized === "lg-ug" || normalized === "lug" || normalized === "luganda") return "luganda";
   if (normalized.startsWith("rw")) return "rw";
   if (normalized.startsWith("rn")) return "rn";
   if (normalized.startsWith("sw")) return "sw";
@@ -1264,6 +1279,26 @@ export const createInterpreterSession = async ({
     };
   };
 
+  const translateLocalFallbackLanguage = ({ language, translationInput, direction, translationContext }) => {
+    const languageTranslationContext = languageTranslationContextFor(language, translationContext);
+    const fallbackText = String(resolveFastLocalTranslation({ language, translationInput, direction }) || "").trim();
+
+    if (
+      isTranslationDisplayable({
+        text: fallbackText,
+        sourceText: translationInput,
+        sourceLang: direction.source,
+        targetLang: language,
+        provider: "local-fallback"
+      })
+    ) {
+      noteTranslationSuccess(language, fallbackText, languageTranslationContext);
+      return { text: fallbackText, provider: "local-fallback" };
+    }
+
+    return { text: "", provider: "local-fallback" };
+  };
+
   const providerRunner = (provider) => (provider === "gemini" ? translateWithGemini : translateWithOpenAI);
 
   const runProviderTranslationAttempt = async ({ provider, language, translationInput, direction, languageTranslationContext, jobId }) => {
@@ -1286,6 +1321,14 @@ export const createInterpreterSession = async ({
 
     const providerName = provider === "gemini" ? "Gemini" : "OpenAI";
     const attemptStartedAt = Date.now();
+    const abortController = typeof AbortController !== "undefined" ? new AbortController() : null;
+    logTranslationEvent("TRANSLATION_PROVIDER", {
+      jobId,
+      provider,
+      sourceLang: direction.source,
+      targetLang: language,
+      chars: translationInput.length
+    });
 
     try {
       const translatedText = await withTimeout(
@@ -1294,11 +1337,12 @@ export const createInterpreterSession = async ({
           text: translationInput,
           sourceLang: direction.source,
           targetLang: language,
-          translationContext: languageTranslationContext
+          translationContext: languageTranslationContext,
+          signal: abortController?.signal
         }),
         TRANSLATION_ATTEMPT_TIMEOUT_MS,
         `${providerName} translation timed out for ${language}`
-      );
+      ).finally(() => abortController?.abort());
       const responseTimeMs = Date.now() - attemptStartedAt;
       const safeTranslatedText = String(translatedText || "").trim();
 
@@ -1320,12 +1364,26 @@ export const createInterpreterSession = async ({
         };
       }
 
+      logTranslationEvent("TRANSLATION_FAILED", {
+        jobId,
+        provider,
+        targetLang: language,
+        error: `Invalid ${providerName} translation response`
+      }, "warn");
+
       return {
         provider,
         responseTimeMs,
         error: new Error(`Invalid ${providerName} translation response for ${language}`)
       };
     } catch (error) {
+      abortController?.abort();
+      logTranslationEvent("TRANSLATION_FAILED", {
+        jobId,
+        provider,
+        targetLang: language,
+        error: error?.message || String(error)
+      }, "warn");
       return {
         provider,
         error,
@@ -1354,6 +1412,13 @@ export const createInterpreterSession = async ({
     }
 
     const healthyProviders = getHealthyProviders();
+    if (healthyProviders.length === 0) {
+      logTranslationEvent("TRANSLATION_FAILED", {
+        jobId,
+        targetLang: language,
+        error: "No healthy translation providers available"
+      }, "warn");
+    }
 
     const pendingAttempts = [];
     const startProvider = (provider) =>
@@ -1441,6 +1506,14 @@ export const createInterpreterSession = async ({
       noteTranslationSuccess(language, failureCachedTranslation, languageTranslationContext);
       return { text: failureCachedTranslation, provider: "cache" };
     }
+
+    const localFallback = translateLocalFallbackLanguage({
+      language,
+      translationInput,
+      direction,
+      translationContext
+    });
+    if (localFallback.text) return localFallback;
 
     return { text: "", provider: "retry" };
   };
@@ -1637,6 +1710,15 @@ export const createInterpreterSession = async ({
     job.translations[language] = safeTranslatedText;
     const translationOutputs = translationOutputsForJob(job);
 
+    logTranslationEvent("TRANSLATION_SUCCESS", {
+      jobId: job.id,
+      provider,
+      sourceLang: job.direction.source,
+      targetLang: language,
+      latencyMs: Date.now() - job.startedAt,
+      text: safeTranslatedText
+    });
+
     onResult?.({
       original: job.sentence,
       originalText: job.sentence,
@@ -1671,6 +1753,13 @@ export const createInterpreterSession = async ({
 
     if (translatedText) {
       rememberTranscriptEntry(job, translatedText);
+    } else if (job.shouldTranslate) {
+      logTranslationEvent("TRANSLATION_FAILED", {
+        jobId: job.id,
+        sourceLang: job.direction.source,
+        targetLanguages: job.direction.targets,
+        error: "Translation job completed without displayable output"
+      }, "warn");
     }
 
     onResult?.({
@@ -2085,6 +2174,14 @@ export const createInterpreterSession = async ({
       mode: "production"
     });
 
+    logTranslationEvent("TRANSLATION_STARTED", {
+      jobId,
+      sourceLang: direction.source,
+      targetLanguages: direction.targets,
+      chars: translationInput.length,
+      text: sentence
+    });
+
     enqueueTranslationJob(job);
 
     if (currentSentence.trim()) {
@@ -2195,6 +2292,13 @@ export const createInterpreterSession = async ({
         return;
       }
       lastFinalTranscript = normalized;
+      logTranslationEvent("TRANSCRIPT_RECEIVED", {
+        sourceLang: direction.source,
+        targetLanguages: direction.targets,
+        detectedLanguage: effectiveDetectedLanguage,
+        chars: displayText.length,
+        text: displayText
+      });
       currentDirection = direction;
       currentDetectedLanguage = effectiveDetectedLanguage;
       rememberLocalSourceLanguage({

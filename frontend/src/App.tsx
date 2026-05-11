@@ -113,8 +113,10 @@ interface HistoryItem {
   title: string;
   sourceLang: string;
   targetLang: string;
+  targetLanguages?: string[];
   originalText: string;
   translatedText: string;
+  translations?: Record<string, string>;
   durationSeconds: number;
   createdAt: string;
 }
@@ -360,7 +362,23 @@ const normalizeTargetLanguages = (languages?: unknown, fallback = DEFAULT_TARGET
   const normalized: string[] = [];
 
   for (const language of requestedLanguages) {
-    const code = String(language || "").trim();
+    const rawCode = String(language || "").trim().toLowerCase().replace("_", "-");
+    const code =
+      rawCode === "ug" || rawCode === "lg" || rawCode === "lg-ug" || rawCode === "lug"
+        ? "luganda"
+        : rawCode.startsWith("rw")
+          ? "rw"
+          : rawCode.startsWith("rn")
+            ? "rn"
+            : rawCode.startsWith("sw")
+              ? "sw"
+              : rawCode.startsWith("zh")
+                ? "zh"
+                : rawCode.startsWith("es")
+                  ? "es"
+                  : rawCode.startsWith("en")
+                    ? "en"
+                    : rawCode.split("-")[0] || rawCode;
     if (!code || !validCodes.has(code) || normalized.includes(code)) continue;
     normalized.push(code);
     if (normalized.length === MAX_TARGET_LANGUAGES) break;
@@ -372,7 +390,7 @@ const normalizeTargetLanguages = (languages?: unknown, fallback = DEFAULT_TARGET
 
 const normalizeLanguageCode = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
-  if (normalized === "lg" || normalized === "lg-ug" || normalized === "lug") return "luganda";
+  if (normalized === "ug" || normalized === "lg" || normalized === "lg-ug" || normalized === "lug") return "luganda";
   if (normalized.startsWith("rw")) return "rw";
   if (normalized.startsWith("rn")) return "rn";
   if (normalized.startsWith("sw")) return "sw";
@@ -1199,6 +1217,10 @@ export default function App() {
   const activeDubbingLanguageRef = useRef("");
   const spokenDubbingKeysRef = useRef<Set<string>>(new Set());
   const historySignatureRef = useRef("");
+  const persistedHistorySignaturesRef = useRef<Set<string>>(new Set());
+  const tokenRef = useRef(token);
+  const saveTranscriptRef = useRef(saveTranscript);
+  const sessionSecondsRef = useRef(sessionSeconds);
   const sessionActionInFlightRef = useRef(false);
   const authRequestRef = useRef<AuthProvider | null>(null);
 
@@ -1290,7 +1312,7 @@ export default function App() {
   const applyUserSettings = (settings?: UserSettings) => {
     if (!settings) return;
 
-    setSourceLang(settings.preferredSourceLang || "en");
+    setSourceLang(normalizeLanguageCode(settings.preferredSourceLang || "en") || "en");
     setTargetLanguages(normalizeTargetLanguages(settings.preferredTargetLanguages, settings.preferredTargetLang || DEFAULT_TARGET_LANGUAGES[0]));
     setPreferredProvider(settings.preferredProvider || "auto");
     setPrivateMode(settings.privateMode ?? true);
@@ -1366,6 +1388,18 @@ export default function App() {
   }, [mode]);
 
   useEffect(() => {
+    tokenRef.current = token;
+  }, [token]);
+
+  useEffect(() => {
+    saveTranscriptRef.current = saveTranscript;
+  }, [saveTranscript]);
+
+  useEffect(() => {
+    sessionSecondsRef.current = sessionSeconds;
+  }, [sessionSeconds]);
+
+  useEffect(() => {
     sourceLangRef.current = sourceLang;
     targetLangRef.current = targetLang;
     targetLanguagesRef.current = targetLanguages;
@@ -1421,6 +1455,26 @@ export default function App() {
     const translated = entry.translated.trim();
 
     if (!original || !isValidTranslationText({ text: translated, sourceText: original, targetLang: entry.targetLang })) return;
+
+    const persistenceSignature = `${entry.timestamp}|${original}|${translated}`;
+    if (saveTranscriptRef.current && tokenRef.current && !persistedHistorySignaturesRef.current.has(persistenceSignature)) {
+      persistedHistorySignaturesRef.current.add(persistenceSignature);
+      void requestApi<{ item: HistoryItem }>("/api/user/history", {
+        method: "POST",
+        body: JSON.stringify({
+          title: original.slice(0, 80) || "Live interpreter session",
+          sourceLang: entry.sourceLang,
+          targetLang: entry.targetLang,
+          targetLanguages: entry.targetLanguages,
+          originalText: original,
+          translatedText: translated,
+          translations: entry.translations,
+          durationSeconds: sessionSecondsRef.current
+        })
+      }, tokenRef.current).catch(() => {
+        persistedHistorySignaturesRef.current.delete(persistenceSignature);
+      });
+    }
 
     setHistory((current) => {
       const historySignature = `${entry.timestamp}|${original}|${translated}`;
@@ -1681,7 +1735,7 @@ export default function App() {
       }
     });
 
-    socket.on("translation_update", ({ original, text, translations, latencyMs, provider, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete }: { original?: string; text?: string; translations?: Record<string, string>; latencyMs?: number; provider?: string; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean }) => {
+    const handleTranslationUpdate = ({ original, text, translations, latencyMs, provider, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete }: { original?: string; text?: string; translations?: Record<string, string>; latencyMs?: number; provider?: string; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean }) => {
       const pendingTranscript = pendingFinalTranscriptRef.current;
       const updateOriginal = original?.trim() || "";
 
@@ -1695,8 +1749,19 @@ export default function App() {
       const nextTranslation = formatTranslationsText(nextTranslations, nextTargetLanguages);
       const nextTranslationSignature = JSON.stringify(orderedTranslationEntries(nextTranslations, nextTargetLanguages));
       const isComplete = complete !== false && !partial;
+      const completedSignature = isComplete
+        ? `${activeTranslationIdRef.current || pendingTranscript?.timestamp || "current"}|${nextTranslationSignature}`
+        : "";
 
       if (!nextTranslation || (!isComplete && nextTranslationSignature === lastFinalTranslationRef.current)) return;
+      if (isComplete && completedSignature === lastCompletedTranslationRef.current && nextTranslationSignature === lastFinalTranslationRef.current) return;
+      console.info("[FRONTEND_TRANSLATION_RECEIVED]", {
+        provider,
+        targetLanguages: nextTargetLanguages,
+        partial: Boolean(partial),
+        complete: isComplete,
+        chars: nextTranslation.length
+      });
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
       trackLatency(latencyMs, provider);
 
@@ -1705,7 +1770,6 @@ export default function App() {
       setFinalTranslations(nextTranslations);
 
       if (isComplete) {
-        const completedSignature = `${activeTranslationIdRef.current || pendingTranscript?.timestamp || "current"}|${nextTranslationSignature}`;
         if (completedSignature === lastCompletedTranslationRef.current) return;
         lastCompletedTranslationRef.current = completedSignature;
 
@@ -1722,7 +1786,11 @@ export default function App() {
         });
         pendingFinalTranscriptRef.current = null;
       }
-    });
+    };
+
+    socket.on("translation_update", handleTranslationUpdate);
+    socket.on("translation_result", handleTranslationUpdate);
+    socket.on("translated_text", handleTranslationUpdate);
 
     return () => {
       if (interimTimerRef.current) {
@@ -1978,9 +2046,10 @@ export default function App() {
         cleanupMedia();
       };
 
+      const activeSourceLang = normalizeLanguageCode(sourceLang) || "en";
       const activeTargetLanguages = normalizeTargetLanguages(targetLanguages, targetLang);
       const sessionPayload = {
-        sourceLang,
+        sourceLang: activeSourceLang,
         targetLang: activeTargetLanguages[0],
         targetLanguages: activeTargetLanguages,
         translate: modeRef.current !== "transcribe",
@@ -2517,7 +2586,14 @@ export default function App() {
             </div>
             <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
               <p className="rounded-lg border border-white/10 bg-slate-950/60 p-3 text-sm text-slate-300">{item.originalText || "No transcript text"}</p>
-              <p className="rounded-lg border border-blue-500/10 bg-blue-500/5 p-3 text-sm text-blue-50">{item.translatedText || "No translation text"}</p>
+              <div className="rounded-lg border border-blue-500/10 bg-blue-500/5 p-3 text-sm text-blue-50">
+                {orderedTranslationEntries(
+                  normalizeTranslationMap(item.translations, item.translatedText, item.targetLang, { sourceText: item.originalText }),
+                  item.targetLanguages || [item.targetLang]
+                ).map(([language, translatedText]) => (
+                  <p key={language}><span className="font-black text-blue-200">{language.toUpperCase()}:</span> {translatedText}</p>
+                ))}
+              </div>
             </div>
           </GlassPanel>
         ))}

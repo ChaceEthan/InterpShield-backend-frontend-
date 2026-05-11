@@ -78,6 +78,101 @@ export const LOCAL_PHRASES = {
 };
 
 export const LOCAL_TRANSLATIONS = {
+  es: {
+    en: {
+      hello: "hola",
+      "how are you": "como estas?",
+      "good morning": "buenos dias",
+      "good evening": "buenas noches",
+      "thank you": "gracias",
+      "thank you very much": "muchas gracias",
+      yes: "si",
+      no: "no",
+      okay: "vale",
+      "no problem": "no hay problema",
+      please: "por favor",
+      "can you please give me your book": "Me puedes dar tu libro, por favor",
+      "can you give me your book": "Me puedes dar tu libro",
+      "i need help": "necesito ayuda",
+      "i need your help now": "necesito tu ayuda ahora"
+    }
+  },
+  fr: {
+    en: {
+      hello: "bonjour",
+      "how are you": "comment allez-vous?",
+      "good morning": "bonjour",
+      "good evening": "bonsoir",
+      "thank you": "merci",
+      "thank you very much": "merci beaucoup",
+      yes: "oui",
+      no: "non",
+      okay: "d'accord",
+      "no problem": "pas de probleme",
+      please: "s'il vous plait",
+      "can you please give me your book": "Peux-tu me donner ton livre, s'il te plait",
+      "can you give me your book": "Peux-tu me donner ton livre",
+      "i need help": "j'ai besoin d'aide",
+      "i need your help now": "j'ai besoin de ton aide maintenant"
+    }
+  },
+  de: {
+    en: {
+      hello: "hallo",
+      "how are you": "wie geht es dir?",
+      "good morning": "guten morgen",
+      "good evening": "guten abend",
+      "thank you": "danke",
+      "thank you very much": "vielen dank",
+      yes: "ja",
+      no: "nein",
+      okay: "in ordnung",
+      "no problem": "kein problem",
+      please: "bitte",
+      "can you please give me your book": "Kannst du mir bitte dein Buch geben",
+      "can you give me your book": "Kannst du mir dein Buch geben",
+      "i need help": "ich brauche Hilfe",
+      "i need your help now": "ich brauche jetzt deine Hilfe"
+    }
+  },
+  zh: {
+    en: {
+      hello: "你好",
+      "how are you": "你好吗?",
+      "good morning": "早上好",
+      "good evening": "晚上好",
+      "thank you": "谢谢",
+      "thank you very much": "非常感谢",
+      yes: "是",
+      no: "不是",
+      okay: "好的",
+      "no problem": "没问题",
+      please: "请",
+      "can you please give me your book": "请把你的书给我",
+      "can you give me your book": "你能把你的书给我吗",
+      "i need help": "我需要帮助",
+      "i need your help now": "我现在需要你的帮助"
+    }
+  },
+  ja: {
+    en: {
+      hello: "こんにちは",
+      "how are you": "お元気ですか?",
+      "good morning": "おはようございます",
+      "good evening": "こんばんは",
+      "thank you": "ありがとうございます",
+      "thank you very much": "本当にありがとうございます",
+      yes: "はい",
+      no: "いいえ",
+      okay: "大丈夫です",
+      "no problem": "問題ありません",
+      please: "お願いします",
+      "can you please give me your book": "あなたの本を渡してもらえますか",
+      "can you give me your book": "あなたの本を渡してもらえますか",
+      "i need help": "助けが必要です",
+      "i need your help now": "今あなたの助けが必要です"
+    }
+  },
   en: {
     rw: {
       amakuru: "how are you",
@@ -94,7 +189,10 @@ export const LOCAL_TRANSLATIONS = {
       mwiriwe: "good evening",
       bite: "what's up",
       "nta kibazo": "no problem",
-      "ntacyo bitwaye": "no problem"
+      "ntacyo bitwaye": "no problem",
+      "urashobora kumpa igitabo cyawe": "can you give me your book",
+      "ndagusabye mfasha": "please help me",
+      "nkeneye ubufasha": "i need help"
     },
     rn: {
       amakuru: "how are you",
@@ -108,7 +206,10 @@ export const LOCAL_TRANSLATIONS = {
       cane: "very much",
       amahoro: "hello",
       mwaramutse: "good morning",
-      "ni vyiza": "it is good"
+      "ni vyiza": "it is good",
+      "urashobora kumpa igitabu cawe": "can you give me your book",
+      "ndagusavye mfasha": "please help me",
+      "nkeneye ubufasha": "i need help"
     },
     sw: {
       habari: "how are you",
@@ -120,7 +221,10 @@ export const LOCAL_TRANSLATIONS = {
       karibu: "welcome",
       jambo: "hello",
       ndio: "yes",
-      hapana: "no"
+      hapana: "no",
+      "unaweza kunipa kitabu chako": "can you give me your book",
+      "tafadhali nisaidie": "please help me",
+      "ninahitaji msaada": "i need help"
     },
     luganda: {
       ssebo: "sir",
@@ -147,6 +251,7 @@ export const LOCAL_TRANSLATIONS = {
       "i know": "ndabizi",
       problem: "ikibazo",
       "no problem": "ntacyo bitwaye",
+      "can you please give me your book": "urashobora kumpa igitabo cyawe",
       okay: "ni byiza",
       "it is okay": "ni byiza"
     }
@@ -162,6 +267,7 @@ export const LOCAL_TRANSLATIONS = {
       no: "oya",
       okay: "ni vyiza",
       "it is okay": "ni vyiza",
+      "can you please give me your book": "urashobora kumpa igitabu cawe",
       "i know": "ndabizi",
       problem: "ikibazo"
     }
@@ -178,6 +284,7 @@ export const LOCAL_TRANSLATIONS = {
       please: "tafadhali",
       yes: "ndio",
       no: "hapana",
+      "can you please give me your book": "unaweza kunipa kitabu chako",
       welcome: "karibu"
     }
   },
@@ -190,6 +297,7 @@ export const LOCAL_TRANSLATIONS = {
       madam: "nyabo",
       friend: "mukwano",
       please: "banange",
+      "can you please give me your book": "osobola okumpa ekitabo kyo",
       "well done": "gyebale"
     }
   }

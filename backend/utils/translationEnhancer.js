@@ -28,7 +28,7 @@ const countMarkerMatches = (normalizedText, markers = []) =>
 const normalizeLanguageCode = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
   if (!normalized) return "";
-  if (normalized === "lg" || normalized === "lg-ug" || normalized === "lug" || normalized === "luganda") return "luganda";
+  if (normalized === "ug" || normalized === "lg" || normalized === "lg-ug" || normalized === "lug" || normalized === "luganda") return "luganda";
   if (normalized.startsWith("rw")) return "rw";
   if (normalized.startsWith("rn")) return "rn";
   if (normalized.startsWith("sw")) return "sw";

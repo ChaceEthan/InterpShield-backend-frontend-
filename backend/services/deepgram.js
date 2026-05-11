@@ -2,6 +2,23 @@
 import { DeepgramClient } from "@deepgram/sdk";
 
 const createClient = (apiKey) => new DeepgramClient({ apiKey });
+const DEEPGRAM_LANGUAGE_ALIASES = {
+  luganda: "multi",
+  lg: "multi",
+  ug: "multi",
+  rw: "multi",
+  rn: "multi",
+  sw: "multi"
+};
+
+const normalizeDeepgramLanguage = (sourceLang = "") => {
+  const normalized = String(sourceLang || "").trim().toLowerCase().replace("_", "-");
+  if (!normalized || normalized === "auto") return { language: "multi" };
+  if (DEEPGRAM_LANGUAGE_ALIASES[normalized]) return { language: DEEPGRAM_LANGUAGE_ALIASES[normalized] };
+  if (normalized.startsWith("rw") || normalized.startsWith("rn") || normalized.startsWith("sw")) return { language: "multi" };
+  if (normalized === "lg-ug" || normalized === "lug") return { language: "multi" };
+  return { language: normalized };
+};
 
 const isConnectionOpen = (connection) => {
   const readyState = connection?.readyState ?? connection?.socket?.readyState;
@@ -65,11 +82,7 @@ export const createDeepgramSession = ({
       connectionTimeoutInSeconds: 10
     };
 
-    if (sourceLang === "auto") {
-      options.detect_language = "true";
-    } else {
-      options.language = sourceLang;
-    }
+    Object.assign(options, normalizeDeepgramLanguage(sourceLang));
 
     connection = await deepgram.listen.v1.connect(options);
 
