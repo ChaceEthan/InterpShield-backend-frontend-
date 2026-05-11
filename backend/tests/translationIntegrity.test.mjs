@@ -16,7 +16,10 @@ const source = "Can you please give me your book?";
 const rejectedTranslations = [
   ["source echo", source, "es"],
   ["source tag", "[EN] Can you please give me your book?", "es"],
-  ["provider failure", "Translation unavailable", "es"]
+  ["provider failure", "Translation unavailable", "es"],
+  ["kinyarwanda target", "Urashobora kumpa igitabo cyawe?", "rw"],
+  ["kirundi target", "Urashobora kumpa igitabu cawe?", "rn"],
+  ["luganda target", "Osobola okumpa ekitabo kyo?", "luganda"]
 ];
 
 const acceptedTranslations = [
@@ -25,14 +28,8 @@ const acceptedTranslations = [
   ["short spanish", "Claro.", "es"],
   ["chinese", "请把你的书给我。", "zh"],
   ["japanese", "こんにちは", "ja"],
-  ["kinyarwanda", "Urashobora kumpa igitabo cyawe?", "rw"],
-  ["kirundi", "Urashobora kumpa igitabu cawe?", "rn"],
   ["swahili", "Unaweza kunipa kitabu chako?", "sw"],
-  ["luganda", "Osobola okumpa ekitabo kyo?", "luganda"],
-  ["long swahili", "Ninahitaji msaada wako sasa kwa sababu kazi hii ni muhimu.", "sw"],
-  ["long kinyarwanda", "Ndashobora kugufasha ubu kuko iki gikorwa ni ingenzi.", "rw"],
-  ["long kirundi", "Ndashobora kugufasha ubu kuko iki gikorwa ni ngirakamaro.", "rn"],
-  ["long luganda", "Nsobola okukuyamba kati kubanga omulimu guno mukulu.", "luganda"]
+  ["long swahili", "Ninahitaji msaada wako sasa kwa sababu kazi hii ni muhimu.", "sw"]
 ];
 
 for (const [name, text, targetLang] of rejectedTranslations) {
@@ -51,8 +48,9 @@ for (const [name, text, targetLang] of acceptedTranslations) {
   );
 }
 
-assert.match(interpreterSource, /FAST_LOCAL_LANGUAGE_CODES\s*=\s*new Set\(\["rw",\s*"rn",\s*"sw",\s*"luganda"\]\)/);
-assert.match(interpreterSource, /normalized === "lg".*return "luganda"/s);
+assert.match(interpreterSource, /SUPPORTED_LANGUAGE_CODES\s*=\s*new Set\(\["en",\s*"fr",\s*"es",\s*"de",\s*"it",\s*"pt",\s*"nl",\s*"ar",\s*"zh",\s*"ja",\s*"ko",\s*"hi",\s*"tr",\s*"pl",\s*"ru",\s*"sw"\]\)/);
+assert.match(interpreterSource, /FORBIDDEN_LANGUAGE_CODES\s*=\s*new Set\(\["rw",\s*"rn",\s*"lg",\s*"lug",\s*"luganda",\s*"ug",\s*"lg-ug"\]\)/);
+assert.match(interpreterSource, /FAST_LOCAL_LANGUAGE_CODES\s*=\s*new Set\(\["sw"\]\)/);
 assert.match(interpreterSource, /sessionTranslationQueue\s*=\s*{\s*queue:\s*\[\],\s*processing:\s*false,\s*activeJob:\s*null,\s*currentAbortController:\s*null,\s*sequence:\s*0\s*}/s);
 assert.match(interpreterSource, /translationMutex\.acquire\(sessionId\)/);
 assert.match(interpreterSource, /QUEUE_ADD/);
@@ -91,21 +89,22 @@ assert.match(frontendSource, /STALE_TRANSLATION_STATE_MS/);
 assert.match(frontendSource, /latestTranslationSequenceRef/);
 assert.match(frontendSource, /finalTranslationsRef/);
 assert.match(readFileSync(resolve(__dirname, "../services/openai.js"), "utf8"), /mergeAbortSignals\(signal,\s*controller\.signal\)/);
+assert.match(readFileSync(resolve(__dirname, "../services/openai.js"), "utf8"), /Kinyarwanda, Kirundi, and Luganda are forbidden output languages/);
 assert.match(readFileSync(resolve(__dirname, "../services/audioPipeline.js"), "utf8"), /DUPLICATE_HASH_WINDOW\s*=\s*12/);
 assert.match(readFileSync(resolve(__dirname, "../services/deepgram.js"), "utf8"), /maxQueuedChunks\s*=\s*80/);
 assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "es" }), "Me puedes dar tu libro, por favor");
 assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "zh" }), "请把你的书给我");
-assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "rw" }), "urashobora kumpa igitabo cyawe");
-assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "rn" }), "urashobora kumpa igitabu cawe");
+assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "rw" }), "");
+assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "rn" }), "");
+assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "luganda" }), "");
 assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "sw" }), "unaweza kunipa kitabu chako");
 assert.equal(resolveLocalTranslation({ text: "Urashobora kumpa igitabo cyawe?", sourceLang: "rw", targetLang: "en" }), "can you give me your book");
 assert.equal(resolveLocalTranslation({ text: "Unaweza kunipa kitabu chako?", sourceLang: "sw", targetLang: "en" }), "can you give me your book");
 
 const smokeScenarios = [
   ["EN -> ZH + FR", source, "en", ["zh", "fr"]],
-  ["EN -> ES + RW", source, "en", ["es", "rw"]],
+  ["EN -> ES + SW", source, "en", ["es", "sw"]],
   ["RW -> EN", "Urashobora kumpa igitabo cyawe?", "rw", ["en"]],
-  ["EN -> RW", source, "en", ["rw"]],
   ["EN -> ZH + FR + ES", source, "en", ["zh", "fr", "es"]]
 ];
 
@@ -127,7 +126,7 @@ const audioPipeline = createAudioPipelineSession({
   roomId: "test-room",
   participantId: "participant-1",
   sourceLang: "en",
-  targetLanguages: ["es", "rw"]
+  targetLanguages: ["es", "sw"]
 });
 const acceptedAudio = audioPipeline.preprocessAudioChunk(Buffer.alloc(512, 7), { sequence: 1, audioLevel: 0.02 });
 assert.equal(acceptedAudio.accepted, true);
@@ -148,7 +147,7 @@ const room = upsertCallRoomParticipant(rooms, {
   participantId: "participant-1",
   socketId: "socket-1",
   sourceLang: "en",
-  targetLanguages: ["rw"]
+  targetLanguages: ["sw"]
 });
 assert.equal(room.participants.size, 1);
 removeCallRoomParticipant(rooms, "call-1", "participant-1");

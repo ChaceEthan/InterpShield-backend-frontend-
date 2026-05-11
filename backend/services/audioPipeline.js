@@ -5,18 +5,17 @@ const MIN_CHUNK_INTERVAL_MS = 35;
 const LOW_AUDIO_LEVEL = 0.0015;
 const MAX_TRANSLATED_SPEECH_QUEUE = 24;
 const TRANSLATED_SPEECH_TTL_MS = 45000;
+const SUPPORTED_LANGUAGE_CODES = new Set(["en", "fr", "es", "de", "it", "pt", "nl", "ar", "zh", "ja", "ko", "hi", "tr", "pl", "ru", "sw"]);
+const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
 
 const normalizeLanguage = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
   if (!normalized) return "";
-  if (normalized === "ug" || normalized === "lg" || normalized === "lg-ug" || normalized === "lug") return "luganda";
-  if (normalized.startsWith("rw")) return "rw";
-  if (normalized.startsWith("rn")) return "rn";
+  if (FORBIDDEN_LANGUAGE_CODES.has(normalized) || normalized.startsWith("rw") || normalized.startsWith("rn")) return "en";
   if (normalized.startsWith("sw")) return "sw";
   if (normalized.startsWith("zh")) return "zh";
-  if (normalized.startsWith("en")) return "en";
-  if (normalized.startsWith("es")) return "es";
-  return normalized.split("-")[0] || normalized;
+  const code = normalized.split("-")[0] || normalized;
+  return SUPPORTED_LANGUAGE_CODES.has(code) ? code : "en";
 };
 
 const hashBufferSample = (buffer) => {

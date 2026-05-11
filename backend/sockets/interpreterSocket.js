@@ -8,6 +8,8 @@ import {
 } from "../services/audioPipeline.js";
 
 const MAX_TARGET_LANGUAGES = 3;
+const SUPPORTED_LANGUAGE_CODES = new Set(["en", "fr", "es", "de", "it", "pt", "nl", "ar", "zh", "ja", "ko", "hi", "tr", "pl", "ru", "sw"]);
+const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
 const LOG_TEXT_PREVIEW_CHARS = 96;
 const callRooms = new Map();
 
@@ -29,14 +31,12 @@ const logSocketTranslationEvent = (event, payload = {}) => {
 const normalizeSocketLanguageCode = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
   if (!normalized) return "";
-  if (normalized === "ug" || normalized === "lg" || normalized === "lg-ug" || normalized === "lug" || normalized === "luganda") return "luganda";
-  if (normalized.startsWith("rw")) return "rw";
-  if (normalized.startsWith("rn")) return "rn";
+  if (normalized === "auto") return "auto";
+  if (FORBIDDEN_LANGUAGE_CODES.has(normalized) || normalized.startsWith("rw") || normalized.startsWith("rn")) return "en";
   if (normalized.startsWith("sw")) return "sw";
   if (normalized.startsWith("zh")) return "zh";
-  if (normalized.startsWith("es")) return "es";
-  if (normalized.startsWith("en")) return "en";
-  return normalized.split("-")[0] || normalized;
+  const code = normalized.split("-")[0] || normalized;
+  return SUPPORTED_LANGUAGE_CODES.has(code) ? code : "en";
 };
 
 const audioPayloadToBuffer = (audio) => {
@@ -60,12 +60,14 @@ const normalizeTargetLanguages = (targetLanguages, fallbackTargetLang = "es") =>
 
   for (const language of requestedLanguages) {
     const code = normalizeSocketLanguageCode(language);
-    if (!code || uniqueLanguages.includes(code)) continue;
+    if (!code || code === "auto" || !SUPPORTED_LANGUAGE_CODES.has(code) || uniqueLanguages.includes(code)) continue;
     uniqueLanguages.push(code);
     if (uniqueLanguages.length === MAX_TARGET_LANGUAGES) break;
   }
 
-  return uniqueLanguages.length > 0 ? uniqueLanguages : [fallbackTargetLang || "es"];
+  if (uniqueLanguages.length > 0) return uniqueLanguages;
+  const fallback = normalizeSocketLanguageCode(fallbackTargetLang);
+  return fallback && fallback !== "auto" && SUPPORTED_LANGUAGE_CODES.has(fallback) ? [fallback] : ["en"];
 };
 
 const sanitizeTranslationResult = (result = {}) => {

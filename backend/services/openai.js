@@ -5,6 +5,9 @@ import { enhanceTranslation } from "../utils/translationEnhancer.js";
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_TRANSLATION_MODEL = "gpt-4o-mini";
 const OPENAI_TIMEOUT_MS = 22000;
+const SUPPORTED_LANGUAGE_CODES = new Set(["en", "fr", "es", "de", "it", "pt", "nl", "ar", "zh", "ja", "ko", "hi", "tr", "pl", "ru", "sw"]);
+const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
+const SUPPORTED_LANGUAGE_LIST = "English (en), French (fr), Spanish (es), German (de), Italian (it), Portuguese (pt), Dutch (nl), Arabic (ar), Chinese Simplified (zh), Japanese (ja), Korean (ko), Hindi (hi), Turkish (tr), Polish (pl), Russian (ru), Swahili (sw)";
 
 const mergeAbortSignals = (...signals) => {
   const activeSignals = signals.filter(Boolean);
@@ -35,14 +38,32 @@ const normalizeForComparison = (value = "") =>
 const stripWrappedText = (value = "") => value.trim().replace(/^["'`]+|["'`]+$/g, "").trim();
 
 const normalizedLanguageCode = (code = "") => String(code || "").trim().toLowerCase();
+const sanitizeTargetLanguageCode = (code = "") => {
+  const normalized = normalizedLanguageCode(code).replace("_", "-");
+  if (FORBIDDEN_LANGUAGE_CODES.has(normalized) || normalized.startsWith("rw") || normalized.startsWith("rn")) return "en";
+  if (normalized.startsWith("zh")) return "zh";
+  if (normalized.startsWith("sw")) return "sw";
+  const baseCode = normalized.split("-")[0] || normalized;
+  return SUPPORTED_LANGUAGE_CODES.has(baseCode) ? baseCode : "en";
+};
 
 const describeLanguage = (code = "") => {
-  const normalizedCode = normalizedLanguageCode(code);
+  const normalizedCode = sanitizeTargetLanguageCode(code);
   const languageName = LANGUAGE_NAMES[normalizedCode];
   return languageName ? `${languageName} (${normalizedCode})` : String(code || "").trim();
 };
 
-const targetLanguageInstructions = (targetLang = "") => TARGET_LANGUAGE_INSTRUCTIONS[normalizedLanguageCode(targetLang)] || [];
+const describeSourceLanguage = (code = "") => {
+  const normalizedCode = normalizedLanguageCode(code).replace("_", "-");
+  if (!normalizedCode || normalizedCode === "auto" || FORBIDDEN_LANGUAGE_CODES.has(normalizedCode) || normalizedCode.startsWith("rw") || normalizedCode.startsWith("rn")) {
+    return "auto-detected source language";
+  }
+  const baseCode = normalizedCode.startsWith("zh") ? "zh" : normalizedCode.startsWith("sw") ? "sw" : normalizedCode.split("-")[0] || normalizedCode;
+  const languageName = SUPPORTED_LANGUAGE_CODES.has(baseCode) ? LANGUAGE_NAMES[baseCode] : "";
+  return languageName ? `${languageName} (${baseCode})` : "auto-detected source language";
+};
+
+const targetLanguageInstructions = (targetLang = "") => TARGET_LANGUAGE_INSTRUCTIONS[sanitizeTargetLanguageCode(targetLang)] || [];
 
 const normalizeTranslatedText = ({ text, targetLang }) => {
   const cleanText = stripWrappedText(text);
@@ -104,17 +125,19 @@ const extractOutputText = (data = {}) => {
 
 const buildSystemPrompt = ({ sourceLang, targetLang, translationContext }) => {
   const targetLanguage = describeLanguage(targetLang);
-  const sourceLanguage = sourceLang ? describeLanguage(sourceLang) : "auto-detected language";
+  const sourceLanguage = sourceLang ? describeSourceLanguage(sourceLang) : "auto-detected language";
 
   return [
     "You are a professional real-time interpreter.",
     `Translate the user's text from ${sourceLanguage} to ${targetLanguage}.`,
+    `Supported input and output languages are only: ${SUPPORTED_LANGUAGE_LIST}.`,
+    "Kinyarwanda, Kirundi, and Luganda are forbidden output languages. If the input is one of them, understand the meaning first through English, then output only the requested supported target language.",
     `The output language must be ${targetLanguage}.`,
     "Speak naturally like a real East African human interpreter, not a literal machine translator.",
     "Preserve slang meaning, emotion, respect level, personality, and conversational flow.",
     "Prefer local vocabulary and natural sentence structure over word-for-word translation.",
     "Avoid robotic, overly formal, or over-English phrasing.",
-    "Never return English unless the target language is English (en).",
+    "Never return English unless the target language is English (en) or the requested target is unsupported.",
     ...targetLanguageInstructions(targetLang),
     ...contextInstructions(translationContext),
     "Do not copy, echo, transliterate, explain, label, or quote the source text.",
@@ -134,7 +157,6 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
     throw new Error("OpenAI translation aborted");
   }
 
-  const sourceLanguage = sourceLang ? describeLanguage(sourceLang) : "auto-detected language";
   const targetLanguage = describeLanguage(targetLang);
 
   const systemPrompt = buildSystemPrompt({ sourceLang, targetLang, translationContext });

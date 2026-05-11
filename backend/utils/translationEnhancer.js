@@ -9,6 +9,8 @@ import {
   ROBOTIC_PHRASES
 } from "../data/languageMemory.js";
 
+const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
+
 const toLanguageList = (languages, fallback = "") => {
   const requested = Array.isArray(languages) ? languages : languages ? [languages] : [fallback];
   return requested.map((language) => String(language || "").trim().toLowerCase()).filter(Boolean);
@@ -34,6 +36,12 @@ const normalizeLanguageCode = (language = "") => {
   if (normalized.startsWith("sw")) return "sw";
   if (normalized.startsWith("en")) return "en";
   return normalized.split("-")[0] || normalized;
+};
+
+const isForbiddenLanguageCode = (language = "") => {
+  const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
+  const code = normalizeLanguageCode(normalized);
+  return FORBIDDEN_LANGUAGE_CODES.has(normalized) || FORBIDDEN_LANGUAGE_CODES.has(code);
 };
 
 const escapeRegExp = (value = "") => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -301,24 +309,13 @@ export const resolveLocalTranslation = ({ text = "", sourceLang = "", targetLang
   const cleanText = normalizePunctuation(text).replace(/[.!?]+$/g, "").trim();
 
   if (!cleanText) return "";
+  if (isForbiddenLanguageCode(language)) return "";
 
   const exactTranslation = resolveExactLocalTranslation({ text: cleanText, sourceLang: source, targetLang: language });
   if (exactTranslation) return exactTranslation;
 
-  if (language === "rw") {
-    return exactPhraseCorrection(cleanText, LOCAL_PHRASES.rw) || "";
-  }
-
-  if (language === "rn") {
-    return exactPhraseCorrection(cleanText, LOCAL_PHRASES.rn) || "";
-  }
-
   if (language === "sw") {
     return exactPhraseCorrection(cleanText, LOCAL_PHRASES.sw) || "";
-  }
-
-  if (language === "luganda") {
-    return exactPhraseCorrection(cleanText, LOCAL_PHRASES.luganda) || "";
   }
 
   if (language === "en") {
@@ -335,7 +332,5 @@ export const resolveLocalTranslation = ({ text = "", sourceLang = "", targetLang
 export const enhanceTranslation = ({ text = "", targetLang = "" } = {}) => {
   const language = String(targetLang || "").trim().toLowerCase();
 
-  if (language === "rw") return enhanceKinyarwanda(text);
-  if (language === "rn") return enhanceKirundi(text);
   return normalizePunctuation(cleanRepeatedWords(removeRoboticPhrasing(text)));
 };

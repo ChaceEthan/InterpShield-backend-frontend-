@@ -205,6 +205,8 @@ const MIN_AUDIO_CHUNK_INTERVAL_MS = 90;
 const DUBBING_QUEUE_SETTLE_MS = 180;
 const STALE_TRANSLATION_STATE_MS = 9000;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
+const SUPPORTED_LANGUAGE_CODES = new Set(["en", "fr", "es", "de", "it", "pt", "nl", "ar", "zh", "ja", "ko", "hi", "tr", "pl", "ru", "sw"]);
+const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
 const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
@@ -287,10 +289,7 @@ const LANGUAGES: Language[] = [
   { code: "tr", name: "Turkish", region: "Turkiye" },
   { code: "pl", name: "Polish", region: "Poland" },
   { code: "ru", name: "Russian", region: "Global" },
-  { code: "rw", name: "Kinyarwanda", region: "Rwanda" },
-  { code: "rn", name: "Kirundi", region: "Burundi" },
-  { code: "sw", name: "Swahili", region: "East Africa" },
-  { code: "luganda", name: "Luganda", region: "Uganda" }
+  { code: "sw", name: "Swahili", region: "East Africa" }
 ];
 
 const TOOL_ITEMS: Array<{ mode: Mode; label: string; icon: LucideIcon }> = [
@@ -315,10 +314,7 @@ const LANGUAGE_FLAGS: Record<string, string> = {
   tr: "🇹🇷",
   pl: "🇵🇱",
   ru: "🇷🇺",
-  rw: "🇷🇼",
-  rn: "🇧🇮",
   sw: "SW",
-  luganda: "UG"
 };
 
 const SPEECH_SYNTHESIS_LANGS: Record<string, string> = {
@@ -337,10 +333,7 @@ const SPEECH_SYNTHESIS_LANGS: Record<string, string> = {
   tr: "tr-TR",
   pl: "pl-PL",
   ru: "ru-RU",
-  rw: "rw-RW",
-  rn: "rn-BI",
   sw: "sw-KE",
-  luganda: "lg-UG"
 };
 
 const PRICING_PLANS = [
@@ -369,46 +362,28 @@ const PRICING_PLANS = [
 
 const normalizeTargetLanguages = (languages?: unknown, fallback = DEFAULT_TARGET_LANGUAGES[0]) => {
   const requestedLanguages = Array.isArray(languages) ? languages : languages ? [languages] : [fallback];
-  const validCodes = new Set(LANGUAGES.map((language) => language.code));
   const normalized: string[] = [];
 
   for (const language of requestedLanguages) {
-    const rawCode = String(language || "").trim().toLowerCase().replace("_", "-");
-    const code =
-      rawCode === "ug" || rawCode === "lg" || rawCode === "lg-ug" || rawCode === "lug"
-        ? "luganda"
-        : rawCode.startsWith("rw")
-          ? "rw"
-          : rawCode.startsWith("rn")
-            ? "rn"
-            : rawCode.startsWith("sw")
-              ? "sw"
-              : rawCode.startsWith("zh")
-                ? "zh"
-                : rawCode.startsWith("es")
-                  ? "es"
-                  : rawCode.startsWith("en")
-                    ? "en"
-                    : rawCode.split("-")[0] || rawCode;
-    if (!code || !validCodes.has(code) || normalized.includes(code)) continue;
+    const code = normalizeLanguageCode(String(language || ""));
+    if (!code || !SUPPORTED_LANGUAGE_CODES.has(code) || normalized.includes(code)) continue;
     normalized.push(code);
     if (normalized.length === MAX_TARGET_LANGUAGES) break;
   }
 
   if (normalized.length > 0) return normalized;
-  return validCodes.has(fallback) ? [fallback] : DEFAULT_TARGET_LANGUAGES;
+  const fallbackCode = normalizeLanguageCode(fallback);
+  return fallbackCode && SUPPORTED_LANGUAGE_CODES.has(fallbackCode) ? [fallbackCode] : ["en"];
 };
 
 const normalizeLanguageCode = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
-  if (normalized === "ug" || normalized === "lg" || normalized === "lg-ug" || normalized === "lug") return "luganda";
-  if (normalized.startsWith("rw")) return "rw";
-  if (normalized.startsWith("rn")) return "rn";
+  if (!normalized || normalized === "auto") return normalized;
+  if (FORBIDDEN_LANGUAGE_CODES.has(normalized) || normalized.startsWith("rw") || normalized.startsWith("rn")) return "en";
   if (normalized.startsWith("sw")) return "sw";
   if (normalized.startsWith("zh")) return "zh";
-  if (normalized.startsWith("es")) return "es";
-  if (normalized.startsWith("en")) return "en";
-  return normalized.split("-")[0] || normalized;
+  const baseCode = normalized.split("-")[0] || normalized;
+  return SUPPORTED_LANGUAGE_CODES.has(baseCode) ? baseCode : "en";
 };
 
 const normalizeComparableText = (text = "") =>
@@ -456,21 +431,9 @@ const TARGET_LANGUAGE_MARKERS: Record<string, { phrases?: string[]; words?: stri
     phrases: ["por favor", "muchas gracias", "buenos dias", "buenas tardes", "buenas noches", "me puedes", "puedes darme", "tu libro", "su libro", "de nada", "lo siento", "que tal"],
     words: ["el", "la", "los", "las", "un", "una", "de", "del", "que", "para", "por", "con", "sin", "como", "hola", "gracias", "favor", "vale", "claro", "bueno", "bien", "perdon", "adios", "listo", "puedes", "puede", "puedo", "dame", "darme", "libro", "libros", "necesito", "quiero", "tengo", "tienes", "tiene", "buenos", "buenas", "dias", "noches", "si", "aqui", "ahora", "usted", "tu", "mi", "su", "voy", "hablar", "escuchar", "traducir", "ayuda"]
   },
-  rw: {
-    phrases: ["murakoze cyane", "nta kibazo", "ntacyo bitwaye", "urashobora kumpa", "igitabo cyawe", "ndagusabye"],
-    words: ["amakuru", "murakoze", "yego", "oya", "ndabizi", "ikibazo", "muraho", "mwaramutse", "mwiriwe", "cyane", "ndashaka", "urashobora", "kumpa", "igitabo", "cyawe", "nyamuneka", "byiza", "kuri", "kandi", "ndashobora", "tugomba", "gukora", "avuga", "abantu", "umuntu", "cyangwa", "ariko", "rero", "kuko", "ubu", "hano", "akazi", "ubuzima", "amafaranga", "umuryango", "mfasha"]
-  },
-  rn: {
-    phrases: ["ego cane", "amakuru meza", "urakoze cane", "murakoze cane", "ni vyiza", "urashobora kumpa", "igitabu cawe"],
-    words: ["ego", "cane", "vyiza", "amahoro", "mwaramutse", "urashobora", "kumpa", "igitabu", "cawe", "ndagusavye", "oya", "kuri", "kandi", "ndashobora", "tugomba", "gukora", "avuga", "abantu", "umuntu", "canke", "ariko", "rero", "kuko", "ubu", "ngaha", "akazi", "ubuzima", "amafaranga", "umuryango", "mfasha"]
-  },
   sw: {
     phrases: ["asante sana", "unaweza kunipa", "kitabu chako", "habari", "tafadhali"],
     words: ["habari", "asante", "sawa", "rafiki", "tafadhali", "karibu", "jambo", "ndio", "ndiyo", "hapana", "sana", "unaweza", "kunipa", "kitabu", "chako", "nina", "kwa", "mimi", "wewe", "yeye", "sisi", "wao", "ni", "na", "ya", "za", "wa", "watu", "mtu", "leo", "kesho", "sasa", "hapa", "kazi", "fedha", "familia", "afya", "msaada", "wako", "ninahitaji"]
-  },
-  luganda: {
-    phrases: ["oli otya", "webale nyo", "osobola okumpa", "ekitabo kyo"],
-    words: ["ssebo", "nyabo", "webale", "mukwano", "banange", "gyebale", "mpola", "kale", "naye", "osobola", "okumpa", "ekitabo", "kyo", "nkusaba", "nze", "ggwe", "ndi", "oli", "ali", "tuli", "muli", "bali", "nga", "kuba", "mu", "ku", "ne", "era", "abantu", "omuntu", "leero", "wano", "ssente", "famire", "obulamu", "nsobola", "okukuyamba", "kati", "kubanga", "omulimu", "guno", "mukulu"]
   }
 };
 
@@ -498,7 +461,7 @@ const isTargetLanguageText = (text = "", targetLang = "") => {
     return hasSpanishOrthography(text) || spanishScore >= 2 || (spanishScore >= 1 && englishScore === 0 && tokenCount <= 3);
   }
 
-  if (["rw", "rn", "sw", "luganda"].includes(target)) {
+  if (target === "sw") {
     const markerScore = countLanguageMarkers(text, TARGET_LANGUAGE_MARKERS[target] || {});
     return markerScore >= 2 || (markerScore >= 1 && englishScore === 0 && tokenCount <= 4);
   }

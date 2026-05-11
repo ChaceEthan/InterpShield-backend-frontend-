@@ -21,7 +21,9 @@ const SILENCE_DEBOUNCE_MS = 1300;
 const LOCAL_LANGUAGE_CONFIDENCE_THRESHOLD = 0.7;
 const TRANSLATION_LANE_FAST_LOCAL = "fastLocal";
 const TRANSLATION_LANE_PROVIDER = "provider";
-const FAST_LOCAL_LANGUAGE_CODES = new Set(["rw", "rn", "sw", "luganda"]);
+const SUPPORTED_LANGUAGE_CODES = new Set(["en", "fr", "es", "de", "it", "pt", "nl", "ar", "zh", "ja", "ko", "hi", "tr", "pl", "ru", "sw"]);
+const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
+const FAST_LOCAL_LANGUAGE_CODES = new Set(["sw"]);
 const FAST_LOCAL_MAX_ACTIVE_TRANSLATIONS = 8;
 const PROVIDER_MAX_ACTIVE_TRANSLATIONS = 2;
 const MAX_TRANSLATION_LANE_QUEUE_SIZE = 24;
@@ -212,12 +214,14 @@ const normalizeTargetLanguages = (targetLanguages, fallbackTargetLang = "es") =>
 
   for (const language of requestedLanguages) {
     const code = normalizeInterpreterLanguageCode(language) || String(language || "").trim().toLowerCase();
-    if (!code || uniqueLanguages.includes(code)) continue;
+    if (!code || !SUPPORTED_LANGUAGE_CODES.has(code) || uniqueLanguages.includes(code)) continue;
     uniqueLanguages.push(code);
     if (uniqueLanguages.length === MAX_TARGET_LANGUAGES) break;
   }
 
-  return uniqueLanguages.length > 0 ? uniqueLanguages : [fallbackTargetLang || "es"];
+  if (uniqueLanguages.length > 0) return uniqueLanguages;
+  const fallback = normalizeInterpreterLanguageCode(fallbackTargetLang);
+  return fallback && SUPPORTED_LANGUAGE_CODES.has(fallback) ? [fallback] : ["en"];
 };
 
 const prepareTextForTranslation = (text = "") => {
@@ -245,6 +249,19 @@ const normalizeInterpreterLanguageCode = (language = "") => {
   return normalized.split("-")[0] || normalized;
 };
 
+const isForbiddenLanguageCode = (language = "") => {
+  const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
+  const code = normalizeInterpreterLanguageCode(normalized);
+  return FORBIDDEN_LANGUAGE_CODES.has(normalized) || FORBIDDEN_LANGUAGE_CODES.has(code);
+};
+
+const sourceLanguageForProvider = (language = "") => {
+  const code = normalizeInterpreterLanguageCode(language);
+  if (!code || code === "auto") return "auto";
+  if (isForbiddenLanguageCode(code) || !SUPPORTED_LANGUAGE_CODES.has(code)) return "auto";
+  return code;
+};
+
 const shouldUseDetectedSourceLanguage = ({ configuredSourceLang = "", twoWay = false } = {}) => {
   const configured = normalizeInterpreterLanguageCode(configuredSourceLang);
   return Boolean(twoWay || !configured || configured === "auto");
@@ -255,6 +272,7 @@ const isFastLocalLaneLanguage = ({ sourceLang = "", targetLang = "" } = {}) => {
   const target = normalizeInterpreterLanguageCode(targetLang);
 
   if (FAST_LOCAL_LANGUAGE_CODES.has(target)) return true;
+  if (target === "en" && isForbiddenLanguageCode(source)) return true;
   if (target === "en" && FAST_LOCAL_LANGUAGE_CODES.has(source)) return true;
   return source === "en" && target === "en";
 };
@@ -439,96 +457,6 @@ const TARGET_LANGUAGE_MARKERS = {
       "hospital"
     ]
   },
-  rw: {
-    phrases: [
-      ...(LOCAL_LANGUAGE_MARKERS.rw?.phrases || []),
-      "urashobora kumpa",
-      "igitabo cyawe",
-      "ndagusabye",
-      "mumbabarire"
-    ],
-    words: [
-      ...(LOCAL_LANGUAGE_MARKERS.rw?.words || []),
-      "urashobora",
-      "kumpa",
-      "igitabo",
-      "cyawe",
-      "ndagusabye",
-      "nyamuneka",
-      "oya",
-      "byiza",
-      "iki",
-      "ibyo",
-      "uyu",
-      "wacu",
-      "wawe",
-      "kuri",
-      "kandi",
-      "ndi",
-      "uri",
-      "ari",
-      "muri",
-      "bose",
-      "ndashobora",
-      "tugomba",
-      "gukora",
-      "avuga",
-      "abantu",
-      "umuntu",
-      "cyangwa",
-      "ariko",
-      "rero",
-      "kuko",
-      "ubu",
-      "hano",
-      "akazi",
-      "ubuzima",
-      "amafaranga",
-      "umuryango",
-      "mfasha"
-    ]
-  },
-  rn: {
-    phrases: [
-      ...(LOCAL_LANGUAGE_MARKERS.rn?.phrases || []),
-      "urashobora kumpa",
-      "igitabu cawe",
-      "ndagusavye"
-    ],
-    words: [
-      ...(LOCAL_LANGUAGE_MARKERS.rn?.words || []),
-      "urashobora",
-      "kumpa",
-      "igitabu",
-      "cawe",
-      "ndagusavye",
-      "oya",
-      "amahoro",
-      "nkeneye",
-      "ndashaka",
-      "ivyo",
-      "vyiza",
-      "kuri",
-      "kandi",
-      "ndashobora",
-      "tugomba",
-      "gukora",
-      "avuga",
-      "abantu",
-      "umuntu",
-      "canke",
-      "ariko",
-      "rero",
-      "kuko",
-      "ubu",
-      "ngaha",
-      "akazi",
-      "ubuzima",
-      "amafaranga",
-      "umuryango",
-      "mfasha"
-    ]
-  },
   sw: {
     phrases: [
       ...(LOCAL_LANGUAGE_MARKERS.sw?.phrases || []),
@@ -574,55 +502,6 @@ const TARGET_LANGUAGE_MARKERS = {
       "msaada",
       "wako",
       "ninahitaji"
-    ]
-  },
-  luganda: {
-    phrases: [
-      ...(LOCAL_LANGUAGE_MARKERS.luganda?.phrases || []),
-      "osobola okumpa",
-      "ekitabo kyo",
-      "webale nyo"
-    ],
-    words: [
-      ...(LOCAL_LANGUAGE_MARKERS.luganda?.words || []),
-      "osobola",
-      "okumpa",
-      "ekitabo",
-      "kyo",
-      "nkusaba",
-      "mpa",
-      "nze",
-      "ggwe",
-      "ffe",
-      "mwe",
-      "kino",
-      "kiri",
-      "ndi",
-      "oli",
-      "ali",
-      "tuli",
-      "muli",
-      "bali",
-      "nga",
-      "kuba",
-      "mu",
-      "ku",
-      "ne",
-      "era",
-      "abantu",
-      "omuntu",
-      "leero",
-      "wano",
-      "ssente",
-      "famire",
-      "obulamu",
-      "nsobola",
-      "okukuyamba",
-      "kati",
-      "kubanga",
-      "omulimu",
-      "guno",
-      "mukulu"
     ]
   }
 };
@@ -728,7 +607,7 @@ const isTargetLanguageText = ({ text = "", targetLang = "" } = {}) => {
     );
   }
 
-  if (["rw", "rn", "sw", "luganda"].includes(target)) {
+  if (target === "sw") {
     const markerScore = countLanguageMarkers(cleanText, TARGET_LANGUAGE_MARKERS[target]);
     return markerScore >= 2 || (markerScore >= 1 && englishScore === 0 && tokenCount <= 4);
   }
@@ -739,6 +618,7 @@ const isTargetLanguageText = ({ text = "", targetLang = "" } = {}) => {
 
 export const isTranslationDisplayable = ({ text = "", sourceText = "", sourceLang = "", targetLang = "", provider = "" } = {}) => {
   const cleanText = cleanTranscriptText(text);
+  if (isForbiddenLanguageCode(targetLang)) return false;
   if (!cleanText || isProviderFailureText(cleanText)) return false;
   if (isSourceTaggedFallbackText(cleanText)) return false;
   if (provider === "failed" || provider === "source") return false;
@@ -1485,7 +1365,7 @@ export const createInterpreterSession = async ({
         providerRunner(provider)({
           apiKey: provider === "gemini" ? env.geminiApiKey : env.openaiApiKey,
           text: translationInput,
-          sourceLang: direction.source,
+          sourceLang: sourceLanguageForProvider(direction.source),
           targetLang: language,
           translationContext: languageTranslationContext,
           signal: abortController?.signal
@@ -2448,22 +2328,38 @@ export const createInterpreterSession = async ({
 
       try {
         releaseLanguageLock = await translationMutex.acquire(sessionId);
+        const englishBridgeText = isForbiddenLanguageCode(job.direction.source)
+          ? cleanTranscriptText(resolveLocalTranslation({
+            text: job.translationInput,
+            sourceLang: job.direction.source,
+            targetLang: "en"
+          }) || "")
+          : "";
+        const effectiveTranslationInput = englishBridgeText || job.translationInput;
+        const effectiveDirection = englishBridgeText
+          ? { ...job.direction, source: "en" }
+          : job.direction;
+
+        if (englishBridgeText && language === "en") {
+          result = { text: englishBridgeText, provider: "local-bridge" };
+        }
+
         const localResult = await translateFastLocalLanguage({
           language,
-          translationInput: job.translationInput,
-          direction: job.direction,
+          translationInput: effectiveTranslationInput,
+          direction: effectiveDirection,
           translationContext: job.translationContext,
           jobId: job.id
         });
 
         if (job.stale || staleTranslationJobs.has(job.id)) break;
-        result = localResult?.text ? localResult : null;
+        result = result?.text ? result : localResult?.text ? localResult : null;
 
         if (!result?.text && localResult?.needsProviderFallback !== false) {
           result = await translateProviderLanguageWithRecovery({
             language,
-            translationInput: job.translationInput,
-            direction: job.direction,
+            translationInput: effectiveTranslationInput,
+            direction: effectiveDirection,
             translationContext: job.translationContext,
             jobId: job.id
           });
