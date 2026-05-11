@@ -3,6 +3,8 @@ import { GoogleGenAI } from "@google/genai";
 import { LANGUAGE_NAMES, TARGET_LANGUAGE_INSTRUCTIONS } from "../data/languageMemory.js";
 import { enhanceTranslation } from "../utils/translationEnhancer.js";
 
+const GEMINI_TIMEOUT_MS = 8000;
+
 let client = null;
 let activeKey = null;
 
@@ -80,7 +82,7 @@ const contextInstructions = (translationContext = {}) => {
   return instructions;
 };
 
-const translateOnce = async ({ apiKey, text, sourceLang, targetLang, translationContext }) => {
+const translateOnce = async ({ apiKey, text, sourceLang, targetLang, translationContext, timeoutMs = GEMINI_TIMEOUT_MS }) => {
   if (!client || activeKey !== apiKey) {
     client = new GoogleGenAI({ apiKey });
     activeKey = apiKey;
@@ -89,41 +91,53 @@ const translateOnce = async ({ apiKey, text, sourceLang, targetLang, translation
   const targetLanguage = describeLanguage(targetLang);
   const sourceLanguage = sourceLang ? describeLanguage(sourceLang) : "auto-detected language";
 
-  const response = await client.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text: [
-              "You are a professional real-time interpreter.",
-              `Translate the user's text from ${sourceLanguage} to ${targetLanguage}.`,
-              `Translate to ${targetLanguage}.`,
-              `The output language must be ${targetLanguage}.`,
-              "Speak naturally like a real East African human interpreter, not a literal machine translator.",
-              "Preserve slang meaning, emotion, respect level, personality, and conversational flow.",
-              "Prefer local vocabulary and natural sentence structure over word-for-word translation.",
-              "Avoid robotic, overly formal, or over-English phrasing.",
-              "Never return English unless the target language is English (en).",
-              ...targetLanguageInstructions(targetLang),
-              ...contextInstructions(translationContext),
-              "Do not copy, echo, transliterate, explain, label, or quote the source text.",
-              "Preserve tone, intent, names, numbers, and formatting where possible.",
-              "Return only the translated text.",
-              "",
-              "Text:",
-              text
-            ].join("\n")
-          }
-        ]
-      }
-    ],
-    config: {
-      temperature: 0,
-      maxOutputTokens: 512
-    }
+  // Create a timeout promise
+  const timeoutPromise = new Promise((_, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Gemini translation timed out for ${targetLanguage}`));
+    }, timeoutMs);
+    timer.unref?.();
   });
+
+  // Race the actual request against the timeout
+  const response = await Promise.race([
+    client.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: [
+                "You are a professional real-time interpreter.",
+                `Translate the user's text from ${sourceLanguage} to ${targetLanguage}.`,
+                `Translate to ${targetLanguage}.`,
+                `The output language must be ${targetLanguage}.`,
+                "Speak naturally like a real East African human interpreter, not a literal machine translator.",
+                "Preserve slang meaning, emotion, respect level, personality, and conversational flow.",
+                "Prefer local vocabulary and natural sentence structure over word-for-word translation.",
+                "Avoid robotic, overly formal, or over-English phrasing.",
+                "Never return English unless the target language is English (en).",
+                ...targetLanguageInstructions(targetLang),
+                ...contextInstructions(translationContext),
+                "Do not copy, echo, transliterate, explain, label, or quote the source text.",
+                "Preserve tone, intent, names, numbers, and formatting where possible.",
+                "Return only the translated text.",
+                "",
+                "Text:",
+                text
+              ].join("\n")
+            }
+          ]
+        }
+      ],
+      config: {
+        temperature: 0,
+        maxOutputTokens: 512
+      }
+    }),
+    timeoutPromise
+  ]);
 
   const translatedText = normalizeTranslatedText({ text: extractGeminiText(response), targetLang });
   if (!translatedText) {
@@ -133,7 +147,7 @@ const translateOnce = async ({ apiKey, text, sourceLang, targetLang, translation
   return translatedText;
 };
 
-export const translateWithGemini = async ({ apiKey, text, sourceLang, targetLang, translationContext }) => {
+export const translateWithGemini = async ({ apiKey, text, sourceLang, targetLang, translationContext, signal }) => {
   const cleanText = text?.trim();
 
   if (!cleanText) {
@@ -144,12 +158,35 @@ export const translateWithGemini = async ({ apiKey, text, sourceLang, targetLang
     return "";
   }
 
-  const translatedText = await translateOnce({ apiKey, text: cleanText, sourceLang, targetLang, translationContext });
-  const echoedSource = normalizeForComparison(translatedText) === normalizeForComparison(cleanText);
-
-  if (translatedText && !echoedSource) {
-    return translatedText;
+  if (signal?.aborted) {
+    throw new Error("Gemini translation aborted");
   }
 
-  return "";
+  try {
+    const translatedText = await translateOnce({ 
+      apiKey, 
+      text: cleanText, 
+      sourceLang, 
+      targetLang, 
+      translationContext,
+      timeoutMs: GEMINI_TIMEOUT_MS
+    });
+    
+    if (signal?.aborted) {
+      throw new Error("Gemini translation aborted");
+    }
+
+    const echoedSource = normalizeForComparison(translatedText) === normalizeForComparison(cleanText);
+
+    if (translatedText && !echoedSource) {
+      return translatedText;
+    }
+
+    return "";
+  } catch (error) {
+    if (signal?.aborted || /aborted/i.test(error?.message || "")) {
+      throw new Error("Gemini translation aborted");
+    }
+    throw error;
+  }
 };

@@ -179,7 +179,10 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           provider: payload.provider,
           partial: payload.partial,
           complete: payload.complete,
-          text: payload.text
+          text: payload.text,
+          sessionId: payload.sessionId,
+          jobId: payload.jobId,
+          sequence: payload.sequence
         });
         socket.emit("translation_update", payload);
         socket.emit("translation_result", payload);
@@ -220,7 +223,11 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         if (Object.keys(translations).length > 0 || hasTranslationState) {
           emitTranslationPayload({
             original: result.originalText,
-            text: safe.translatedText,
+            ...(safe.translatedText ? { text: safe.translatedText } : {}),
+            sessionId: result.sessionId,
+            jobId: result.jobId,
+            timestamp: result.timestamp,
+            sequence: result.sequence,
             translations,
             outputs: safe.translationOutputs,
             statusByLanguage: safe.translationStatus,
@@ -242,6 +249,10 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
       socket.emit("transcript_final", {
         text: result.originalText,
+        sessionId: result.sessionId,
+        jobId: result.jobId,
+        timestamp: result.timestamp,
+        sequence: result.sequence,
         sourceLang: result.sourceLang,
         targetLang: result.targetLang,
         targetLanguages: result.targetLanguages || [result.targetLang],
@@ -261,7 +272,11 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       if (Object.keys(translations).length > 0 || hasTranslationState) {
         emitTranslationPayload({
           original: result.originalText,
-          text: safe.translatedText,
+          ...(safe.translatedText ? { text: safe.translatedText } : {}),
+          sessionId: result.sessionId,
+          jobId: result.jobId,
+          timestamp: result.timestamp,
+          sequence: result.sequence,
           translations,
           outputs: safe.translationOutputs,
           statusByLanguage: safe.translationStatus,

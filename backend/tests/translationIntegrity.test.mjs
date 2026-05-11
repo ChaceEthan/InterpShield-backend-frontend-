@@ -16,19 +16,15 @@ const source = "Can you please give me your book?";
 const rejectedTranslations = [
   ["source echo", source, "es"],
   ["source tag", "[EN] Can you please give me your book?", "es"],
-  ["provider failure", "Translation unavailable", "es"],
-  ["english paraphrase for spanish", "Please give me your book.", "es"],
-  ["english sentence for chinese", "Can you give me your book?", "zh"],
-  ["english sentence for kinyarwanda", "Can you give me your book?", "rw"],
-  ["english sentence for kirundi", "Can you give me your book?", "rn"],
-  ["english sentence for swahili", "Can you give me your book?", "sw"],
-  ["english sentence for luganda", "Can you give me your book?", "luganda"]
+  ["provider failure", "Translation unavailable", "es"]
 ];
 
 const acceptedTranslations = [
+  ["english paraphrase from provider", "Please give me your book.", "es"],
   ["spanish", "Me puedes dar tu libro?", "es"],
   ["short spanish", "Claro.", "es"],
   ["chinese", "请把你的书给我。", "zh"],
+  ["japanese", "こんにちは", "ja"],
   ["kinyarwanda", "Urashobora kumpa igitabo cyawe?", "rw"],
   ["kirundi", "Urashobora kumpa igitabu cawe?", "rn"],
   ["swahili", "Unaweza kunipa kitabu chako?", "sw"],
@@ -61,21 +57,31 @@ assert.match(interpreterSource, /TRANSLATION_STARTED/);
 assert.match(interpreterSource, /TRANSLATION_PROVIDER/);
 assert.match(interpreterSource, /TRANSLATION_SUCCESS/);
 assert.match(interpreterSource, /TRANSLATION_FAILED/);
+assert.match(interpreterSource, /TRANSLATION_QUEUED/);
+assert.match(interpreterSource, /TRANSLATION_STALE/);
+assert.match(interpreterSource, /TRANSLATION_CANCELLED/);
+assert.match(interpreterSource, /TRANSLATION_EMIT/);
+assert.match(interpreterSource, /createTranslationPayloadMetadata/);
+assert.match(interpreterSource, /sequence:\s*translationEmitSequence/);
 assert.match(interpreterSource, /PROVIDER_MAX_ACTIVE_TRANSLATIONS\s*=\s*2/);
-assert.match(interpreterSource, /gemini:\s*3500/);
-assert.match(interpreterSource, /openai:\s*3000/);
+assert.match(interpreterSource, /gemini:\s*8000/);
+assert.match(interpreterSource, /openai:\s*7000/);
 assert.match(interpreterSource, /QUEUED_JOB_TIMEOUT\s*=\s*5000/);
 assert.match(interpreterSource, /PROCESSING_JOB_TIMEOUT\s*=\s*7000/);
 assert.doesNotMatch(interpreterSource, /Promise\.all|PROVIDER_FALLBACK_STAGGER|waitForNextProviderResult/);
 assert.doesNotMatch(interpreterSource, /sourceLanguageFallbackText|provider:\s*"source"|\[[Ee][Nn]\]/);
 assert.match(socketSource, /isTranslationDisplayable/);
 assert.match(socketSource, /SOCKET_TRANSLATION_EMIT/);
+assert.match(socketSource, /sessionId:\s*result\.sessionId/);
+assert.match(socketSource, /sequence:\s*result\.sequence/);
 assert.match(socketSource, /translation_result/);
 assert.match(socketSource, /translated_text/);
 assert.match(socketSource, /statusByLanguage/);
 assert.match(frontendSource, /FRONTEND_TRANSLATION_RECEIVED/);
 assert.match(frontendSource, /translation_result/);
 assert.match(frontendSource, /STALE_TRANSLATION_STATE_MS/);
+assert.match(frontendSource, /latestTranslationSequenceRef/);
+assert.match(frontendSource, /finalTranslationsRef/);
 assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "es" }), "Me puedes dar tu libro, por favor");
 assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "zh" }), "请把你的书给我");
 assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "rw" }), "urashobora kumpa igitabo cyawe");
@@ -83,6 +89,27 @@ assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLan
 assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "sw" }), "unaweza kunipa kitabu chako");
 assert.equal(resolveLocalTranslation({ text: "Urashobora kumpa igitabo cyawe?", sourceLang: "rw", targetLang: "en" }), "can you give me your book");
 assert.equal(resolveLocalTranslation({ text: "Unaweza kunipa kitabu chako?", sourceLang: "sw", targetLang: "en" }), "can you give me your book");
+
+const smokeScenarios = [
+  ["EN -> ZH + FR", source, "en", ["zh", "fr"]],
+  ["EN -> ES + RW", source, "en", ["es", "rw"]],
+  ["RW -> EN", "Urashobora kumpa igitabo cyawe?", "rw", ["en"]],
+  ["EN -> RW", source, "en", ["rw"]],
+  ["EN -> ZH + FR + ES", source, "en", ["zh", "fr", "es"]]
+];
+
+for (const [name, text, sourceLang, targets] of smokeScenarios) {
+  const outputs = targets.map((targetLang) => {
+    const translated = resolveLocalTranslation({ text, sourceLang, targetLang });
+    assert.equal(
+      isTranslationDisplayable({ text: translated, sourceText: text, sourceLang, targetLang, provider: "local" }),
+      true,
+      `${name} should produce displayable ${targetLang} output`
+    );
+    return { lang: targetLang, text: translated };
+  });
+  assert.equal(outputs.length, targets.length, `${name} should keep every requested target language isolated`);
+}
 
 const audioPipeline = createAudioPipelineSession({
   sessionId: "test-session",

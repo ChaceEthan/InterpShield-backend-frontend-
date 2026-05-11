@@ -2,8 +2,9 @@
 import { LANGUAGE_NAMES, TARGET_LANGUAGE_INSTRUCTIONS } from "../data/languageMemory.js";
 import { enhanceTranslation } from "../utils/translationEnhancer.js";
 
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
-const OPENAI_REALTIME_TRANSLATION_MODEL = "gpt-4.1-nano";
+const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
+const OPENAI_TRANSLATION_MODEL = "gpt-4o-mini";
+const OPENAI_TIMEOUT_MS = 7000;
 
 const normalizeForComparison = (value = "") =>
   value
@@ -110,42 +111,75 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
     return "";
   }
 
-  const response = await fetch(OPENAI_RESPONSES_URL, {
-    method: "POST",
-    signal,
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: OPENAI_REALTIME_TRANSLATION_MODEL,
-      input: [
-        {
-          role: "system",
-          content: buildSystemPrompt({ sourceLang, targetLang, translationContext })
-        },
-        {
-          role: "user",
-          content: `Text:\n${cleanText}`
-        }
-      ],
-      temperature: 0,
-      max_output_tokens: 512
-    })
-  });
-
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    const message = data?.error?.message || data?.error || response.statusText || "OpenAI translation request failed";
-    throw new Error(`OpenAI ${response.status}: ${message}`);
+  if (signal?.aborted) {
+    throw new Error("OpenAI translation aborted");
   }
 
-  const translatedText = normalizeTranslatedText({ text: extractOutputText(data), targetLang });
-  if (!translatedText) {
-    throw new Error(`OpenAI returned an empty translation for ${describeLanguage(targetLang) || targetLang}`);
-  }
+  const sourceLanguage = sourceLang ? describeLanguage(sourceLang) : "auto-detected language";
+  const targetLanguage = describeLanguage(targetLang);
 
-  const echoedSource = normalizeForComparison(translatedText) === normalizeForComparison(cleanText);
-  return translatedText && !echoedSource ? translatedText : "";
+  const systemPrompt = buildSystemPrompt({ sourceLang, targetLang, translationContext });
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+    
+    const mergedSignal = signal?.aborted ? signal : controller.signal;
+
+    const response = await fetch(OPENAI_API_URL, {
+      method: "POST",
+      signal: mergedSignal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: OPENAI_TRANSLATION_MODEL,
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          {
+            role: "user",
+            content: `Text:\n${cleanText}`
+          }
+        ],
+        temperature: 0,
+        max_tokens: 512
+      })
+    }).finally(() => clearTimeout(timeout));
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      const message = errorData?.error?.message || errorData?.error || response.statusText || "OpenAI translation request failed";
+      throw new Error(`OpenAI ${response.status}: ${message}`);
+    }
+
+    const data = await response.json();
+
+    if (!data?.choices?.length) {
+      throw new Error(`OpenAI returned no translation choices for ${targetLanguage}`);
+    }
+
+    const messageContent = data.choices[0]?.message?.content || "";
+    const translatedText = normalizeTranslatedText({ text: messageContent, targetLang });
+
+    if (!translatedText) {
+      throw new Error(`OpenAI returned an empty translation for ${targetLanguage}`);
+    }
+
+    const echoedSource = normalizeForComparison(translatedText) === normalizeForComparison(cleanText);
+    
+    if (signal?.aborted) {
+      throw new Error("OpenAI translation aborted");
+    }
+
+    return translatedText && !echoedSource ? translatedText : "";
+  } catch (error) {
+    if (signal?.aborted || error?.name === "AbortError") {
+      throw new Error("OpenAI translation aborted");
+    }
+    throw error;
+  }
 };

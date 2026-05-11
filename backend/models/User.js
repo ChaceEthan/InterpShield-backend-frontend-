@@ -63,14 +63,51 @@ const userSchema = new mongoose.Schema(
     },
     plan: {
       type: String,
-      enum: ["free", "pro"],
+      enum: ["free", "pro_lite", "creator", "business", "team"],
       default: "free"
     },
+    credits: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    totalCreditsEarned: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    totalCreditsSpent: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    dailyUsageMinutes: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    dailyUsageResetAt: {
+      type: Date,
+      default: () => new Date()
+    },
+    totalUsageMinutes: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    translationRequestsThisMonth: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    lastSessionLanguages: [String],
     settings: {
       type: mongoose.Schema.Types.Mixed,
       default: () => ({ ...defaultSettings })
     },
-    upgradedAt: Date
+    upgradedAt: Date,
+    subscriptionStartedAt: Date,
+    subscriptionEndsAt: Date
   },
   {
     timestamps: true

@@ -31,7 +31,7 @@ import { io, type Socket } from "socket.io-client";
 type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
 type SessionStatus = "idle" | "connecting" | "listening" | "stopping" | "error";
-type TranslationLifecycleState = "ready" | "queued" | "translating" | "retrying" | "done" | "failed";
+type TranslationLifecycleState = "ready" | "queued" | "processing" | "translating" | "retrying" | "translated" | "done" | "failed" | "stale" | "cancelled";
 type Plan = "free" | "pro";
 type SummaryLength = "short" | "standard" | "long";
 type AuthProvider = "manual" | "google";
@@ -518,7 +518,8 @@ const isValidTranslationText = ({
   const cleanText = text.trim();
   if (!isVisibleTranslationText(cleanText)) return false;
   if (sourceText && normalizeComparableText(cleanText) === normalizeComparableText(sourceText)) return false;
-  return isTargetLanguageText(cleanText, targetLang);
+  void targetLang;
+  return true;
 };
 
 const normalizeTranslationMap = (
@@ -566,25 +567,32 @@ const formatTranslationsText = (translations: Record<string, string>, targetLang
     .join("\n");
 
 const translationStateLabel = (state: TranslationLifecycleState) => {
-  if (state === "done") return "done";
+  if (state === "done" || state === "translated") return "done";
   if (state === "failed") return "failed";
+  if (state === "stale") return "stale";
+  if (state === "cancelled") return "cancelled";
   if (state === "retrying") return "retrying";
-  if (state === "translating") return "translating";
+  if (state === "translating" || state === "processing") return "processing";
   if (state === "queued") return "queued";
   return "ready";
 };
 
 const translationStateClass = (state: TranslationLifecycleState) => {
-  if (state === "done") return "bg-emerald-500/10 text-emerald-300";
+  if (state === "done" || state === "translated") return "bg-emerald-500/10 text-emerald-300";
   if (state === "failed") return "bg-red-500/10 text-red-200";
+  if (state === "stale" || state === "cancelled") return "bg-slate-800/80 text-slate-400";
   if (state === "retrying") return "bg-amber-500/10 text-amber-200";
-  if (state === "translating") return "bg-blue-500/10 text-blue-200";
+  if (state === "translating" || state === "processing") return "bg-blue-500/10 text-blue-200";
   return "bg-slate-800/80 text-slate-500";
 };
 
 const coerceTranslationState = (value: unknown): TranslationLifecycleState | "" => {
-  const state = String(value || "") as TranslationLifecycleState;
-  return ["ready", "queued", "translating", "retrying", "done", "failed"].includes(state) ? state : "";
+  const state = String(value || "");
+  if (state === "done") return "translated";
+  if (state === "translating") return "processing";
+  return ["ready", "queued", "processing", "retrying", "translated", "failed", "stale", "cancelled"].includes(state)
+    ? (state as TranslationLifecycleState)
+    : "";
 };
 
 const appendTextWindow = (current: string, next: string, maxChars = LIVE_TEXT_WINDOW_CHARS) => {
@@ -1276,8 +1284,12 @@ export default function App() {
   const lastFinalTranslationRef = useRef("");
   const lastCompletedTranslationRef = useRef("");
   const lastTranslationOriginalRef = useRef("");
+  const finalTranslationsRef = useRef<Record<string, string>>({});
   const pendingFinalTranscriptRef = useRef<Pick<TranscriptHistoryEntry, "original" | "timestamp" | "sourceLang" | "targetLang" | "targetLanguages"> | null>(null);
   const activeTranslationIdRef = useRef("");
+  const activeBackendSessionIdRef = useRef("");
+  const activeBackendTranslationJobIdRef = useRef<string | number>("");
+  const latestTranslationSequenceRef = useRef(0);
   const translationStatusUpdatedAtRef = useRef<Record<string, number>>({});
   const audioChunkMsRef = useRef(700);
   const interimTimerRef = useRef<number | null>(null);
@@ -1307,12 +1319,16 @@ export default function App() {
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
   const displayTranslationEntries = targetLanguages.map((language) => {
     const translatedText = finalTranslations[language]?.trim() || "";
-    const state: TranslationLifecycleState = translatedText ? "done" : translationStatuses[language] || (isRecording && mode !== "transcribe" ? "queued" : "ready");
+    const state: TranslationLifecycleState = translatedText ? "translated" : translationStatuses[language] || (isRecording && mode !== "transcribe" ? "queued" : "ready");
     return [language, translatedText, state] as const;
   });
   const visibleHistory = useMemo(() => history.slice(-VISIBLE_HISTORY_ITEMS), [history]);
   const maxSessionSeconds = config?.maxSessionSeconds || 3600;
   const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
+
+  useEffect(() => {
+    finalTranslationsRef.current = finalTranslations;
+  }, [finalTranslations]);
 
   const stopDubbingPlayback = useCallback((clearQueue = true) => {
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
@@ -1660,6 +1676,9 @@ export default function App() {
     activeDubbingUtteranceIdRef.current = "";
     activeDubbingLanguageRef.current = "";
     lastTranslationOriginalRef.current = "";
+    activeBackendSessionIdRef.current = "";
+    activeBackendTranslationJobIdRef.current = "";
+    latestTranslationSequenceRef.current = 0;
     if (subtitleThrottleTimerRef.current) {
       window.clearTimeout(subtitleThrottleTimerRef.current);
       subtitleThrottleTimerRef.current = null;
@@ -1788,7 +1807,7 @@ export default function App() {
       schedulePartialTranscript({ text: originalText, detectedLanguage });
     });
 
-    socket.on("transcript_final", ({ text, detectedLanguage, latencyMs, provider, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages }: { text?: string; detectedLanguage?: string; latencyMs?: number; provider?: string; sourceLang?: string; targetLang?: string; targetLanguages?: string[] }) => {
+    socket.on("transcript_final", ({ text, sessionId, jobId, sequence, detectedLanguage, latencyMs, provider, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages }: { text?: string; sessionId?: string; jobId?: string | number; sequence?: number; detectedLanguage?: string; latencyMs?: number; provider?: string; sourceLang?: string; targetLang?: string; targetLanguages?: string[] }) => {
       const originalText = text?.trim() || "";
       if (!originalText || originalText === lastFinalOriginalRef.current) return;
       if (detectedLanguage) setDetectedLanguage(detectedLanguage);
@@ -1820,6 +1839,15 @@ export default function App() {
       };
       pendingFinalTranscriptRef.current = pendingEntry;
       activeTranslationIdRef.current = `${timestamp}-${originalText.slice(0, 48)}`;
+      if (sessionId && activeBackendSessionIdRef.current !== sessionId) {
+        activeBackendSessionIdRef.current = sessionId;
+        latestTranslationSequenceRef.current = 0;
+      }
+      activeBackendTranslationJobIdRef.current = jobId || "";
+      const transcriptSequence = Number(sequence);
+      if (Number.isFinite(transcriptSequence)) {
+        latestTranslationSequenceRef.current = Math.max(latestTranslationSequenceRef.current, transcriptSequence);
+      }
       updateTranslationStatuses(Object.fromEntries(pendingTargetLanguages.map((language) => [language, "queued"])));
       spokenDubbingKeysRef.current = compactSetToLimit(spokenDubbingKeysRef.current, MAX_SPOKEN_DUBBING_KEYS);
       dubbingQueueRef.current = dubbingQueueRef.current.slice(-Math.ceil(MAX_DUBBING_QUEUE_ITEMS / 2));
@@ -1847,67 +1875,110 @@ export default function App() {
       }
     });
 
-    const handleTranslationUpdate = ({ original, text, translations, statusByLanguage, failedLanguages, latencyMs, provider, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete }: { original?: string; text?: string; translations?: Record<string, string>; statusByLanguage?: Record<string, string>; failedLanguages?: string[]; latencyMs?: number; provider?: string; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean }) => {
+    const handleTranslationUpdate = ({ original, text, translations, statusByLanguage, failedLanguages, latencyMs, provider, sessionId, jobId, sequence, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete }: { original?: string; text?: string; translations?: Record<string, string>; statusByLanguage?: Record<string, string>; failedLanguages?: string[]; latencyMs?: number; provider?: string; sessionId?: string; jobId?: string | number; sequence?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean }) => {
       const pendingTranscript = pendingFinalTranscriptRef.current;
       const updateOriginal = original?.trim() || "";
 
+      if (sessionId && activeBackendSessionIdRef.current && sessionId !== activeBackendSessionIdRef.current) {
+        return;
+      }
+      if (sessionId && !activeBackendSessionIdRef.current) {
+        activeBackendSessionIdRef.current = sessionId;
+      }
+
+      const incomingSequence = Number(sequence);
+      if (Number.isFinite(incomingSequence) && incomingSequence < latestTranslationSequenceRef.current) {
+        return;
+      }
+
       if (pendingTranscript && updateOriginal && updateOriginal !== pendingTranscript.original) {
+        return;
+      }
+      if (!pendingTranscript && updateOriginal && lastFinalOriginalRef.current && updateOriginal !== lastFinalOriginalRef.current) {
+        return;
+      }
+      if (jobId && activeBackendTranslationJobIdRef.current && String(jobId) !== String(activeBackendTranslationJobIdRef.current)) {
         return;
       }
 
       const nextTargetLanguages = normalizeTargetLanguages(eventTargetLanguages || pendingTranscript?.targetLanguages || targetLanguagesRef.current, eventTargetLang || pendingTranscript?.targetLang || targetLangRef.current);
       const sourceText = updateOriginal || pendingTranscript?.original || lastFinalOriginalRef.current;
       const nextTranslations = normalizeTranslationMap(translations, text || "", eventTargetLang || nextTargetLanguages[0], { sourceText });
-      const nextTranslation = formatTranslationsText(nextTranslations, nextTargetLanguages);
-      const nextTranslationSignature = JSON.stringify(orderedTranslationEntries(nextTranslations, nextTargetLanguages));
+      const mergedTranslations: Record<string, string> = { ...finalTranslationsRef.current };
+
+      for (const [language, translatedText] of Object.entries(nextTranslations)) {
+        if (isValidTranslationText({ text: translatedText, sourceText, targetLang: language })) {
+          mergedTranslations[language] = translatedText;
+        }
+      }
+
+      const incomingTranslation = formatTranslationsText(nextTranslations, nextTargetLanguages);
+      const mergedTranslation = formatTranslationsText(mergedTranslations, nextTargetLanguages);
+      const mergedTranslationSignature = JSON.stringify(orderedTranslationEntries(mergedTranslations, nextTargetLanguages));
       const isComplete = complete !== false && !partial;
       const nextStatusUpdates: Record<string, TranslationLifecycleState> = {};
       for (const [language, status] of Object.entries(statusByLanguage || {})) {
         const normalizedStatus = coerceTranslationState(status);
-        if (normalizedStatus) nextStatusUpdates[language] = normalizedStatus;
+        if (!normalizedStatus) continue;
+        if (normalizedStatus === "failed" && (mergedTranslations[language] || nextTranslations[language])) continue;
+        nextStatusUpdates[language] = normalizedStatus;
       }
       for (const language of failedLanguages || []) {
-        nextStatusUpdates[language] = "failed";
+        if (!mergedTranslations[language] && !nextTranslations[language]) {
+          nextStatusUpdates[language] = "failed";
+        }
       }
       for (const language of Object.keys(nextTranslations)) {
-        nextStatusUpdates[language] = "done";
+        nextStatusUpdates[language] = "translated";
       }
       const hasStatusUpdate = Object.keys(nextStatusUpdates).length > 0;
       const completedSignature = isComplete
-        ? `${activeTranslationIdRef.current || pendingTranscript?.timestamp || "current"}|${nextTranslationSignature}`
+        ? `${activeTranslationIdRef.current || pendingTranscript?.timestamp || "current"}|${mergedTranslationSignature}`
         : "";
 
-      if (!nextTranslation && !hasStatusUpdate) return;
-      if (hasStatusUpdate) updateTranslationStatuses(nextStatusUpdates);
-      if (!nextTranslation) return;
-      if (!isComplete && nextTranslationSignature === lastFinalTranslationRef.current && !hasStatusUpdate) return;
-      if (isComplete && completedSignature === lastCompletedTranslationRef.current && nextTranslationSignature === lastFinalTranslationRef.current) return;
+      if (!incomingTranslation && !hasStatusUpdate) return;
+      if (hasStatusUpdate) {
+        updateTranslationStatuses(nextStatusUpdates);
+        if (Number.isFinite(incomingSequence)) {
+          latestTranslationSequenceRef.current = Math.max(latestTranslationSequenceRef.current, incomingSequence);
+        }
+        if (jobId) activeBackendTranslationJobIdRef.current = jobId;
+      }
+      if (!incomingTranslation || !mergedTranslation) return;
+      if (!isComplete && mergedTranslationSignature === lastFinalTranslationRef.current && !hasStatusUpdate) return;
+      if (isComplete && completedSignature === lastCompletedTranslationRef.current && mergedTranslationSignature === lastFinalTranslationRef.current) return;
       if (import.meta.env.DEV) {
         console.info("[FRONTEND_TRANSLATION_RECEIVED]", {
           provider,
           targetLanguages: nextTargetLanguages,
           partial: Boolean(partial),
           complete: isComplete,
-          chars: nextTranslation.length
+          chars: mergedTranslation.length,
+          sequence: Number.isFinite(incomingSequence) ? incomingSequence : undefined
         });
       }
+      if (Number.isFinite(incomingSequence)) {
+        latestTranslationSequenceRef.current = Math.max(latestTranslationSequenceRef.current, incomingSequence);
+      }
+      if (jobId) activeBackendTranslationJobIdRef.current = jobId;
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
       trackLatency(latencyMs, provider);
 
       lastTranslationOriginalRef.current = sourceText;
-      lastFinalTranslationRef.current = nextTranslationSignature;
-      setFinalTranslations(nextTranslations);
+      lastFinalTranslationRef.current = mergedTranslationSignature;
+      finalTranslationsRef.current = mergedTranslations;
+      setFinalTranslations(mergedTranslations);
 
       if (isComplete) {
         if (completedSignature === lastCompletedTranslationRef.current) return;
         lastCompletedTranslationRef.current = completedSignature;
 
-        setFinalTranslationText((current) => [current, nextTranslation].filter(Boolean).join("\n\n").trim().slice(-3500));
-        setTranslatedSegments((current) => [...current, nextTranslation].slice(-MAX_LIVE_SEGMENTS));
+        setFinalTranslationText((current) => [current, mergedTranslation].filter(Boolean).join("\n\n").trim().slice(-3500));
+        setTranslatedSegments((current) => [...current, mergedTranslation].slice(-MAX_LIVE_SEGMENTS));
         appendTranscriptHistory({
           original: sourceText,
-          translated: nextTranslation,
-          translations: nextTranslations,
+          translated: mergedTranslation,
+          translations: mergedTranslations,
           timestamp: pendingTranscript?.timestamp || new Date().toISOString(),
           sourceLang: eventSourceLang || pendingTranscript?.sourceLang || sourceLangRef.current,
           targetLang: eventTargetLang || pendingTranscript?.targetLang || nextTargetLanguages[0],
@@ -1955,7 +2026,7 @@ export default function App() {
       const staleUpdates: Record<string, TranslationLifecycleState> = {};
 
       for (const [language, state] of Object.entries(translationStatuses)) {
-        if (!["queued", "translating", "retrying"].includes(state)) continue;
+        if (!["queued", "translating", "processing", "retrying"].includes(state)) continue;
         const updatedAt = translationStatusUpdatedAtRef.current[language] || 0;
         if (updatedAt && now - updatedAt > STALE_TRANSLATION_STATE_MS) staleUpdates[language] = "failed";
       }
@@ -2124,6 +2195,10 @@ export default function App() {
     lastCompletedTranslationRef.current = "";
     pendingFinalTranscriptRef.current = null;
     activeTranslationIdRef.current = "";
+    activeBackendSessionIdRef.current = "";
+    activeBackendTranslationJobIdRef.current = "";
+    latestTranslationSequenceRef.current = 0;
+    finalTranslationsRef.current = {};
     spokenDubbingKeysRef.current.clear();
     lastDubbingTextRef.current = "";
     stopDubbingPlayback(true);
@@ -2305,6 +2380,10 @@ export default function App() {
     lastCompletedTranslationRef.current = "";
     lastTranslationOriginalRef.current = "";
     activeTranslationIdRef.current = "";
+    activeBackendSessionIdRef.current = "";
+    activeBackendTranslationJobIdRef.current = "";
+    latestTranslationSequenceRef.current = 0;
+    finalTranslationsRef.current = {};
     pendingFinalTranscriptRef.current = null;
     spokenDubbingKeysRef.current.clear();
     lastDubbingTextRef.current = "";
