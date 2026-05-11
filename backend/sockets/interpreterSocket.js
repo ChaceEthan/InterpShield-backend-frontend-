@@ -182,7 +182,9 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           text: payload.text,
           sessionId: payload.sessionId,
           jobId: payload.jobId,
-          sequence: payload.sequence
+          sequence: payload.sequence,
+          lang: payload.lang,
+          status: payload.status
         });
         socket.emit("translation_update", payload);
         socket.emit("translation_result", payload);
@@ -232,6 +234,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
             outputs: safe.translationOutputs,
             statusByLanguage: safe.translationStatus,
             failedLanguages: safe.failedLanguages,
+            lang: result.lang,
+            status: result.status,
             sourceLang: result.sourceLang,
             targetLang: result.targetLang,
             targetLanguages: result.targetLanguages || [result.targetLang],
@@ -281,6 +285,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           outputs: safe.translationOutputs,
           statusByLanguage: safe.translationStatus,
           failedLanguages: safe.failedLanguages,
+          lang: result.lang,
+          status: result.status,
           sourceLang: result.sourceLang,
           targetLang: result.targetLang,
           targetLanguages: result.targetLanguages || [result.targetLang],

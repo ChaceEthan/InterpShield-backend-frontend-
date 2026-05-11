@@ -279,6 +279,35 @@ const withTimeout = (promise, timeoutMs, message) => {
   });
 };
 
+const translationMutex = (() => {
+  const tails = new Map();
+
+  return {
+    async acquire(sessionId) {
+      const key = sessionId || "default";
+      const previousTail = tails.get(key) || Promise.resolve();
+      let releaseCurrent = () => undefined;
+      const currentTail = new Promise((resolve) => {
+        releaseCurrent = resolve;
+      });
+      const chainedTail = previousTail.catch(() => undefined).then(() => currentTail);
+
+      tails.set(key, chainedTail);
+      await previousTail.catch(() => undefined);
+
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        releaseCurrent();
+        if (tails.get(key) === chainedTail) {
+          tails.delete(key);
+        }
+      };
+    }
+  };
+})();
+
 const hashTranslationCacheInput = (value = "") => {
   let hash = 2166136261;
   const input = String(value || "");
@@ -946,6 +975,13 @@ export const createInterpreterSession = async ({
   const providerAbortControllersByJob = new Map();
   const activeTranslationLanguageLocks = new Set();
   let activeSequentialTranslationJob = null;
+  const sessionTranslationQueue = {
+    queue: [],
+    processing: false,
+    activeJob: null,
+    currentAbortController: null,
+    sequence: 0
+  };
   const createTranslationLane = ({ group, language }) => ({
     id: `${group}:${language || "default"}`,
     group,
@@ -1039,14 +1075,21 @@ export const createInterpreterSession = async ({
     const jobId = typeof jobOrId === "object" && jobOrId !== null
       ? jobOrId.id
       : jobOrId || `preview-${translationEmitSequence + 1}`;
+    const stableSequence = typeof jobOrId === "object" && jobOrId !== null && Number.isFinite(jobOrId.sequence)
+      ? jobOrId.sequence
+      : null;
 
-    translationEmitSequence += 1;
+    if (stableSequence) {
+      translationEmitSequence = Math.max(translationEmitSequence, stableSequence);
+    } else {
+      translationEmitSequence += 1;
+    }
 
     return {
       sessionId,
       jobId,
       timestamp: new Date().toISOString(),
-      sequence: translationEmitSequence
+      sequence: stableSequence || translationEmitSequence
     };
   };
 
@@ -1113,6 +1156,11 @@ export const createInterpreterSession = async ({
     providerAbortControllersByJob.clear();
     activeSequentialTranslationJob = null;
     activeTranslationLanguageLocks.clear();
+    sessionTranslationQueue.currentAbortController?.abort?.();
+    sessionTranslationQueue.currentAbortController = null;
+    sessionTranslationQueue.activeJob = null;
+    sessionTranslationQueue.queue.length = 0;
+    sessionTranslationQueue.processing = false;
     translationJobs.clear();
     for (const lane of Object.values(translationLanes)) {
       lane.queue.length = 0;
@@ -1420,6 +1468,7 @@ export const createInterpreterSession = async ({
     const timeoutMs = PROVIDER_TIMEOUT_MS[provider] || 3000;
     const abortController = typeof AbortController !== "undefined" ? new AbortController() : null;
     const unregisterAbortController = trackProviderAbortController(jobId, abortController);
+    sessionTranslationQueue.currentAbortController = abortController;
     try {
       const translatedText = await withTimeout(
         providerRunner(provider)({
@@ -1435,6 +1484,9 @@ export const createInterpreterSession = async ({
       ).finally(() => {
         abortController?.abort();
         unregisterAbortController();
+        if (sessionTranslationQueue.currentAbortController === abortController) {
+          sessionTranslationQueue.currentAbortController = null;
+        }
       });
       const responseTimeMs = Date.now() - attemptStartedAt;
       rememberProviderLatency(provider, responseTimeMs);
@@ -1484,6 +1536,9 @@ export const createInterpreterSession = async ({
     } catch (error) {
       abortController?.abort();
       unregisterAbortController();
+      if (sessionTranslationQueue.currentAbortController === abortController) {
+        sessionTranslationQueue.currentAbortController = null;
+      }
       const responseTimeMs = Date.now() - attemptStartedAt;
       const timedOut = /timed out|timeout/i.test(error?.message || "");
       if (timedOut) translationMetrics.timeoutCount += 1;
@@ -1521,8 +1576,13 @@ export const createInterpreterSession = async ({
       return { text: cachedTranslation, provider: "cache" };
     }
 
-    const healthyProviders = getHealthyProviders();
-    if (healthyProviders.length === 0) {
+    refreshProviderCooldowns();
+    const providerOrder = [
+      env.openaiApiKey && providerAvailable("openai") ? "openai" : "",
+      env.geminiApiKey && providerAvailable("gemini") ? "gemini" : ""
+    ].filter(Boolean);
+
+    if (providerOrder.length === 0) {
       logTranslationEvent("TRANSLATION_FAILED", {
         sessionId,
         jobId,
@@ -1531,15 +1591,6 @@ export const createInterpreterSession = async ({
       }, "warn");
     }
 
-    const startProvider = (provider) =>
-      runProviderTranslationAttempt({
-        provider,
-        language,
-        translationInput,
-        direction,
-        languageTranslationContext,
-        jobId
-      });
     const consumeProviderResult = (result) => {
       if (!result) return "";
       if (result.stale) {
@@ -1573,50 +1624,28 @@ export const createInterpreterSession = async ({
       return { text: "", provider: result.provider };
     };
 
-    for (const provider of healthyProviders) {
-      for (let attempt = 0; attempt <= MAX_PROVIDER_RETRY_ATTEMPTS; attempt += 1) {
-        if (staleTranslationJobs.has(jobId)) break;
+    for (const provider of providerOrder) {
+      if (staleTranslationJobs.has(jobId)) break;
 
-        if (attempt > 0) {
-          translationMetrics.retryCount += 1;
-          await delay(PROVIDER_RETRY_DELAY_MS * Math.pow(2, attempt - 1));
-          if (staleTranslationJobs.has(jobId)) break;
-        }
-
-        const result = await startProvider(provider);
-        if (result?.stale) {
-          lastError = result.error;
-          return { text: "", provider, stale: true };
-        }
-
-        const translatedText = consumeProviderResult(result);
-        if (translatedText?.text) return translatedText;
-        if (!result?.error && !result?.timedOut) break;
+      const result = await runProviderTranslationAttempt({
+        provider,
+        language,
+        translationInput,
+        direction,
+        languageTranslationContext,
+        jobId
+      });
+      if (result?.stale) {
+        lastError = result.error;
+        return { text: "", provider, stale: true };
       }
+
+      const translatedText = consumeProviderResult(result);
+      if (translatedText?.text) return translatedText;
     }
 
     noteTranslationFailure(language, lastError);
-
-    const failureCachedTranslation = readCachedTranslation(translationCache, cacheKey, {
-      source: direction.source,
-      target: language,
-      sourceText: translationInput,
-      provider: "cache"
-    });
-    if (failureCachedTranslation) {
-      noteTranslationSuccess(language, failureCachedTranslation, languageTranslationContext);
-      return { text: failureCachedTranslation, provider: "cache" };
-    }
-
-    const localFallback = translateLocalFallbackLanguage({
-      language,
-      translationInput,
-      direction,
-      translationContext
-    });
-    if (localFallback.text) return localFallback;
-
-    return { text: "", provider: "retry" };
+    return { text: "", provider: providerOrder[providerOrder.length - 1] || "provider" };
   };
 
   const translationTaskKey = (jobId, language) => `${jobId}:${language}`;
@@ -1657,9 +1686,16 @@ export const createInterpreterSession = async ({
     if (activeSequentialTranslationJob?.id === job.id) {
       activeSequentialTranslationJob = null;
     }
+    if (sessionTranslationQueue.activeJob?.id === job.id) {
+      sessionTranslationQueue.activeJob = null;
+    }
 
-    logTranslationEvent("TRANSLATION_CANCELLED", {
+    logTranslationEvent("JOB_CANCEL", {
       sessionId,
+      sequence: job.sequence,
+      language: job.activeLanguage || job.direction?.targets?.join(",") || "all",
+      provider: "queue",
+      latency: Date.now() - (job.startedAt || job.createdAt || Date.now()),
       jobId: job.id,
       sourceLang: job.direction?.source,
       targetLanguages: job.direction?.targets,
@@ -1758,11 +1794,13 @@ export const createInterpreterSession = async ({
       original: job.sentence,
       originalText: job.sentence,
       ...createTranslationPayloadMetadata(job),
-      translatedText: job.translations[job.direction.target] || Object.values(job.translations).find(Boolean) || "",
+      translatedText: job.translations[language] || "",
       translations: { ...job.translations },
       translationOutputs: translationOutputsForJob(job),
       translationStatus: translationStatusForJob(job),
       failedLanguages: failedLanguagesForJob(job),
+      lang: language,
+      status,
       isFinal: true,
       isTranslationPartial: true,
       translationComplete: false,
@@ -1774,14 +1812,16 @@ export const createInterpreterSession = async ({
       provider,
       mode: "production"
     });
-    logTranslationEvent("TRANSLATION_EMIT", {
+    logTranslationEvent("LANGUAGE_EMIT", {
       sessionId,
+      sequence: job.sequence,
+      language,
       jobId: job.id,
       sourceLang: job.direction.source,
       targetLang: language,
       provider,
       status,
-      latencyMs: Date.now() - job.startedAt
+      latency: Date.now() - job.startedAt
     });
   };
 
@@ -1943,11 +1983,13 @@ export const createInterpreterSession = async ({
       original: job.sentence,
       originalText: job.sentence,
       ...createTranslationPayloadMetadata(job),
-      translatedText: job.translations[job.direction.target] || safeTranslatedText,
+      translatedText: safeTranslatedText,
       translations: { ...job.translations },
       translationOutputs,
       translationStatus: translationStatusForJob(job),
       failedLanguages: failedLanguagesForJob(job),
+      lang: language,
+      status: "translated",
       isFinal: true,
       isTranslationPartial: true,
       translationComplete: false,
@@ -1959,14 +2001,16 @@ export const createInterpreterSession = async ({
       provider,
       mode: "production"
     });
-    logTranslationEvent("TRANSLATION_EMIT", {
+    logTranslationEvent("LANGUAGE_EMIT", {
       sessionId,
+      sequence: job.sequence,
+      language,
       jobId: job.id,
       sourceLang: job.direction.source,
       targetLang: language,
       provider,
       status: "translated",
-      latencyMs: Date.now() - job.startedAt
+      latency: Date.now() - job.startedAt
     });
     return true;
   };
@@ -2306,20 +2350,36 @@ export const createInterpreterSession = async ({
     }
   }
 
-  const cancelOlderTranslationJobs = (nextJob) => {
+  const clearPendingTranslationQueue = (reason = "newer_final_transcript", nextJob = null) => {
+    const pendingCount = sessionTranslationQueue.queue.length;
+    sessionTranslationQueue.queue.length = 0;
+    logTranslationEvent("QUEUE_CLEAR", {
+      sessionId,
+      sequence: nextJob?.sequence || sessionTranslationQueue.sequence,
+      language: nextJob?.direction?.targets?.join(",") || "all",
+      provider: "queue",
+      latency: 0,
+      reason,
+      pendingCount
+    });
+
+    const activeJob = sessionTranslationQueue.activeJob || activeSequentialTranslationJob;
     if (
-      activeSequentialTranslationJob &&
-      activeSequentialTranslationJob.id !== nextJob.id &&
-      !activeSequentialTranslationJob.completed &&
-      !activeSequentialTranslationJob.stale
+      activeJob &&
+      activeJob.id !== nextJob?.id &&
+      !activeJob.completed &&
+      !activeJob.stale
     ) {
-      markTranslationJobStale(activeSequentialTranslationJob, "newer_final_transcript");
+      markTranslationJobStale(activeJob, reason);
     }
 
     for (const existingJob of [...translationJobs.values()]) {
-      if (existingJob.id === nextJob.id || existingJob.completed || existingJob.stale) continue;
-      markTranslationJobStale(existingJob, "newer_final_transcript");
+      if (existingJob.id === nextJob?.id || existingJob.completed || existingJob.stale) continue;
+      markTranslationJobStale(existingJob, reason);
     }
+
+    sessionTranslationQueue.currentAbortController?.abort?.();
+    sessionTranslationQueue.currentAbortController = null;
 
     for (const retryTimer of backgroundRetryTimers) {
       clearTimeout(retryTimer);
@@ -2348,12 +2408,21 @@ export const createInterpreterSession = async ({
       job.activeLanguageStartedAt = Date.now();
       activeTranslationLanguageLocks.add(language);
       setTranslationLanguageStatus(job, language, "processing");
-      emitTranslationStatusUpdate(job, language, "processing", "orchestrator");
+      logTranslationEvent("LANGUAGE_START", {
+        sessionId,
+        sequence: job.sequence,
+        language,
+        provider: "queue",
+        latency: 0,
+        jobId: job.id
+      });
 
       const languageStartedAt = job.activeLanguageStartedAt;
       let result = null;
+      let releaseLanguageLock = null;
 
       try {
+        releaseLanguageLock = await translationMutex.acquire(sessionId);
         const localResult = await translateFastLocalLanguage({
           language,
           translationInput: job.translationInput,
@@ -2392,17 +2461,42 @@ export const createInterpreterSession = async ({
         ) {
           finishSequentialLanguage(job, language, "translated");
           emitTranslationUpdate(job, language, translatedText, provider);
+          logTranslationEvent("LANGUAGE_SUCCESS", {
+            sessionId,
+            sequence: job.sequence,
+            language,
+            provider,
+            latency: Date.now() - languageStartedAt,
+            jobId: job.id
+          });
         } else {
           finishSequentialLanguage(job, language, "failed");
           markTranslationLanguageFailed(job, language, "empty_or_invalid_translation", provider);
+          logTranslationEvent("LANGUAGE_FAILED", {
+            sessionId,
+            sequence: job.sequence,
+            language,
+            provider,
+            latency: Date.now() - languageStartedAt,
+            jobId: job.id
+          });
         }
       } catch (error) {
         if (!job.stale && !staleTranslationJobs.has(job.id)) {
           noteTranslationFailure(language, error);
           finishSequentialLanguage(job, language, "failed");
           markTranslationLanguageFailed(job, language, error?.message || "translation_failed", "orchestrator");
+          logTranslationEvent("LANGUAGE_FAILED", {
+            sessionId,
+            sequence: job.sequence,
+            language,
+            provider: "orchestrator",
+            latency: Date.now() - languageStartedAt,
+            jobId: job.id
+          });
         }
       } finally {
+        releaseLanguageLock?.();
         activeTranslationLanguageLocks.delete(language);
         job.runningLanguages.delete(language);
         if (job.activeLanguage === language) {
@@ -2417,42 +2511,87 @@ export const createInterpreterSession = async ({
       }
     }
 
-    if (activeSequentialTranslationJob?.id === job.id) {
-      activeSequentialTranslationJob = null;
-    }
-
     finalizeTranslationJobIfReady(job);
   };
 
+  const processSessionTranslationQueue = async () => {
+    if (sessionTranslationQueue.processing) return;
+    sessionTranslationQueue.processing = true;
+
+    try {
+      while (sessionTranslationQueue.queue.length > 0) {
+        const job = sessionTranslationQueue.queue.shift();
+        if (!job || job.stale || job.completed || staleTranslationJobs.has(job.id)) continue;
+
+        sessionTranslationQueue.activeJob = job;
+        activeSequentialTranslationJob = job;
+        logTranslationEvent("JOB_START", {
+          sessionId,
+          sequence: job.sequence,
+          language: job.direction.targets.join(","),
+          provider: "queue",
+          latency: 0,
+          jobId: job.id
+        });
+
+        await processSequentialTranslationJob(job);
+
+        if (sessionTranslationQueue.activeJob?.id === job.id) {
+          sessionTranslationQueue.activeJob = null;
+        }
+        if (activeSequentialTranslationJob?.id === job.id) {
+          activeSequentialTranslationJob = null;
+        }
+        logTranslationEvent("QUEUE_NEXT", {
+          sessionId,
+          sequence: job.sequence,
+          language: job.direction.targets.join(","),
+          provider: job.lastProviderUsed || "queue",
+          latency: Date.now() - job.startedAt,
+          remaining: sessionTranslationQueue.queue.length
+        });
+      }
+    } finally {
+      sessionTranslationQueue.processing = false;
+      sessionTranslationQueue.activeJob = null;
+      activeSequentialTranslationJob = null;
+      if (sessionTranslationQueue.queue.length > 0) {
+        void processSessionTranslationQueue();
+      }
+    }
+  };
+
   const enqueueTranslationJob = (job) => {
-    cancelOlderTranslationJobs(job);
+    clearPendingTranslationQueue("newer_final_transcript", job);
     translationJobs.set(job.id, job);
-    activeSequentialTranslationJob = job;
 
     for (const language of job.direction.targets.slice(0, MAX_TARGET_LANGUAGES)) {
       setTranslationLanguageStatus(job, language, "queued");
     }
 
-    logTranslationEvent("TRANSLATION_QUEUED", {
+    sessionTranslationQueue.queue.push(job);
+    logTranslationEvent("QUEUE_ADD", {
       sessionId,
+      sequence: job.sequence,
+      language: job.direction.targets.join(","),
+      provider: "queue",
+      latency: 0,
       jobId: job.id,
-      sourceLang: job.direction.source,
-      targetLanguages: job.direction.targets,
-      chars: job.translationInput.length
+      queueLength: sessionTranslationQueue.queue.length
     });
-    emitTranslationStatusUpdate(job, job.direction.targets[0], "queued", "orchestrator");
     logTranslationMetrics("job_enqueued", {
       jobId: job.id,
       targetLanguages: job.direction.targets
     });
 
-    void processSequentialTranslationJob(job).catch((error) => {
-      if (job.stale || staleTranslationJobs.has(job.id)) return;
-      for (const language of job.direction.targets.slice(0, MAX_TARGET_LANGUAGES)) {
-        if (job.translations?.[language] || job.completedLanguages?.has?.(language)) continue;
-        markTranslationLanguageFailed(job, language, error?.message || "translation_orchestrator_failed", "orchestrator");
+    void processSessionTranslationQueue().catch((error) => {
+      const activeJob = sessionTranslationQueue.activeJob;
+      if (!activeJob || activeJob.stale || staleTranslationJobs.has(activeJob.id)) return;
+      for (const language of activeJob.direction.targets.slice(0, MAX_TARGET_LANGUAGES)) {
+        if (activeJob.translations?.[language] || activeJob.completedLanguages?.has?.(language)) continue;
+        markTranslationLanguageFailed(activeJob, language, error?.message || "translation_orchestrator_failed", "orchestrator");
       }
-      finalizeTranslationJobIfReady(job);
+      finalizeTranslationJobIfReady(activeJob);
     });
   };
 
@@ -2497,6 +2636,8 @@ export const createInterpreterSession = async ({
     const startedAt = Date.now();
     const jobId = translationJobSequence + 1;
     translationJobSequence = jobId;
+    sessionTranslationQueue.sequence += 1;
+    const jobSequence = sessionTranslationQueue.sequence;
     const translationInput = prepareTextForTranslation(sentence);
     const translationContext = buildTranslationContext({ sentence, direction, detectedLanguage: effectiveDetectedLanguage });
 
@@ -2521,6 +2662,7 @@ export const createInterpreterSession = async ({
 
     const job = {
       id: jobId,
+      sequence: jobSequence,
       sentence,
       normalizedSentence,
       translationInput,
@@ -2548,7 +2690,7 @@ export const createInterpreterSession = async ({
     onResult?.({
       original: sentence,
       originalText: sentence,
-      ...createTranslationPayloadMetadata(jobId),
+      ...createTranslationPayloadMetadata(job),
       translatedText: "",
       translations: {},
       translationOutputs: [],
@@ -2719,6 +2861,11 @@ export const createInterpreterSession = async ({
       lane.activeTasks.clear();
       lane.drainScheduled = false;
     }
+    sessionTranslationQueue.currentAbortController?.abort?.();
+    sessionTranslationQueue.currentAbortController = null;
+    sessionTranslationQueue.queue.length = 0;
+    sessionTranslationQueue.activeJob = null;
+    sessionTranslationQueue.processing = false;
     for (const retryTimer of backgroundRetryTimers) {
       clearTimeout(retryTimer);
     }

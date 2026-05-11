@@ -1856,9 +1856,7 @@ export default function App() {
       setFinalText((current) => appendTextWindow(current, originalText));
       setOriginalSegments((current) => [...current, originalText].slice(-MAX_LIVE_SEGMENTS));
       if (!keepStreamingTranslation) {
-        setFinalTranslations({});
         setTranslationStatuses(Object.fromEntries(pendingTargetLanguages.map((language) => [language, "queued" as TranslationLifecycleState])));
-        lastFinalTranslationRef.current = "";
       }
       lastCompletedTranslationRef.current = "";
 
@@ -1875,7 +1873,7 @@ export default function App() {
       }
     });
 
-    const handleTranslationUpdate = ({ original, text, translations, statusByLanguage, failedLanguages, latencyMs, provider, sessionId, jobId, sequence, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete }: { original?: string; text?: string; translations?: Record<string, string>; statusByLanguage?: Record<string, string>; failedLanguages?: string[]; latencyMs?: number; provider?: string; sessionId?: string; jobId?: string | number; sequence?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean }) => {
+    const handleTranslationUpdate = ({ original, text, translations, statusByLanguage, failedLanguages, latencyMs, provider, sessionId, jobId, sequence, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete, lang, status }: { original?: string; text?: string; translations?: Record<string, string>; statusByLanguage?: Record<string, string>; failedLanguages?: string[]; latencyMs?: number; provider?: string; sessionId?: string; jobId?: string | number; sequence?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean; lang?: string; status?: string }) => {
       const pendingTranscript = pendingFinalTranscriptRef.current;
       const updateOriginal = original?.trim() || "";
 
@@ -1903,7 +1901,8 @@ export default function App() {
 
       const nextTargetLanguages = normalizeTargetLanguages(eventTargetLanguages || pendingTranscript?.targetLanguages || targetLanguagesRef.current, eventTargetLang || pendingTranscript?.targetLang || targetLangRef.current);
       const sourceText = updateOriginal || pendingTranscript?.original || lastFinalOriginalRef.current;
-      const nextTranslations = normalizeTranslationMap(translations, text || "", eventTargetLang || nextTargetLanguages[0], { sourceText });
+      const singleLanguage = lang || eventTargetLang || nextTargetLanguages[0];
+      const nextTranslations = normalizeTranslationMap(translations, text || "", singleLanguage, { sourceText });
       const mergedTranslations: Record<string, string> = { ...finalTranslationsRef.current };
 
       for (const [language, translatedText] of Object.entries(nextTranslations)) {
@@ -1922,6 +1921,12 @@ export default function App() {
         if (!normalizedStatus) continue;
         if (normalizedStatus === "failed" && (mergedTranslations[language] || nextTranslations[language])) continue;
         nextStatusUpdates[language] = normalizedStatus;
+      }
+      if (lang && status) {
+        const normalizedStatus = coerceTranslationState(status);
+        if (normalizedStatus && !(normalizedStatus === "failed" && (mergedTranslations[lang] || nextTranslations[lang]))) {
+          nextStatusUpdates[lang] = normalizedStatus;
+        }
       }
       for (const language of failedLanguages || []) {
         if (!mergedTranslations[language] && !nextTranslations[language]) {
