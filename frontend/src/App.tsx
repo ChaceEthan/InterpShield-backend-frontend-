@@ -31,6 +31,7 @@ import { io, type Socket } from "socket.io-client";
 type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
 type SessionStatus = "idle" | "connecting" | "listening" | "stopping" | "error";
+type TranslationLifecycleState = "ready" | "queued" | "translating" | "retrying" | "done" | "failed";
 type Plan = "free" | "pro";
 type SummaryLength = "short" | "standard" | "long";
 type AuthProvider = "manual" | "google";
@@ -202,6 +203,7 @@ const DUBBING_UTTERANCE_TTL_MS = 45000;
 const MIN_MEDIA_CHUNK_BYTES = 192;
 const MIN_AUDIO_CHUNK_INTERVAL_MS = 90;
 const DUBBING_QUEUE_SETTLE_MS = 180;
+const STALE_TRANSLATION_STATE_MS = 9000;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
 const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
@@ -562,6 +564,28 @@ const formatTranslationsText = (translations: Record<string, string>, targetLang
   orderedTranslationEntries(translations, targetLanguages)
     .map(([language, translatedText]) => `${language.toUpperCase()}: ${translatedText}`)
     .join("\n");
+
+const translationStateLabel = (state: TranslationLifecycleState) => {
+  if (state === "done") return "done";
+  if (state === "failed") return "failed";
+  if (state === "retrying") return "retrying";
+  if (state === "translating") return "translating";
+  if (state === "queued") return "queued";
+  return "ready";
+};
+
+const translationStateClass = (state: TranslationLifecycleState) => {
+  if (state === "done") return "bg-emerald-500/10 text-emerald-300";
+  if (state === "failed") return "bg-red-500/10 text-red-200";
+  if (state === "retrying") return "bg-amber-500/10 text-amber-200";
+  if (state === "translating") return "bg-blue-500/10 text-blue-200";
+  return "bg-slate-800/80 text-slate-500";
+};
+
+const coerceTranslationState = (value: unknown): TranslationLifecycleState | "" => {
+  const state = String(value || "") as TranslationLifecycleState;
+  return ["ready", "queued", "translating", "retrying", "done", "failed"].includes(state) ? state : "";
+};
 
 const appendTextWindow = (current: string, next: string, maxChars = LIVE_TEXT_WINDOW_CHARS) => {
   const combined = [current, next].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
@@ -1188,6 +1212,7 @@ export default function App() {
   const [finalText, setFinalText] = useState("");
   const [finalTranslationText, setFinalTranslationText] = useState("");
   const [finalTranslations, setFinalTranslations] = useState<Record<string, string>>({});
+  const [translationStatuses, setTranslationStatuses] = useState<Record<string, TranslationLifecycleState>>({});
   const [interimOriginal, setInterimOriginal] = useState("");
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [chunkCount, setChunkCount] = useState(0);
@@ -1253,6 +1278,7 @@ export default function App() {
   const lastTranslationOriginalRef = useRef("");
   const pendingFinalTranscriptRef = useRef<Pick<TranscriptHistoryEntry, "original" | "timestamp" | "sourceLang" | "targetLang" | "targetLanguages"> | null>(null);
   const activeTranslationIdRef = useRef("");
+  const translationStatusUpdatedAtRef = useRef<Record<string, number>>({});
   const audioChunkMsRef = useRef(700);
   const interimTimerRef = useRef<number | null>(null);
   const subtitleThrottleTimerRef = useRef<number | null>(null);
@@ -1279,7 +1305,11 @@ export default function App() {
   const isRecording = status === "connecting" || status === "listening";
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
-  const displayTranslationEntries = targetLanguages.map((language) => [language, finalTranslations[language]?.trim() || ""] as const);
+  const displayTranslationEntries = targetLanguages.map((language) => {
+    const translatedText = finalTranslations[language]?.trim() || "";
+    const state: TranslationLifecycleState = translatedText ? "done" : translationStatuses[language] || (isRecording && mode !== "transcribe" ? "queued" : "ready");
+    return [language, translatedText, state] as const;
+  });
   const visibleHistory = useMemo(() => history.slice(-VISIBLE_HISTORY_ITEMS), [history]);
   const maxSessionSeconds = config?.maxSessionSeconds || 3600;
   const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
@@ -1555,6 +1585,21 @@ export default function App() {
     });
   }, []);
 
+  const updateTranslationStatuses = useCallback((updates: Record<string, TranslationLifecycleState | string>) => {
+    const now = Date.now();
+    const normalizedUpdates: Record<string, TranslationLifecycleState> = {};
+
+    for (const [language, value] of Object.entries(updates)) {
+      const status = coerceTranslationState(value);
+      if (!status) continue;
+      normalizedUpdates[language] = status;
+      translationStatusUpdatedAtRef.current[language] = now;
+    }
+
+    if (Object.keys(normalizedUpdates).length === 0) return;
+    setTranslationStatuses((current) => ({ ...current, ...normalizedUpdates }));
+  }, []);
+
   const flushPendingPartialTranscript = useCallback(() => {
     const pending = pendingPartialTranscriptRef.current;
     if (!pending) return;
@@ -1775,6 +1820,7 @@ export default function App() {
       };
       pendingFinalTranscriptRef.current = pendingEntry;
       activeTranslationIdRef.current = `${timestamp}-${originalText.slice(0, 48)}`;
+      updateTranslationStatuses(Object.fromEntries(pendingTargetLanguages.map((language) => [language, "queued"])));
       spokenDubbingKeysRef.current = compactSetToLimit(spokenDubbingKeysRef.current, MAX_SPOKEN_DUBBING_KEYS);
       dubbingQueueRef.current = dubbingQueueRef.current.slice(-Math.ceil(MAX_DUBBING_QUEUE_ITEMS / 2));
       setInterimOriginal("");
@@ -1783,6 +1829,7 @@ export default function App() {
       setOriginalSegments((current) => [...current, originalText].slice(-MAX_LIVE_SEGMENTS));
       if (!keepStreamingTranslation) {
         setFinalTranslations({});
+        setTranslationStatuses(Object.fromEntries(pendingTargetLanguages.map((language) => [language, "queued" as TranslationLifecycleState])));
         lastFinalTranslationRef.current = "";
       }
       lastCompletedTranslationRef.current = "";
@@ -1800,7 +1847,7 @@ export default function App() {
       }
     });
 
-    const handleTranslationUpdate = ({ original, text, translations, latencyMs, provider, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete }: { original?: string; text?: string; translations?: Record<string, string>; latencyMs?: number; provider?: string; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean }) => {
+    const handleTranslationUpdate = ({ original, text, translations, statusByLanguage, failedLanguages, latencyMs, provider, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete }: { original?: string; text?: string; translations?: Record<string, string>; statusByLanguage?: Record<string, string>; failedLanguages?: string[]; latencyMs?: number; provider?: string; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean }) => {
       const pendingTranscript = pendingFinalTranscriptRef.current;
       const updateOriginal = original?.trim() || "";
 
@@ -1814,19 +1861,36 @@ export default function App() {
       const nextTranslation = formatTranslationsText(nextTranslations, nextTargetLanguages);
       const nextTranslationSignature = JSON.stringify(orderedTranslationEntries(nextTranslations, nextTargetLanguages));
       const isComplete = complete !== false && !partial;
+      const nextStatusUpdates: Record<string, TranslationLifecycleState> = {};
+      for (const [language, status] of Object.entries(statusByLanguage || {})) {
+        const normalizedStatus = coerceTranslationState(status);
+        if (normalizedStatus) nextStatusUpdates[language] = normalizedStatus;
+      }
+      for (const language of failedLanguages || []) {
+        nextStatusUpdates[language] = "failed";
+      }
+      for (const language of Object.keys(nextTranslations)) {
+        nextStatusUpdates[language] = "done";
+      }
+      const hasStatusUpdate = Object.keys(nextStatusUpdates).length > 0;
       const completedSignature = isComplete
         ? `${activeTranslationIdRef.current || pendingTranscript?.timestamp || "current"}|${nextTranslationSignature}`
         : "";
 
-      if (!nextTranslation || (!isComplete && nextTranslationSignature === lastFinalTranslationRef.current)) return;
+      if (!nextTranslation && !hasStatusUpdate) return;
+      if (hasStatusUpdate) updateTranslationStatuses(nextStatusUpdates);
+      if (!nextTranslation) return;
+      if (!isComplete && nextTranslationSignature === lastFinalTranslationRef.current && !hasStatusUpdate) return;
       if (isComplete && completedSignature === lastCompletedTranslationRef.current && nextTranslationSignature === lastFinalTranslationRef.current) return;
-      console.info("[FRONTEND_TRANSLATION_RECEIVED]", {
-        provider,
-        targetLanguages: nextTargetLanguages,
-        partial: Boolean(partial),
-        complete: isComplete,
-        chars: nextTranslation.length
-      });
+      if (import.meta.env.DEV) {
+        console.info("[FRONTEND_TRANSLATION_RECEIVED]", {
+          provider,
+          targetLanguages: nextTargetLanguages,
+          partial: Boolean(partial),
+          complete: isComplete,
+          chars: nextTranslation.length
+        });
+      }
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
       trackLatency(latencyMs, provider);
 
@@ -1870,7 +1934,7 @@ export default function App() {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [token, user, stopDubbingPlayback]);
+  }, [token, user, stopDubbingPlayback, updateTranslationStatuses]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1884,6 +1948,23 @@ export default function App() {
 
     return () => window.clearInterval(timer);
   }, [maxSessionSeconds, stopSession]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      const staleUpdates: Record<string, TranslationLifecycleState> = {};
+
+      for (const [language, state] of Object.entries(translationStatuses)) {
+        if (!["queued", "translating", "retrying"].includes(state)) continue;
+        const updatedAt = translationStatusUpdatedAtRef.current[language] || 0;
+        if (updatedAt && now - updatedAt > STALE_TRANSLATION_STATE_MS) staleUpdates[language] = "failed";
+      }
+
+      if (Object.keys(staleUpdates).length > 0) updateTranslationStatuses(staleUpdates);
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [translationStatuses, updateTranslationStatuses]);
 
   useEffect(() => {
     if (!("speechSynthesis" in window)) return;
@@ -2034,6 +2115,8 @@ export default function App() {
     setDetectedLanguage(null);
     setChunkCount(0);
     setLastLatency(null);
+    setTranslationStatuses({});
+    translationStatusUpdatedAtRef.current = {};
     sequenceRef.current = 0;
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
@@ -2042,11 +2125,8 @@ export default function App() {
     pendingFinalTranscriptRef.current = null;
     activeTranslationIdRef.current = "";
     spokenDubbingKeysRef.current.clear();
-    dubbingQueueRef.current = [];
-    dubbingSpeakingRef.current = false;
-    activeDubbingUtteranceIdRef.current = "";
-    activeDubbingLanguageRef.current = "";
-    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    lastDubbingTextRef.current = "";
+    stopDubbingPlayback(true);
     pendingPartialTranscriptRef.current = null;
     if (subtitleThrottleTimerRef.current) {
       window.clearTimeout(subtitleThrottleTimerRef.current);
@@ -2179,7 +2259,7 @@ export default function App() {
 
       setAlert("Microphone not detected");
     }
-  }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, shareableMode, sourceLang, targetLang, targetLanguages, twoWay, user?.id, user?.plan]);
+  }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, shareableMode, sourceLang, stopDubbingPlayback, targetLang, targetLanguages, twoWay, user?.id, user?.plan]);
 
   const selectMode = (nextMode: Mode) => {
     if (isRecording) return;
@@ -2212,6 +2292,8 @@ export default function App() {
     setFinalText("");
     setFinalTranslationText("");
     setFinalTranslations({});
+    setTranslationStatuses({});
+    translationStatusUpdatedAtRef.current = {};
     setInterimOriginal("");
     setSessionSeconds(0);
     setChunkCount(0);
@@ -2503,14 +2585,14 @@ export default function App() {
                   </p>
                 ) : displayTranslationEntries.length > 0 ? (
                   <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
-                    {displayTranslationEntries.map(([language, translatedText]) => (
+                    {displayTranslationEntries.map(([language, translatedText, translationState]) => (
                       <div key={language} className={`rounded-lg border p-3 transition ${translatedText ? "border-white/10 bg-slate-950/40" : "border-white/5 bg-slate-950/20"}`}>
                         <div className="mb-2 flex items-center justify-between gap-2">
                           <span className="flex min-w-0 items-center gap-2 text-sm font-black text-blue-100"><span aria-hidden="true">{languageFlag(language)}</span>{language.toUpperCase()}</span>
-                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-black uppercase tracking-widest ${translatedText ? "bg-emerald-500/10 text-emerald-300" : "bg-slate-800/80 text-slate-500"}`}>{translatedText ? "done" : isRecording ? "queued" : "ready"}</span>
+                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-black uppercase tracking-widest ${translationStateClass(translationState)}`}>{translationStateLabel(translationState)}</span>
                         </div>
                         <p className="min-h-20 text-base font-black leading-7 text-white md:text-lg">
-                          <TypingSubtitle text={translatedText} empty={isRecording ? "Translating..." : "Translated subtitles appear here."} />
+                          <TypingSubtitle text={translatedText} empty={translationState === "failed" ? "Translation did not complete." : isRecording ? "Translating..." : "Translated subtitles appear here."} />
                         </p>
                       </div>
                     ))}

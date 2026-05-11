@@ -12,6 +12,8 @@ const LOG_TEXT_PREVIEW_CHARS = 96;
 const callRooms = new Map();
 
 const logSocketTranslationEvent = (event, payload = {}) => {
+  if (process.env.NODE_ENV === "production") return;
+
   const safePayload = {};
 
   for (const [key, value] of Object.entries(payload || {})) {
@@ -103,11 +105,15 @@ const sanitizeTranslationResult = (result = {}) => {
       ...result,
       translatedText,
       translations,
-      translationOutputs
+      translationOutputs,
+      translationStatus: result.translationStatus || {},
+      failedLanguages: Array.isArray(result.failedLanguages) ? result.failedLanguages : []
     },
     translatedText,
     translations,
-    translationOutputs
+    translationOutputs,
+    translationStatus: result.translationStatus || {},
+    failedLanguages: Array.isArray(result.failedLanguages) ? result.failedLanguages : []
   };
 };
 
@@ -209,13 +215,16 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       if (result.isTranslationPartial || result.isTranslationComplete) {
         const safe = sanitizeTranslationResult(result);
         const translations = safe.translations;
+        const hasTranslationState = Object.keys(safe.translationStatus || {}).length > 0 || safe.failedLanguages.length > 0;
 
-        if (Object.keys(translations).length > 0) {
+        if (Object.keys(translations).length > 0 || hasTranslationState) {
           emitTranslationPayload({
             original: result.originalText,
             text: safe.translatedText,
             translations,
             outputs: safe.translationOutputs,
+            statusByLanguage: safe.translationStatus,
+            failedLanguages: safe.failedLanguages,
             sourceLang: result.sourceLang,
             targetLang: result.targetLang,
             targetLanguages: result.targetLanguages || [result.targetLang],
@@ -247,13 +256,16 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
       const safe = sanitizeTranslationResult(result);
       const translations = safe.translations;
+      const hasTranslationState = Object.keys(safe.translationStatus || {}).length > 0 || safe.failedLanguages.length > 0;
 
-      if (Object.keys(translations).length > 0) {
+      if (Object.keys(translations).length > 0 || hasTranslationState) {
         emitTranslationPayload({
           original: result.originalText,
           text: safe.translatedText,
           translations,
           outputs: safe.translationOutputs,
+          statusByLanguage: safe.translationStatus,
+          failedLanguages: safe.failedLanguages,
           sourceLang: result.sourceLang,
           targetLang: result.targetLang,
           targetLanguages: result.targetLanguages || [result.targetLang],
