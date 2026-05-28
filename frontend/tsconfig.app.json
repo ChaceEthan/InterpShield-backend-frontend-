@@ -9,7 +9,8 @@
     "allowImportingTsExtensions": true,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["src/*"],
+      "@/": ["src/"]
     },
     "isolatedModules": true,
     "moduleDetection": "force",

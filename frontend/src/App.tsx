@@ -195,6 +195,7 @@ declare global {
 }
 
 const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
+const SOCKET_URL = (import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL)?.replace(/\/$/, "");
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const TRANSCRIPT_HISTORY_STORAGE_KEY = "interp_history";
 const MAX_TRANSCRIPT_HISTORY_ENTRIES = 40;
@@ -1707,7 +1708,12 @@ export default function App() {
       return undefined;
     }
 
-    const socket = io(API, {
+    if (!SOCKET_URL) {
+      setAlert("Backend socket URL is missing. Set VITE_SOCKET_URL or VITE_API_URL and restart the frontend.");
+      return undefined;
+    }
+
+    const socket = io(SOCKET_URL, {
       auth: { token },
       transports: ["websocket", "polling"],
       withCredentials: true,
