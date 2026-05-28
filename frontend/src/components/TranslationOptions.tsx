@@ -1,5 +1,5 @@
 import { Info, Route } from "lucide-react";
-import { motion } from "motion/react";
+import { motion } from "framer-motion";
 
 interface TranslationOptionsProps {
   twoWayEnabled: boolean;

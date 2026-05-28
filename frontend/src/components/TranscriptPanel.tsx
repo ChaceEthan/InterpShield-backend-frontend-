@@ -1,5 +1,5 @@
 import React from 'react';
-import { motion, AnimatePresence } from 'motion/react';
+import { motion, AnimatePresence } from 'framer-motion';
 import { ChevronDown, Zap } from 'lucide-react';
 
 interface TranscriptEntry {

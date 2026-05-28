@@ -1,5 +1,5 @@
 import { FileText, Languages, Volume2 } from "lucide-react";
-import { motion } from "motion/react";
+import { motion } from "framer-motion";
 
 export type ToolType = "transcribe" | "translate" | "dubbing";
 

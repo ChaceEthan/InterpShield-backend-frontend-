@@ -1,4 +1,7 @@
 node_modules/
+.npm-cache/
+.browser-profile/
+dev-check*.png
 .env
 .env.local
 .env.*

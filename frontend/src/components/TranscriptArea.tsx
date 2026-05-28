@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { Languages } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, motion } from "framer-motion";
 
 export interface TranscriptTranslationEntry {
   language: string;

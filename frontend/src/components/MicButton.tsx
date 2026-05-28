@@ -1,5 +1,5 @@
 import { CircleStop, Loader2, Mic } from "lucide-react";
-import { motion } from "motion/react";
+import { motion } from "framer-motion";
 
 interface MicButtonProps {
   isRecording: boolean;

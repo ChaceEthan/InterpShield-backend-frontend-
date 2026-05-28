@@ -1,7 +1,7 @@
 {
   "framework": "vite",
-  "installCommand": "npm install --prefix frontend",
-  "buildCommand": "npm run build --prefix frontend && npm run sync:frontend-dist",
+  "installCommand": "npm install --legacy-peer-deps",
+  "buildCommand": "npm run build --workspace=frontend && npm run sync:frontend-dist",
   "outputDirectory": "dist",
   "rewrites": [
     {

@@ -25,7 +25,7 @@ import {
   Volume2,
   type LucideIcon
 } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, motion } from "framer-motion";
 import { io, type Socket } from "socket.io-client";
 import { HeroSection } from "./components/HeroSection";
 import { LanguageSelector } from "./components/LanguageSelector";
