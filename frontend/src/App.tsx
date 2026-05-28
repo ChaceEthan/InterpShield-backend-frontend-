@@ -40,6 +40,8 @@ type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history"
 type Mode = "transcribe" | "translate" | "dubbing";
 type SessionStatus = "idle" | "connecting" | "listening" | "stopping" | "error";
 type TranslationLifecycleState = "ready" | "queued" | "processing" | "translating" | "retrying" | "translated" | "done" | "failed" | "stale" | "cancelled";
+type SocketConnectionState = "ready" | "connecting" | "connected" | "listening" | "translating" | "reconnecting";
+type MicrophonePermissionState = "unknown" | "prompt" | "granted" | "denied" | "unsupported";
 type Plan = "free" | "pro";
 type SummaryLength = "short" | "standard" | "long";
 type AuthProvider = "manual" | "google";
@@ -164,6 +166,15 @@ interface PartialTranscriptPayload {
   detectedLanguage?: string;
 }
 
+interface AudioChunkPayload {
+  audio: Blob;
+  sequence: number;
+  audioLevel: number;
+  chunkMs: number;
+  capturedAt: number;
+  mimeType: string;
+}
+
 interface GoogleCredentialResponse {
   credential?: string;
   select_by?: string;
@@ -195,7 +206,7 @@ declare global {
 }
 
 const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
-const SOCKET_URL = (import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL)?.replace(/\/$/, "");
+const SOCKET_URL = API;
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const TRANSCRIPT_HISTORY_STORAGE_KEY = "interp_history";
 const MAX_TRANSCRIPT_HISTORY_ENTRIES = 40;
@@ -211,6 +222,8 @@ const MAX_SPOKEN_DUBBING_KEYS = 180;
 const DUBBING_UTTERANCE_TTL_MS = 45000;
 const MIN_MEDIA_CHUNK_BYTES = 96;
 const MIN_AUDIO_CHUNK_INTERVAL_MS = 45;
+const MAX_QUEUED_AUDIO_CHUNKS = 12;
+const CLIENT_HEARTBEAT_MS = 25000;
 const DUBBING_QUEUE_SETTLE_MS = 180;
 const STALE_TRANSLATION_STATE_MS = 45000;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
@@ -1203,6 +1216,8 @@ export default function App() {
   const [savedHistory, setSavedHistory] = useState<HistoryItem[]>([]);
   const [billingCycle, setBillingCycle] = useState<"monthly" | "yearly">("monthly");
   const [microphones, setMicrophones] = useState<MediaDeviceInfo[]>([]);
+  const [microphonePermission, setMicrophonePermission] = useState<MicrophonePermissionState>("unknown");
+  const [microphoneAvailable, setMicrophoneAvailable] = useState<boolean | null>(null);
 
   const [mode, setMode] = useState<Mode>("translate");
   const [sourceLang, setSourceLang] = useState("en");
@@ -1210,9 +1225,9 @@ export default function App() {
   const [targetLanguages, setTargetLanguages] = useState<string[]>(DEFAULT_TARGET_LANGUAGES);
   const [privateMode, setPrivateMode] = useState(true);
   const [shareableMode, setShareableMode] = useState(false);
-  const [twoWay, setTwoWay] = useState(false);
   const [status, setStatus] = useState<SessionStatus>("idle");
   const [socketConnected, setSocketConnected] = useState(false);
+  const [socketReconnecting, setSocketReconnecting] = useState(false);
   const [originalSegments, setOriginalSegments] = useState<string[]>([]);
   const [translatedSegments, setTranslatedSegments] = useState<string[]>([]);
   const [history, setHistory] = useState<TranscriptHistoryEntry[]>(readStoredTranscriptHistory);
@@ -1278,6 +1293,8 @@ export default function App() {
   const shouldRestartSessionOnReconnectRef = useRef(false);
   const sequenceRef = useRef(0);
   const lastAudioChunkSentAtRef = useRef(0);
+  const queuedAudioChunksRef = useRef<AudioChunkPayload[]>([]);
+  const clientHeartbeatTimerRef = useRef<number | null>(null);
   const sessionStartedAtRef = useRef<number | null>(null);
   const lastInterimRef = useRef("");
   const lastFinalOriginalRef = useRef("");
@@ -1317,6 +1334,21 @@ export default function App() {
   const isRecording = status === "connecting" || status === "listening";
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
+  const isTranslationActive = mode !== "transcribe" && Object.values(translationStatuses).some((translationState) =>
+    ["queued", "processing", "translating", "retrying"].includes(translationState)
+  );
+  const connectionState: SocketConnectionState =
+    socketReconnecting || (!socketConnected && status === "listening")
+      ? "reconnecting"
+      : status === "connecting"
+        ? "connecting"
+        : isTranslationActive
+          ? "translating"
+          : status === "listening"
+            ? "listening"
+            : socketConnected
+              ? "connected"
+              : "ready";
   const displayTranslationEntries = targetLanguages.map((language) => {
     const translatedText = finalTranslations[language]?.trim() || "";
     const state: TranslationLifecycleState = translatedText ? "translated" : translationStatuses[language] || (isRecording && mode !== "transcribe" ? "queued" : "ready");
@@ -1324,7 +1356,18 @@ export default function App() {
   });
   const visibleHistory = useMemo(() => history.slice(-VISIBLE_HISTORY_ITEMS), [history]);
   const maxSessionSeconds = config?.maxSessionSeconds || 3600;
-  const statusLabel = status === "connecting" ? "Connecting" : status === "listening" ? "Live" : status === "stopping" ? "Stopping" : status === "error" ? "Attention" : "Ready";
+  const statusLabel = status === "stopping"
+    ? "Stopping"
+    : status === "error"
+      ? "Attention"
+      : {
+          ready: "Ready",
+          connecting: "Connecting",
+          connected: "Connected",
+          listening: "Listening",
+          translating: "Translating",
+          reconnecting: "Reconnecting..."
+        }[connectionState];
 
   useEffect(() => {
     finalTranslationsRef.current = finalTranslations;
@@ -1411,9 +1454,35 @@ export default function App() {
 
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
-      setMicrophones(devices.filter((device) => device.kind === "audioinput"));
+      const audioInputs = devices.filter((device) => device.kind === "audioinput");
+      setMicrophones(audioInputs);
+      if (audioInputs.length > 0) setMicrophoneAvailable(true);
     } catch {
       setMicrophones([]);
+    }
+  }, []);
+
+  const refreshMicrophonePermission = useCallback(async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMicrophonePermission("unsupported");
+      setMicrophoneAvailable(false);
+      return;
+    }
+
+    if (!navigator.permissions?.query) {
+      setMicrophonePermission("unknown");
+      return;
+    }
+
+    try {
+      const permission = await navigator.permissions.query({ name: "microphone" as PermissionName });
+      const updatePermission = () => {
+        setMicrophonePermission(permission.state === "granted" || permission.state === "denied" || permission.state === "prompt" ? permission.state : "unknown");
+      };
+      updatePermission();
+      permission.onchange = updatePermission;
+    } catch {
+      setMicrophonePermission("unknown");
     }
   }, []);
 
@@ -1481,7 +1550,8 @@ export default function App() {
   useEffect(() => {
     void fetchConfig();
     void refreshMicrophones();
-  }, [fetchConfig, refreshMicrophones]);
+    void refreshMicrophonePermission();
+  }, [fetchConfig, refreshMicrophones, refreshMicrophonePermission]);
 
   useEffect(() => {
     if (token) void refreshMe(token);
@@ -1516,8 +1586,22 @@ export default function App() {
   useEffect(() => {
     setTargetLanguages((current) => {
       if (!current.includes(sourceLang)) return current;
-      const fallback = LANGUAGES.find((language) => language.code !== sourceLang)?.code || DEFAULT_TARGET_LANGUAGES[0];
-      return normalizeTargetLanguages(current.filter((language) => language !== sourceLang), fallback);
+      const desiredCount = Math.min(MAX_TARGET_LANGUAGES, Math.max(1, current.length));
+      const nextTargets: string[] = [];
+      const candidates = [
+        ...current.filter((language) => language !== sourceLang),
+        ...DEFAULT_TARGET_LANGUAGES,
+        ...LANGUAGES.map((language) => language.code)
+      ];
+
+      for (const candidate of candidates) {
+        const code = normalizeLanguageCode(candidate);
+        if (!code || code === "auto" || code === sourceLang || nextTargets.includes(code)) continue;
+        nextTargets.push(code);
+        if (nextTargets.length === desiredCount) break;
+      }
+
+      return nextTargets.length > 0 ? nextTargets : ["es"];
     });
   }, [sourceLang]);
 
@@ -1679,6 +1763,7 @@ export default function App() {
     activeBackendSessionIdRef.current = "";
     activeBackendTranslationJobIdRef.current = "";
     latestTranslationSequenceRef.current = 0;
+    queuedAudioChunksRef.current = [];
     if (subtitleThrottleTimerRef.current) {
       window.clearTimeout(subtitleThrottleTimerRef.current);
       subtitleThrottleTimerRef.current = null;
@@ -1689,6 +1774,28 @@ export default function App() {
     }
     pendingPartialTranscriptRef.current = null;
   }, [stopDubbingPlayback]);
+
+  const emitAudioChunkPayload = useCallback((payload: AudioChunkPayload) => {
+    const activeSocket = socketRef.current;
+
+    if (activeSocket?.connected) {
+      activeSocket.emit("audio_chunk", payload);
+      return true;
+    }
+
+    queuedAudioChunksRef.current = [...queuedAudioChunksRef.current, payload].slice(-MAX_QUEUED_AUDIO_CHUNKS);
+    return false;
+  }, []);
+
+  const flushQueuedAudioChunks = useCallback(() => {
+    const activeSocket = socketRef.current;
+    if (!activeSocket?.connected || queuedAudioChunksRef.current.length === 0) return;
+
+    const queuedChunks = queuedAudioChunksRef.current.splice(0, queuedAudioChunksRef.current.length);
+    for (const chunk of queuedChunks) {
+      activeSocket.emit("audio_chunk", chunk);
+    }
+  }, []);
 
   const stopSession = useCallback(() => {
     if (status === "stopping") return;
@@ -1709,9 +1816,25 @@ export default function App() {
     }
 
     if (!SOCKET_URL) {
-      setAlert("Backend socket URL is missing. Set VITE_SOCKET_URL or VITE_API_URL and restart the frontend.");
+      setAlert("Backend socket URL is missing. Set VITE_API_URL and restart the frontend.");
       return undefined;
     }
+
+    const stopClientHeartbeat = () => {
+      if (clientHeartbeatTimerRef.current) {
+        window.clearInterval(clientHeartbeatTimerRef.current);
+        clientHeartbeatTimerRef.current = null;
+      }
+    };
+
+    const startClientHeartbeat = () => {
+      stopClientHeartbeat();
+      clientHeartbeatTimerRef.current = window.setInterval(() => {
+        if (socketRef.current?.connected) {
+          socketRef.current.emit("ping", { timestamp: Date.now() });
+        }
+      }, CLIENT_HEARTBEAT_MS);
+    };
 
     const socket = io(SOCKET_URL, {
       auth: { token },
@@ -1720,15 +1843,18 @@ export default function App() {
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
-      reconnectionDelayMax: 8000,
+      reconnectionDelayMax: 10000,
       randomizationFactor: 0.35,
-      timeout: 30000
+      timeout: 20000,
+      autoConnect: true
     });
 
     socketRef.current = socket;
 
     socket.on("connect", () => {
       setSocketConnected(true);
+      setSocketReconnecting(false);
+      startClientHeartbeat();
       setAlert((current) => (current === "Unable to reach InterpShield. Please try again." ? null : current));
       setTranslationStatuses((current) => {
         const recovered: Record<string, TranslationLifecycleState> = {};
@@ -1746,11 +1872,12 @@ export default function App() {
     });
 
     socket.on("disconnect", () => {
+      stopClientHeartbeat();
       setSocketConnected(false);
       if (recordingRef.current) {
+        setSocketReconnecting(true);
         shouldRestartSessionOnReconnectRef.current = true;
         setStatus("connecting");
-        setAlert("Connection lost. Your session was paused.");
         updateTranslationStatuses(
           Object.fromEntries(targetLanguagesRef.current.map((language) => [language, "retrying"]))
         );
@@ -1759,8 +1886,22 @@ export default function App() {
 
     socket.on("connect_error", () => {
       setSocketConnected(false);
+      setSocketReconnecting(recordingRef.current);
       if (recordingRef.current) setAlert("Unable to reach the live interpreter.");
     });
+
+    const handleReconnectAttempt = () => {
+      if (recordingRef.current) setSocketReconnecting(true);
+    };
+    const handleReconnect = () => {
+      setSocketReconnecting(false);
+    };
+    const handleReconnectError = () => {
+      if (recordingRef.current) setSocketReconnecting(true);
+    };
+    socket.io.on("reconnect_attempt", handleReconnectAttempt);
+    socket.io.on("reconnect", handleReconnect);
+    socket.io.on("reconnect_error", handleReconnectError);
 
     socket.on("server-config", (serverConfig: AppConfig) => setConfig(serverConfig));
     socket.on("session:heartbeat", () => {
@@ -1775,6 +1916,7 @@ export default function App() {
         sessionStartedAtRef.current = Date.now();
         setSessionSeconds(0);
       }
+      flushQueuedAudioChunks();
       setStatus("listening");
     };
 
@@ -2033,10 +2175,15 @@ export default function App() {
       }
       pendingPartialTranscriptRef.current = null;
       socket.disconnect();
+      stopClientHeartbeat();
+      socket.io.off("reconnect_attempt", handleReconnectAttempt);
+      socket.io.off("reconnect", handleReconnect);
+      socket.io.off("reconnect_error", handleReconnectError);
       socketRef.current = null;
       setSocketConnected(false);
+      setSocketReconnecting(false);
     };
-  }, [token, user, stopDubbingPlayback, updateTranslationStatuses]);
+  }, [token, user, stopDubbingPlayback, updateTranslationStatuses, flushQueuedAudioChunks]);
 
   useEffect(() => {
     const reconnectSocket = () => {
@@ -2255,7 +2402,9 @@ export default function App() {
     if (!navigator.mediaDevices?.getUserMedia) {
       sessionActionInFlightRef.current = false;
       setStatus("error");
-      setAlert("Microphone not detected");
+      setMicrophonePermission("unsupported");
+      setMicrophoneAvailable(false);
+      setAlert("Microphone access is not supported in this browser.");
       return;
     }
 
@@ -2309,6 +2458,8 @@ export default function App() {
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio });
       streamRef.current = stream;
+      setMicrophonePermission("granted");
+      setMicrophoneAvailable(true);
       void refreshMicrophones();
 
       const enhancedAudio = createAmplifiedAudioStream(stream);
@@ -2326,7 +2477,7 @@ export default function App() {
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (event) => {
-        if (event.data.size < MIN_MEDIA_CHUNK_BYTES || !socketRef.current?.connected) return;
+        if (event.data.size < MIN_MEDIA_CHUNK_BYTES) return;
 
         sequenceRef.current += 1;
         const capturedAt = Date.now();
@@ -2336,7 +2487,7 @@ export default function App() {
         if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.002) return;
 
         lastAudioChunkSentAtRef.current = capturedAt;
-        socketRef.current.emit("audio_chunk", {
+        emitAudioChunkPayload({
           audio: event.data,
           sequence: sequenceRef.current,
           audioLevel,
@@ -2360,7 +2511,7 @@ export default function App() {
         targetLang: activeTargetLanguages[0],
         targetLanguages: activeTargetLanguages,
         translate: modeRef.current !== "transcribe",
-        twoWay,
+        twoWay: activeTargetLanguages.length > 1,
         mimeType: mimeType || "audio/webm",
         roomId: shareableMode ? `live:${user?.id || "guest"}` : undefined,
         participantId: user?.id || socketRef.current?.id || "browser",
@@ -2394,18 +2545,20 @@ export default function App() {
       setStatus("error");
 
       if (error instanceof DOMException && (error.name === "NotFoundError" || error.name === "DevicesNotFoundError")) {
-        setAlert("Microphone not detected");
+        setMicrophoneAvailable(false);
+        setAlert("No microphone input was found.");
         return;
       }
 
       if (error instanceof DOMException && (error.name === "NotAllowedError" || error.name === "PermissionDeniedError")) {
-        setAlert("Microphone permission denied");
+        setMicrophonePermission("denied");
+        setAlert("Microphone permission denied. Allow microphone access to start live translation.");
         return;
       }
 
-      setAlert("Microphone not detected");
+      setAlert("Unable to start microphone. Check browser audio permissions and try again.");
     }
-  }, [autoGainControl, cleanupMedia, echoCancellation, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, shareableMode, sourceLang, stopDubbingPlayback, targetLang, targetLanguages, twoWay, user?.id, user?.plan]);
+  }, [autoGainControl, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, shareableMode, sourceLang, stopDubbingPlayback, targetLang, targetLanguages, user?.id, user?.plan]);
 
   const selectMode = (nextMode: Mode) => {
     if (isRecording) return;
@@ -2620,11 +2773,21 @@ export default function App() {
 
   const renderDashboard = () => {
     const privacyMode: PrivacyMode = shareableMode ? "shareable" : "private";
-    const threeWayEnabled = targetLanguages.length > 1;
+    const targetCount = Math.min(MAX_TARGET_LANGUAGES, Math.max(1, targetLanguages.length));
+    const twoWayEnabled = targetCount === 2;
+    const threeWayEnabled = targetCount === 3;
     const sourceLabel = sourceLang === "auto"
       ? detectedLanguage ? languageName(detectedLanguage) : "Auto Detect"
       : languageName(detectedLanguage || sourceLang);
     const targetLabel = targetLanguages.map(languageName).join(", ");
+    const microphoneNotice =
+      !alert && microphonePermission === "denied"
+        ? "Microphone permission denied. Allow microphone access to start live translation."
+        : !alert && microphonePermission === "unsupported"
+          ? "Microphone access is not supported in this browser."
+          : !alert && microphoneAvailable === false
+            ? "No microphone input was found."
+            : null;
     const translationEntries: TranscriptTranslationEntry[] = displayTranslationEntries.map(([language, translatedText, translationState]) => ({
       language,
       label: `${languageName(language)} (${language.toUpperCase()})`,
@@ -2632,12 +2795,12 @@ export default function App() {
       state: translationStateLabel(translationState)
     }));
 
-    const buildThreeWayTargets = (primaryLanguage: string, sourceLanguage = sourceLang) => {
+    const buildTargetList = (primaryLanguage: string, desiredCount = targetCount, sourceLanguage = sourceLang, existingTargets = targetLanguages) => {
       const activeSource = normalizeLanguageCode(sourceLanguage);
       const primary = normalizeLanguageCode(primaryLanguage) || DEFAULT_TARGET_LANGUAGES[0];
       const candidates = [
         primary,
-        ...targetLanguages,
+        ...existingTargets,
         ...DEFAULT_TARGET_LANGUAGES,
         "fr",
         "de",
@@ -2645,15 +2808,17 @@ export default function App() {
         "it",
         "zh",
         "ja",
-        "ko"
+        "ko",
+        ...LANGUAGES.map((language) => language.code)
       ];
       const nextTargets: string[] = [];
+      const exactCount = Math.min(MAX_TARGET_LANGUAGES, Math.max(1, desiredCount));
 
       for (const candidate of candidates) {
         const code = normalizeLanguageCode(candidate);
         if (!code || code === "auto" || code === activeSource || !SUPPORTED_LANGUAGE_CODES.has(code) || nextTargets.includes(code)) continue;
         nextTargets.push(code);
-        if (nextTargets.length === MAX_TARGET_LANGUAGES) break;
+        if (nextTargets.length === exactCount) break;
       }
 
       return nextTargets.length > 0 ? nextTargets : ["es"];
@@ -2676,7 +2841,7 @@ export default function App() {
       persistSetting("preferredSourceLang", nextSource);
 
       if (nextSource !== "auto" && targetLanguages.includes(nextSource)) {
-        const nextTargets = threeWayEnabled ? buildThreeWayTargets(targetLang, nextSource) : buildThreeWayTargets(targetLang, nextSource).slice(0, 1);
+        const nextTargets = buildTargetList(targetLang, targetCount, nextSource);
         setTargetLanguages(nextTargets);
         persistSetting("preferredTargetLanguages", nextTargets);
       }
@@ -2685,9 +2850,20 @@ export default function App() {
     const handleTargetLanguageChange = (language: string) => {
       if (isRecording) return;
       const nextTarget = normalizeLanguageCode(language) || DEFAULT_TARGET_LANGUAGES[0];
-      const nextTargets = threeWayEnabled ? buildThreeWayTargets(nextTarget) : [nextTarget];
+      const nextTargets = buildTargetList(nextTarget, targetCount);
       setTargetLanguages(nextTargets);
       persistSetting("preferredTargetLang", nextTarget);
+      persistSetting("preferredTargetLanguages", nextTargets);
+    };
+
+    const handleTargetSlotChange = (index: number, language: string) => {
+      if (isRecording) return;
+      const nextTarget = normalizeLanguageCode(language) || DEFAULT_TARGET_LANGUAGES[0];
+      const nextCandidateTargets = [...targetLanguages];
+      nextCandidateTargets[index] = nextTarget;
+      const nextTargets = buildTargetList(nextCandidateTargets[0] || nextTarget, targetCount, sourceLang, nextCandidateTargets);
+      setTargetLanguages(nextTargets);
+      persistSetting("preferredTargetLang", nextTargets[0]);
       persistSetting("preferredTargetLanguages", nextTargets);
     };
 
@@ -2695,7 +2871,7 @@ export default function App() {
       if (isRecording) return;
       const nextSource = targetLang;
       const nextTarget = sourceLang === "auto" ? "en" : sourceLang;
-      const nextTargets = threeWayEnabled ? buildThreeWayTargets(nextTarget, nextSource) : [nextTarget];
+      const nextTargets = buildTargetList(nextTarget, targetCount, nextSource);
       setSourceLang(nextSource);
       setTargetLanguages(nextTargets);
       persistSetting("preferredSourceLang", nextSource);
@@ -2705,14 +2881,18 @@ export default function App() {
 
     const handleThreeWayToggle = (enabled: boolean) => {
       if (isRecording) return;
-      const nextTargets = enabled ? buildThreeWayTargets(targetLang) : [targetLang];
+      const nextTargets = buildTargetList(targetLang, enabled ? 3 : 1);
       setTargetLanguages(nextTargets);
+      persistSetting("preferredTargetLang", nextTargets[0]);
       persistSetting("preferredTargetLanguages", nextTargets);
     };
 
     const handleTwoWayToggle = (enabled: boolean) => {
       if (isRecording) return;
-      setTwoWay(enabled);
+      const nextTargets = buildTargetList(targetLang, enabled ? 2 : 1);
+      setTargetLanguages(nextTargets);
+      persistSetting("preferredTargetLang", nextTargets[0]);
+      persistSetting("preferredTargetLanguages", nextTargets);
     };
 
     return (
@@ -2726,13 +2906,16 @@ export default function App() {
             languages={LANGUAGES}
             sourceLanguage={sourceLang}
             targetLanguage={targetLang}
+            targetLanguages={targetLanguages}
+            targetLimit={targetCount}
             disabled={isRecording}
             onSourceChange={handleSourceLanguageChange}
             onTargetChange={handleTargetLanguageChange}
+            onTargetSlotChange={handleTargetSlotChange}
             onSwap={handleSwapLanguages}
           />
           <TranslationOptions
-            twoWayEnabled={twoWay}
+            twoWayEnabled={twoWayEnabled}
             threeWayEnabled={threeWayEnabled}
             disabled={isRecording}
             onTwoWayToggle={handleTwoWayToggle}
@@ -2750,12 +2933,13 @@ export default function App() {
           interimText={interimOriginal}
           translations={translationEntries}
           isConnected={socketConnected}
+          connectionState={connectionState}
           isRecording={isRecording}
           sessionSeconds={sessionSeconds}
           chunkCount={chunkCount}
           lastLatency={lastLatency}
           historyCount={history.length}
-          alert={alert}
+          alert={alert || microphoneNotice}
           aiDegraded={aiDegraded}
           onMicClick={!isRecording ? () => void startSession() : stopSession}
           onClear={clearLiveSession}

@@ -177,7 +177,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         if (!socket.connected) return;
         logSocketTranslationEvent("SOCKET_HEARTBEAT", { socketId: socket.id });
         socket.emit("session:heartbeat", { ts: Date.now(), connected: true });
-      }, 15000);
+      }, 25000);
       heartbeatTimer.unref?.();
     };
 

@@ -49,7 +49,7 @@ export default function PremiumDashboard() {
   // ============ HOOK INTEGRATION ============
   const auth = useAuth();
   const { socket, status: socketStatus, emit } = useSocket({
-    url: (import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL)?.replace(/\/$/, ''),
+    url: import.meta.env.VITE_API_URL?.replace(/\/$/, ''),
     token: auth.token,
     enabled: auth.isAuthed,
     onConnect: () => console.log('Socket connected'),
@@ -351,7 +351,7 @@ export default function PremiumDashboard() {
                   </div>
                   <div>
                     <label className="block text-sm font-semibold text-slate-300">
-                      WebSocket Status: {socketStatus.connected ? 'Connected' : 'Disconnected'}
+                      WebSocket Status: {socketStatus.connected ? 'Connected' : socketStatus.reconnecting ? 'Reconnecting...' : 'Ready'}
                     </label>
                   </div>
                   <div>

@@ -6,6 +6,7 @@ import { TranscriptArea, type TranscriptTranslationEntry } from "./TranscriptAre
 
 type SessionStatus = "idle" | "connecting" | "listening" | "stopping" | "error";
 type ToolMode = "transcribe" | "translate" | "dubbing";
+type ConnectionState = "ready" | "connecting" | "connected" | "listening" | "translating" | "reconnecting";
 
 interface TranslationPanelProps {
   mode: ToolMode;
@@ -17,6 +18,7 @@ interface TranslationPanelProps {
   interimText?: string;
   translations: TranscriptTranslationEntry[];
   isConnected: boolean;
+  connectionState?: ConnectionState;
   isRecording: boolean;
   sessionSeconds: number;
   chunkCount: number;
@@ -39,6 +41,7 @@ export function TranslationPanel({
   interimText,
   translations,
   isConnected,
+  connectionState,
   isRecording,
   sessionSeconds,
   chunkCount,
@@ -127,6 +130,7 @@ export function TranslationPanel({
 
         <StatusBar
           isConnected={isConnected}
+          connectionState={connectionState}
           elapsedSeconds={sessionSeconds}
           chunkCount={chunkCount}
           lastLatency={lastLatency}

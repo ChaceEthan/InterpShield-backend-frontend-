@@ -35,6 +35,7 @@ const readNumber = (value, fallback) => {
 
 const localClientOrigin = "http://localhost:5173";
 const localClientOriginAlt = "http://127.0.0.1:5173";
+const productionClientOrigin = "https://interp-shield-backend-frontend-fron.vercel.app";
 
 const normalizeOrigin = (origin = "") => {
   const trimmed = origin.trim();
@@ -53,7 +54,7 @@ const readClientOrigins = (clientUrl) => {
     .map(normalizeOrigin)
     .filter(Boolean);
 
-  const origins = [localClientOrigin, localClientOriginAlt, ...configuredOrigins];
+  const origins = [localClientOrigin, localClientOriginAlt, productionClientOrigin, ...configuredOrigins];
   return [...new Set(origins)];
 };
 

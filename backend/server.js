@@ -15,6 +15,12 @@ warnAboutMissingConfig();
 const app = express();
 const server = http.createServer(app);
 
+const DEFAULT_CLIENT_ORIGINS = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "https://interp-shield-backend-frontend-fron.vercel.app"
+];
+
 const isAllowedCorsOrigin = (origin) => {
   if (!origin) return true;
 
@@ -28,12 +34,9 @@ const isAllowedCorsOrigin = (origin) => {
   const hostname = parsed.hostname.toLowerCase();
   const normalizedOrigin = parsed.origin.toLowerCase();
 
-  return (
-    hostname === "localhost" ||
-    hostname === "127.0.0.1" ||
-    hostname.endsWith(".vercel.app") ||
-    env.clientOrigins.includes(normalizedOrigin)
-  );
+  const allowedOrigins = new Set([...DEFAULT_CLIENT_ORIGINS, ...env.clientOrigins].map((allowedOrigin) => allowedOrigin.toLowerCase()));
+
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname.endsWith(".vercel.app") || allowedOrigins.has(normalizedOrigin);
 };
 
 const corsOrigin = (origin, callback) => {
@@ -52,19 +55,12 @@ const io = new Server(server, {
   },
   transports: ["websocket", "polling"],
   maxHttpBufferSize: 2e6,
-  // Enhanced heartbeat configuration for stability
-  pingInterval: 15000,      // Send ping every 15 seconds
-  pingTimeout: 20000,       // Wait 20 seconds for pong before disconnect
-  upgradeTimeout: 30000,    // Give 30s for upgrade attempts
-  maxHttpBufferSize: 2e6,
-  connectTimeout: 30000,    // 30s timeout for connection
-  // Improve reconnection handling
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  upgradeTimeout: 30000,
+  connectTimeout: 30000,
   path: "/socket.io",
-  // Enable compression for lower bandwidth
-  transports: ["websocket", "polling"],
-  // Connection state tracking
   allowUpgrades: true,
-  // Better error handling
   allowEIO3: false
 });
 

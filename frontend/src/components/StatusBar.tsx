@@ -1,20 +1,38 @@
 import type { ReactNode } from "react";
 import { Activity, Clock3, Radio, Wifi, WifiOff } from "lucide-react";
 
+type ConnectionState = "ready" | "connecting" | "connected" | "listening" | "translating" | "reconnecting";
+
 interface StatusBarProps {
   isConnected: boolean;
+  connectionState?: ConnectionState;
   elapsedSeconds: number;
   chunkCount?: number;
   lastLatency?: number | null;
   sessionActive: boolean;
 }
 
-export function StatusBar({ isConnected, elapsedSeconds, chunkCount = 0, lastLatency, sessionActive }: StatusBarProps) {
+export function StatusBar({ isConnected, connectionState, elapsedSeconds, chunkCount = 0, lastLatency, sessionActive }: StatusBarProps) {
+  const resolvedConnectionState = connectionState || (sessionActive ? (isConnected ? "listening" : "reconnecting") : (isConnected ? "connected" : "ready"));
+  const connectionLabel = {
+    ready: "Ready",
+    connecting: "Connecting",
+    connected: "Connected",
+    listening: "Listening",
+    translating: "Translating",
+    reconnecting: "Reconnecting..."
+  }[resolvedConnectionState];
+  const connectionIcon = isConnected
+    ? <Wifi className="h-3.5 w-3.5 text-emerald-500" />
+    : resolvedConnectionState === "reconnecting"
+      ? <Wifi className="h-3.5 w-3.5 text-amber-500" />
+      : <WifiOff className="h-3.5 w-3.5 text-gray-400" />;
+
   return (
     <div className="flex flex-wrap items-center justify-center gap-2 text-xs font-medium text-gray-500">
       <StatusPill
-        icon={isConnected ? <Wifi className="h-3.5 w-3.5 text-emerald-500" /> : <WifiOff className="h-3.5 w-3.5 text-red-500" />}
-        label={isConnected ? "Connected" : "Disconnected"}
+        icon={connectionIcon}
+        label={connectionLabel}
       />
       <StatusPill icon={<Clock3 className="h-3.5 w-3.5 text-gray-400" />} label={sessionActive ? formatTime(elapsedSeconds) : "00:00"} mono />
       <StatusPill icon={<Radio className="h-3.5 w-3.5 text-gray-400" />} label={chunkCount > 0 ? `${chunkCount} chunks` : "Ready"} />

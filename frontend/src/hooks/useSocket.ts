@@ -24,7 +24,7 @@ interface SocketStatus {
  */
 export const useSocket = (options: UseSocketOptions = {}) => {
   const {
-    url = (import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL)?.replace(/\/$/, ''),
+    url = import.meta.env.VITE_API_URL?.replace(/\/$/, ''),
     enabled = true,
     token,
     onConnect,
@@ -68,6 +68,7 @@ export const useSocket = (options: UseSocketOptions = {}) => {
         reconnectionDelay: 1000,
         reconnectionDelayMax: 10000,
         timeout: 20000,
+        autoConnect: true,
         auth: token ? { token } : undefined,
         upgrade: true,
         rememberUpgrade: true,
@@ -94,7 +95,7 @@ export const useSocket = (options: UseSocketOptions = {}) => {
         }, 30000);
       });
 
-      // Disconnected
+      // Connection paused
       socketRef.current.on('disconnect', (reason: string) => {
         if (heartbeatTimerRef.current) {
           clearInterval(heartbeatTimerRef.current);
