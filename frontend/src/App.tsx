@@ -580,8 +580,33 @@ const compactSetToLimit = (set: Set<string>, maxItems: number) => {
 
 const speechLanguage = (code: string) => SPEECH_SYNTHESIS_LANGS[code] || code;
 
-const readStoredToken = () => sessionStorage.getItem("interp_shield_token") || localStorage.getItem("interp_shield_token");
-const readStoredUser = () => sessionStorage.getItem("interp_shield_user") || localStorage.getItem("interp_shield_user");
+const safeGetStorageItem = (storage: Storage | undefined, key: string) => {
+  try {
+    return storage?.getItem(key) || null;
+  } catch {
+    return null;
+  }
+};
+
+const readStoredToken = () =>
+  safeGetStorageItem(typeof sessionStorage !== "undefined" ? sessionStorage : undefined, "interp_shield_token") ||
+  safeGetStorageItem(typeof localStorage !== "undefined" ? localStorage : undefined, "interp_shield_token");
+
+const readStoredUser = () =>
+  safeGetStorageItem(typeof sessionStorage !== "undefined" ? sessionStorage : undefined, "interp_shield_user") ||
+  safeGetStorageItem(typeof localStorage !== "undefined" ? localStorage : undefined, "interp_shield_user");
+
+const parseStoredUser = () => {
+  const stored = readStoredUser();
+  if (!stored) return null;
+
+  try {
+    return JSON.parse(stored) as AppUser;
+  } catch {
+    clearSessionStorage();
+    return null;
+  }
+};
 
 const readStoredTranscriptHistory = (): TranscriptHistoryEntry[] => {
   try {
@@ -768,10 +793,14 @@ const saveSession = (token: string, user: AppUser) => {
 };
 
 const clearSessionStorage = () => {
-  sessionStorage.removeItem("interp_shield_token");
-  sessionStorage.removeItem("interp_shield_user");
-  localStorage.removeItem("interp_shield_token");
-  localStorage.removeItem("interp_shield_user");
+  try {
+    sessionStorage.removeItem("interp_shield_token");
+    sessionStorage.removeItem("interp_shield_user");
+    localStorage.removeItem("interp_shield_token");
+    localStorage.removeItem("interp_shield_user");
+  } catch {
+    // Storage can be unavailable in private or embedded browser contexts.
+  }
 };
 
 const FlagUs = () => (
@@ -1156,10 +1185,7 @@ const AuthPage = ({
 
 export default function App() {
   const [view, setView] = useState<View>(initialView);
-  const [user, setUser] = useState<AppUser | null>(() => {
-    const stored = readStoredUser();
-    return stored ? (JSON.parse(stored) as AppUser) : null;
-  });
+  const [user, setUser] = useState<AppUser | null>(() => parseStoredUser());
   const [token, setToken] = useState<string | null>(() => readStoredToken());
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [authProvider, setAuthProvider] = useState<AuthProvider | null>(null);
