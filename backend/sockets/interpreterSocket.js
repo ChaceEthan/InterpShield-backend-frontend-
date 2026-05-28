@@ -80,17 +80,21 @@ const sanitizeTranslationResult = (result = {}) => {
   const translations = {};
 
   for (const [language, value] of Object.entries(rawTranslations)) {
+    const safeLanguage = normalizeSocketLanguageCode(language);
     const text = String(value || "").trim();
     if (
+      safeLanguage &&
+      safeLanguage !== "auto" &&
+      SUPPORTED_LANGUAGE_CODES.has(safeLanguage) &&
       isTranslationDisplayable({
         text,
         sourceText: result.originalText || result.original || "",
         sourceLang: result.sourceLang,
-        targetLang: language,
+        targetLang: safeLanguage,
         provider: result.provider
       })
     ) {
-      translations[language] = text;
+      translations[safeLanguage] = text;
     }
   }
 
@@ -126,6 +130,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     let lastSequence = -1;
     let audioPipeline = null;
     let roomMetadata = null;
+    let heartbeatTimer = null;
 
     try {
       const token = socket.handshake.auth?.token;
@@ -136,6 +141,11 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       socket.disconnect(true);
       return;
     }
+
+    const stopHeartbeat = () => {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    };
 
     const stopSession = () => {
       const activeSession = socket.data.interpreterSession || session;
@@ -161,6 +171,16 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       }
     };
 
+    const startHeartbeat = () => {
+      stopHeartbeat();
+      heartbeatTimer = setInterval(() => {
+        if (!socket.connected) return;
+        logSocketTranslationEvent("SOCKET_HEARTBEAT", { socketId: socket.id });
+        socket.emit("session:heartbeat", { ts: Date.now(), connected: true });
+      }, 15000);
+      heartbeatTimer.unref?.();
+    };
+
     const startErrorMessage = (error) => {
       const message = error?.message || "";
       if (/forbidden|unauthorized|401|403/i.test(message)) {
@@ -170,7 +190,9 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       return "Unable to start interpreter session.";
     };
 
+    logSocketTranslationEvent("SOCKET_CONNECTED", { socketId: socket.id });
     socket.emit("server-config", getPublicConfig());
+    startHeartbeat();
 
     const emitInterpreterResult = (result) => {
       const emitTranslationPayload = (payload) => {
@@ -333,9 +355,12 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
             socket.emit("session:ready");
           },
           onWarning: (message) => socket.emit("warning", { message }),
-          onError: (message) => socket.emit("session_error", { message }),
+          onError: (message) => {
+            logSocketTranslationEvent("SOCKET_PROVIDER_WARNING", { socketId: socket.id, message }, "warn");
+            socket.emit("warning", { message });
+          },
           onProviderHealth: (health) => socket.emit("provider_health", health),
-          onClosed: () => socket.emit("session:closed"),
+          onClosed: () => socket.emit("warning", { message: "Provider stream closed; reconnecting if session is active." }),
           onResult: emitInterpreterResult
         });
         socket.data.interpreterSession = session;
@@ -388,6 +413,12 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         sessionTimer.unref?.();
 
         ack?.({ ok: true, mode: "production", sessionId: session.sessionId, targetLanguages, room: callRoomInfo });
+        logSocketTranslationEvent("SOCKET_SESSION_STARTED", {
+          socketId: socket.id,
+          sessionId: session.sessionId,
+          sourceLang,
+          targetLanguages
+        });
       } catch (error) {
         console.error("Interpreter session start failed:", error?.message || error);
         const message = startErrorMessage(error);
@@ -433,11 +464,29 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
     socket.on("start_session", handleStartSession);
     socket.on("session:start", handleStartSession);
+    socket.on("session:pong", () => {
+      socket.data.lastClientPongAt = Date.now();
+    });
+    socket.on("pong", () => {
+      socket.data.lastClientPongAt = Date.now();
+    });
+    // Handle client-side ping for latency measurement
+    socket.on("ping", (data) => {
+      socket.emit("pong", { timestamp: data?.timestamp || Date.now() });
+    });
+    // Handle latency reporting from client
+    socket.on("latency", (data) => {
+      socket.data.clientLatency = data?.value || 0;
+    });
     socket.on("audio_chunk", handleAudioChunk);
     socket.on("audio-chunk", handleAudioChunk);
     socket.on("end_session", handleEndSession);
     socket.on("session:stop", handleEndSession);
 
-    socket.on("disconnect", stopSession);
+    socket.on("disconnect", (reason) => {
+      logSocketTranslationEvent("SOCKET_DISCONNECTED", { socketId: socket.id, reason });
+      stopHeartbeat();
+      stopSession();
+    });
   });
 };

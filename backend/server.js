@@ -52,8 +52,20 @@ const io = new Server(server, {
   },
   transports: ["websocket", "polling"],
   maxHttpBufferSize: 2e6,
-  pingInterval: 15000,
-  pingTimeout: 20000
+  // Enhanced heartbeat configuration for stability
+  pingInterval: 15000,      // Send ping every 15 seconds
+  pingTimeout: 20000,       // Wait 20 seconds for pong before disconnect
+  upgradeTimeout: 30000,    // Give 30s for upgrade attempts
+  maxHttpBufferSize: 2e6,
+  connectTimeout: 30000,    // 30s timeout for connection
+  // Improve reconnection handling
+  path: "/socket.io",
+  // Enable compression for lower bandwidth
+  transports: ["websocket", "polling"],
+  // Connection state tracking
+  allowUpgrades: true,
+  // Better error handling
+  allowEIO3: false
 });
 
 app.use(cors(corsOptions));

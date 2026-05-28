@@ -27,6 +27,14 @@ import {
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { io, type Socket } from "socket.io-client";
+import { HeroSection } from "./components/HeroSection";
+import { LanguageSelector } from "./components/LanguageSelector";
+import { ModeTabs, type PrivacyMode } from "./components/ModeTabs";
+import { Navbar } from "./components/Navbar";
+import { ToolTabs } from "./components/ToolTabs";
+import { TranslationOptions } from "./components/TranslationOptions";
+import { TranslationPanel } from "./components/TranslationPanel";
+import type { TranscriptTranslationEntry } from "./components/TranscriptArea";
 
 type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
@@ -200,10 +208,10 @@ const HISTORY_PERSIST_DEBOUNCE_MS = 250;
 const MAX_DUBBING_QUEUE_ITEMS = 6;
 const MAX_SPOKEN_DUBBING_KEYS = 180;
 const DUBBING_UTTERANCE_TTL_MS = 45000;
-const MIN_MEDIA_CHUNK_BYTES = 192;
-const MIN_AUDIO_CHUNK_INTERVAL_MS = 90;
+const MIN_MEDIA_CHUNK_BYTES = 96;
+const MIN_AUDIO_CHUNK_INTERVAL_MS = 45;
 const DUBBING_QUEUE_SETTLE_MS = 180;
-const STALE_TRANSLATION_STATE_MS = 9000;
+const STALE_TRANSLATION_STATE_MS = 45000;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
 const SUPPORTED_LANGUAGE_CODES = new Set(["en", "fr", "es", "de", "it", "pt", "nl", "ar", "zh", "ja", "ko", "hi", "tr", "pl", "ru", "sw"]);
 const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
@@ -466,7 +474,8 @@ const isTargetLanguageText = (text = "", targetLang = "") => {
     return markerScore >= 2 || (markerScore >= 1 && englishScore === 0 && tokenCount <= 4);
   }
 
-  return englishScore < 3;
+  if (tokenCount <= 4) return true;
+  return englishScore < 6;
 };
 
 const isValidTranslationText = ({
@@ -781,7 +790,7 @@ const GoogleIcon = ({ className = "h-5 w-5" }: { className?: string }) => (
 );
 
 const GlassPanel = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
-  <section className={`rounded-xl border border-white/10 bg-white/[0.055] shadow-2xl shadow-slate-950/30 backdrop-blur-xl ${className}`}>{children}</section>
+  <section className={`rounded-2xl border border-gray-200 bg-white shadow-sm shadow-gray-200/70 backdrop-blur-xl ${className}`}>{children}</section>
 );
 
 const ToggleRow = ({
@@ -795,12 +804,12 @@ const ToggleRow = ({
   value: boolean;
   onChange: (value: boolean) => void;
 }) => (
-  <button type="button" onClick={() => onChange(!value)} className="flex w-full items-center justify-between gap-4 rounded-lg border border-white/10 bg-slate-950/45 px-4 py-3 text-left transition hover:bg-white/[0.07]">
+  <button type="button" onClick={() => onChange(!value)} className="flex w-full items-center justify-between gap-4 rounded-xl border border-gray-200 bg-white px-4 py-3 text-left shadow-sm transition hover:bg-gray-50">
     <span>
-      <span className="block text-sm font-bold text-white">{label}</span>
-      {description && <span className="mt-1 block text-xs leading-5 text-slate-500">{description}</span>}
+      <span className="block text-sm font-bold text-gray-950">{label}</span>
+      {description && <span className="mt-1 block text-xs leading-5 text-gray-500">{description}</span>}
     </span>
-    <span className={`flex h-6 w-11 shrink-0 items-center rounded-full p-1 transition ${value ? "bg-blue-500" : "bg-slate-700"}`}>
+    <span className={`flex h-6 w-11 shrink-0 items-center rounded-full p-1 transition ${value ? "bg-blue-500" : "bg-gray-200"}`}>
       <span className={`h-4 w-4 rounded-full bg-white transition ${value ? "translate-x-5" : "translate-x-0"}`} />
     </span>
   </button>
@@ -818,12 +827,12 @@ const SelectControl = ({
   onChange: (value: string) => void;
 }) => (
   <label className="block">
-    <span className="text-xs font-bold uppercase tracking-widest text-slate-500">{label}</span>
+    <span className="text-xs font-bold uppercase tracking-widest text-gray-500">{label}</span>
     <span className="relative mt-2 block">
-      <select value={value} onChange={(event) => onChange(event.target.value)} className="w-full appearance-none rounded-lg border border-white/10 bg-slate-950/75 px-3 py-3 pr-9 text-sm font-semibold text-white outline-none focus:border-blue-500/50">
+      <select value={value} onChange={(event) => onChange(event.target.value)} className="w-full appearance-none rounded-xl border border-gray-200 bg-white px-3 py-3 pr-9 text-sm font-semibold text-gray-950 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100">
         {children}
       </select>
-      <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+      <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
     </span>
   </label>
 );
@@ -1080,20 +1089,20 @@ const AuthPage = ({
   return (
     <main className="mx-auto grid min-h-[calc(100vh-76px)] w-full max-w-6xl grid-cols-1 gap-8 px-5 py-10 lg:grid-cols-[1fr_420px] lg:items-center">
       <div className="space-y-6">
-        <div className="inline-flex items-center gap-2 rounded-full border border-blue-500/20 bg-blue-500/10 px-3 py-1 text-xs font-bold uppercase tracking-widest text-blue-100">
+        <div className="inline-flex items-center gap-2 rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-bold uppercase tracking-widest text-blue-700">
           <Shield className="h-3.5 w-3.5" />
           Secure interpreter workspace
         </div>
         <div className="max-w-2xl">
-          <h1 className="text-5xl font-black tracking-normal text-white md:text-7xl">Live Translate</h1>
-          <p className="mt-5 max-w-xl text-lg leading-8 text-slate-400">Professional live captions, translation, and AI meeting tools in one workspace.</p>
+          <h1 className="text-5xl font-black tracking-normal text-gray-950 md:text-7xl">Live Translate</h1>
+          <p className="mt-5 max-w-xl text-lg leading-8 text-gray-500">Professional live captions, translation, and AI meeting tools in one workspace.</p>
         </div>
       </div>
 
       <GlassPanel className="p-6">
         <div className="mb-6">
-          <p className="text-xl font-black text-white">{isSignup ? "Create account" : "Welcome back"}</p>
-          <p className="mt-1 text-sm text-slate-500">{isSignup ? "Start your InterpShield workspace." : "Login to open your dashboard."}</p>
+          <p className="text-xl font-black text-gray-950">{isSignup ? "Create account" : "Welcome back"}</p>
+          <p className="mt-1 text-sm text-gray-500">{isSignup ? "Start your InterpShield workspace." : "Login to open your dashboard."}</p>
         </div>
 
         <form
@@ -1106,38 +1115,38 @@ const AuthPage = ({
         >
           {isSignup && (
             <label className="block">
-              <span className="text-xs font-bold uppercase tracking-widest text-slate-500">Name</span>
-              <input value={name} onChange={(event) => setName(event.target.value)} disabled={authBusy} className="mt-2 w-full rounded-lg border border-white/10 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-blue-500/50 disabled:cursor-wait disabled:opacity-70" placeholder="Isaac David" />
+              <span className="text-xs font-bold uppercase tracking-widest text-gray-500">Name</span>
+              <input value={name} onChange={(event) => setName(event.target.value)} disabled={authBusy} className="mt-2 w-full rounded-lg border border-gray-200 bg-white px-4 py-3 text-sm text-gray-950 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100 disabled:cursor-wait disabled:opacity-70" placeholder="Isaac David" />
             </label>
           )}
 
           <label className="block">
-            <span className="text-xs font-bold uppercase tracking-widest text-slate-500">Email</span>
-            <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} disabled={authBusy} className="mt-2 w-full rounded-lg border border-white/10 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-blue-500/50 disabled:cursor-wait disabled:opacity-70" placeholder="you@example.com" required />
+            <span className="text-xs font-bold uppercase tracking-widest text-gray-500">Email</span>
+            <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} disabled={authBusy} className="mt-2 w-full rounded-lg border border-gray-200 bg-white px-4 py-3 text-sm text-gray-950 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100 disabled:cursor-wait disabled:opacity-70" placeholder="you@example.com" required />
           </label>
 
           <label className="block">
-            <span className="text-xs font-bold uppercase tracking-widest text-slate-500">Password</span>
-            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} disabled={authBusy} className="mt-2 w-full rounded-lg border border-white/10 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-blue-500/50 disabled:cursor-wait disabled:opacity-70" placeholder="Minimum 6 characters" required />
+            <span className="text-xs font-bold uppercase tracking-widest text-gray-500">Password</span>
+            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} disabled={authBusy} className="mt-2 w-full rounded-lg border border-gray-200 bg-white px-4 py-3 text-sm text-gray-950 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100 disabled:cursor-wait disabled:opacity-70" placeholder="Minimum 6 characters" required />
           </label>
 
-          {error && <div className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-100">{error}</div>}
+          {error && <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>}
 
-          <button disabled={authBusy} className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-500 px-4 py-3 text-sm font-black text-slate-950 transition hover:bg-white disabled:cursor-wait disabled:opacity-70">
+          <button disabled={authBusy} className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-3 text-sm font-black text-white transition hover:bg-blue-700 disabled:cursor-wait disabled:opacity-70">
             <KeyRound className="h-4 w-4" />
             {manualLoading ? "Please wait..." : isSignup ? "Sign up" : "Login"}
           </button>
         </form>
 
-        <div className="my-5 flex items-center gap-3 text-xs font-bold uppercase tracking-widest text-slate-600">
-          <span className="h-px flex-1 bg-white/10" />
+        <div className="my-5 flex items-center gap-3 text-xs font-bold uppercase tracking-widest text-gray-400">
+          <span className="h-px flex-1 bg-gray-200" />
           or
-          <span className="h-px flex-1 bg-white/10" />
+          <span className="h-px flex-1 bg-gray-200" />
         </div>
 
         <GoogleSignIn disabled={authBusy && !googleLoading} loading={googleLoading} onCredential={onGoogle} onError={onGoogleError} />
 
-        <button type="button" disabled={authBusy} onClick={() => onNavigate(isSignup ? "login" : "signup")} className="mt-4 w-full rounded-lg border border-white/10 px-4 py-3 text-sm font-bold text-slate-300 hover:bg-white/5 disabled:cursor-wait disabled:opacity-60">
+        <button type="button" disabled={authBusy} onClick={() => onNavigate(isSignup ? "login" : "signup")} className="mt-4 w-full rounded-lg border border-gray-200 px-4 py-3 text-sm font-bold text-gray-700 hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60">
           {isSignup ? "Already have an account? Login" : "New here? Create an account"}
         </button>
       </GlassPanel>
@@ -1176,6 +1185,7 @@ export default function App() {
   const [shareableMode, setShareableMode] = useState(false);
   const [twoWay, setTwoWay] = useState(false);
   const [status, setStatus] = useState<SessionStatus>("idle");
+  const [socketConnected, setSocketConnected] = useState(false);
   const [originalSegments, setOriginalSegments] = useState<string[]>([]);
   const [translatedSegments, setTranslatedSegments] = useState<string[]>([]);
   const [history, setHistory] = useState<TranscriptHistoryEntry[]>(readStoredTranscriptHistory);
@@ -1676,14 +1686,26 @@ export default function App() {
       transports: ["websocket", "polling"],
       withCredentials: true,
       reconnection: true,
-      reconnectionAttempts: 5,
-      reconnectionDelay: 650
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 8000,
+      randomizationFactor: 0.35,
+      timeout: 30000
     });
 
     socketRef.current = socket;
 
     socket.on("connect", () => {
+      setSocketConnected(true);
       setAlert((current) => (current === "Unable to reach InterpShield. Please try again." ? null : current));
+      setTranslationStatuses((current) => {
+        const recovered: Record<string, TranslationLifecycleState> = {};
+        for (const [language, state] of Object.entries(current)) {
+          recovered[language] = state === "failed" || state === "stale" || state === "cancelled" ? "retrying" : state;
+          translationStatusUpdatedAtRef.current[language] = Date.now();
+        }
+        return recovered;
+      });
 
       if (shouldRestartSessionOnReconnectRef.current && activeSessionPayloadRef.current) {
         shouldRestartSessionOnReconnectRef.current = false;
@@ -1692,18 +1714,26 @@ export default function App() {
     });
 
     socket.on("disconnect", () => {
+      setSocketConnected(false);
       if (recordingRef.current) {
         shouldRestartSessionOnReconnectRef.current = true;
-        setStatus("error");
+        setStatus("connecting");
         setAlert("Connection lost. Your session was paused.");
+        updateTranslationStatuses(
+          Object.fromEntries(targetLanguagesRef.current.map((language) => [language, "retrying"]))
+        );
       }
     });
 
     socket.on("connect_error", () => {
+      setSocketConnected(false);
       if (recordingRef.current) setAlert("Unable to reach the live interpreter.");
     });
 
     socket.on("server-config", (serverConfig: AppConfig) => setConfig(serverConfig));
+    socket.on("session:heartbeat", () => {
+      socket.emit("session:pong", { ts: Date.now() });
+    });
 
     const markSessionReady = () => {
       sessionActionInFlightRef.current = false;
@@ -1972,8 +2002,18 @@ export default function App() {
       pendingPartialTranscriptRef.current = null;
       socket.disconnect();
       socketRef.current = null;
+      setSocketConnected(false);
     };
   }, [token, user, stopDubbingPlayback, updateTranslationStatuses]);
+
+  useEffect(() => {
+    const reconnectSocket = () => {
+      if (socketRef.current && !socketRef.current.connected) socketRef.current.connect();
+    };
+
+    window.addEventListener("online", reconnectSocket);
+    return () => window.removeEventListener("online", reconnectSocket);
+  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1996,7 +2036,7 @@ export default function App() {
       for (const [language, state] of Object.entries(translationStatuses)) {
         if (!["queued", "translating", "processing", "retrying"].includes(state)) continue;
         const updatedAt = translationStatusUpdatedAtRef.current[language] || 0;
-        if (updatedAt && now - updatedAt > STALE_TRANSLATION_STATE_MS) staleUpdates[language] = "failed";
+        if (updatedAt && now - updatedAt > STALE_TRANSLATION_STATE_MS) staleUpdates[language] = "retrying";
       }
 
       if (Object.keys(staleUpdates).length > 0) updateTranslationStatuses(staleUpdates);
@@ -2195,7 +2235,38 @@ export default function App() {
     }
 
     try {
-      if (!socketRef.current?.connected) socketRef.current?.connect();
+      if (!socketRef.current?.connected) {
+        socketRef.current?.connect();
+        await new Promise<void>((resolve, reject) => {
+          const activeSocket = socketRef.current;
+          if (!activeSocket) {
+            reject(new Error("Live socket is unavailable."));
+            return;
+          }
+          if (activeSocket.connected) {
+            resolve();
+            return;
+          }
+
+          const timer = window.setTimeout(() => {
+            activeSocket.off("connect", handleConnect);
+            activeSocket.off("connect_error", handleError);
+            reject(new Error("Live socket connection timed out."));
+          }, 30000);
+          const handleConnect = () => {
+            window.clearTimeout(timer);
+            activeSocket.off("connect_error", handleError);
+            resolve();
+          };
+          const handleError = (error: Error) => {
+            window.clearTimeout(timer);
+            activeSocket.off("connect", handleConnect);
+            reject(error);
+          };
+          activeSocket.once("connect", handleConnect);
+          activeSocket.once("connect_error", handleError);
+        });
+      }
 
       const audio = buildAudioConstraints({
         microphoneId,
@@ -2230,7 +2301,7 @@ export default function App() {
         const audioLevel = enhancedAudio.getAudioLevel();
         const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
 
-        if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.006) return;
+        if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.002) return;
 
         lastAudioChunkSentAtRef.current = capturedAt;
         socketRef.current.emit("audio_chunk", {
@@ -2273,7 +2344,7 @@ export default function App() {
       activeSessionPayloadRef.current = sessionPayload;
       shouldRestartSessionOnReconnectRef.current = false;
 
-      socketRef.current?.timeout(8000).emit(
+      socketRef.current?.timeout(30000).emit(
         "start_session",
         sessionPayload,
         (timeoutError: Error | null, response?: { ok?: boolean; error?: string }) => {
@@ -2437,11 +2508,11 @@ export default function App() {
           const maxLat = Math.max(...pData.map(d => d.latency), 1200);
           return (
             <div key={p} className="space-y-1.5">
-               <div className="flex justify-between text-[10px] font-black uppercase tracking-widest text-slate-500">
+               <div className="flex justify-between text-[10px] font-black uppercase tracking-widest text-gray-500">
                  <span className="flex items-center gap-1.5"><div className="h-1.5 w-1.5 rounded-full bg-blue-500" />{p} performance</span>
-                 <span className="text-slate-400">{pData[pData.length - 1].latency}ms</span>
+                 <span className="text-gray-500">{pData[pData.length - 1].latency}ms</span>
                </div>
-               <div className="flex h-12 w-full items-end gap-0.5 rounded-lg border border-white/5 bg-slate-950/50 p-1">
+               <div className="flex h-12 w-full items-end gap-0.5 rounded-lg border border-gray-100 bg-gray-50 p-1">
                   {pData.map((d, i) => (
                     <div key={i} className="flex-1 rounded-t-[1px] bg-blue-500/30 transition-all hover:bg-blue-400"
                          style={{ height: `${Math.max(4, (d.latency / maxLat) * 100)}%` }}
@@ -2455,269 +2526,247 @@ export default function App() {
     );
   };
 
+  const handleNavbarNavigate = (target: "dashboard" | "help" | "pricing" | "settings" | "login") => {
+    if (target === "dashboard") {
+      navigate(isAuthed ? "dashboard" : "landing");
+      return;
+    }
+
+    if (target === "settings" && !isAuthed) {
+      navigate("login");
+      return;
+    }
+
+    navigate(target);
+  };
+
   const renderTopNav = () => (
-    <header className="sticky top-0 z-30 border-b border-white/10 bg-slate-950/82 px-4 py-3 backdrop-blur-xl">
-      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-3">
-        <button onClick={() => navigate(isAuthed ? "dashboard" : "landing")} className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-500 text-white shadow-lg shadow-blue-500/20">
-            <Shield className="h-5 w-5" />
-          </div>
-          <div className="text-left">
-            <p className="text-lg font-black tracking-normal text-white">InterpShield</p>
-            <p className="text-xs font-semibold text-slate-500">Built by Isaac David</p>
-          </div>
-        </button>
-
-        <nav className="flex flex-wrap items-center gap-2 text-sm font-semibold text-slate-400">
-          {user?.role === 'admin' && <button onClick={() => navigate("admin")} className="rounded-lg px-3 py-2 hover:bg-white/5 hover:text-white">Admin</button>}
-          <button onClick={() => navigate("pricing")} className="flex items-center gap-2 rounded-lg bg-blue-500 px-4 py-2 font-black text-white hover:bg-blue-400">
-            <Crown className="h-4 w-4" />
-            Get Pro
-          </button>
-          <button onClick={() => navigate("history")} className="rounded-lg px-3 py-2 hover:bg-white/5 hover:text-white">History</button>
-          <button onClick={() => (isAuthed ? setSettingsOpen((current) => !current) : navigate("login"))} className="flex items-center gap-2 rounded-lg px-3 py-2 hover:bg-white/5 hover:text-white">
-            <Settings className="h-4 w-4" />
-            Settings
-          </button>
-          {isAuthed ? (
-            <button onClick={() => navigate("settings")} className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-2 py-1.5">
-              <FlagUs />
-              <span className="hidden text-xs font-bold text-slate-300 sm:inline">{user?.name.split(" ")[0]}</span>
-            </button>
-          ) : (
-            <button onClick={() => navigate("login")} className="rounded-lg px-3 py-2 hover:bg-white/5 hover:text-white">Login</button>
-          )}
-        </nav>
-      </div>
-
-      <AnimatePresence>
-        {settingsOpen && isAuthed && (
-          <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} className="absolute right-4 top-[68px] z-40 w-80 rounded-xl border border-white/10 bg-slate-950 p-4 shadow-2xl">
-            <p className="text-sm font-black text-white">Settings</p>
-            <div className="mt-3 space-y-2 text-sm">
-              <button onClick={() => navigate("settings")} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-slate-300 hover:bg-white/5">
-                <Languages className="h-4 w-4" />
-                Language preferences
-              </button>
-              <button onClick={() => navigate("settings")} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-slate-300 hover:bg-white/5">
-                <SlidersHorizontal className="h-4 w-4" />
-                Audio and AI settings
-              </button>
-              <button onClick={() => void logout()} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-red-200 hover:bg-red-500/10">
-                <LogOut className="h-4 w-4" />
-                Logout
-              </button>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </header>
+    <Navbar user={user} isAuthed={isAuthed} onNavigate={handleNavbarNavigate} onLogout={() => void logout()} />
   );
 
   const renderLanding = () => (
-    <main className="mx-auto w-full max-w-7xl px-5 py-8">
-      <section className="grid min-h-[calc(100vh-150px)] grid-cols-1 gap-8 lg:grid-cols-[1fr_520px] lg:items-center">
-        <div className="space-y-6">
-          <div className="inline-flex items-center gap-2 rounded-full border border-blue-500/20 bg-blue-500/10 px-3 py-1 text-xs font-bold uppercase tracking-widest text-blue-100">
-            <Sparkles className="h-3.5 w-3.5" />
-            AI live interpreter SaaS
-          </div>
-          <h1 className="max-w-4xl text-6xl font-black tracking-normal text-white md:text-8xl">Live Translate</h1>
-          <p className="max-w-xl text-lg leading-8 text-slate-400">Generate translated captions in real-time with a secure SaaS workspace for sessions, summaries, history, and Pro tools.</p>
-          <div className="flex flex-wrap gap-3">
-            <button onClick={() => navigate("signup")} className="rounded-lg bg-blue-500 px-5 py-3 text-sm font-black text-slate-950 shadow-lg shadow-blue-500/20 hover:bg-white">Start free</button>
-            <button onClick={() => navigate("login")} className="rounded-lg border border-white/10 bg-white/5 px-5 py-3 text-sm font-bold text-white hover:bg-white/10">Login</button>
-          </div>
-        </div>
-
-        <GlassPanel className="overflow-hidden">
-          <div className="aspect-video bg-[linear-gradient(135deg,rgba(14,165,233,0.22),rgba(15,23,42,0.1)),radial-gradient(circle_at_top,rgba(34,211,238,0.18),transparent_45%)] p-5">
-            <div className="flex h-full flex-col justify-between rounded-xl border border-white/10 bg-slate-950/65 p-5">
-              <div className="flex items-center justify-between text-xs font-bold uppercase tracking-widest text-slate-500">
-                <span>Interpreter Preview</span>
-                <span>00:18 live</span>
-              </div>
-              <div className="space-y-4 text-center">
-                <p className="text-sm font-bold uppercase tracking-widest text-slate-500">Original</p>
-                <p className="text-base font-bold text-slate-300">We can begin the product demo now.</p>
-                <p className="pt-4 text-sm font-bold uppercase tracking-widest text-blue-300">Spanish</p>
-                <p className="text-3xl font-black leading-tight text-white md:text-4xl">Podemos comenzar la demostracion ahora.</p>
-              </div>
-              <div className="flex items-center justify-center">
-                <span className="rounded-full border border-blue-500/20 bg-blue-500/10 px-4 py-2 text-xs font-bold uppercase tracking-widest text-blue-100">Subtitles streaming</span>
-              </div>
-            </div>
-          </div>
-        </GlassPanel>
-      </section>
+    <main className="mx-auto w-full max-w-5xl space-y-8 px-4 pb-16 sm:px-6">
+      <HeroSection />
+      <div className="space-y-6">
+        <ModeTabs activeMode="private" onChange={() => undefined} />
+        <ToolTabs activeTool="translate" onChange={() => undefined} />
+        <LanguageSelector
+          languages={LANGUAGES}
+          sourceLanguage="auto"
+          targetLanguage="es"
+          onSourceChange={() => undefined}
+          onTargetChange={() => undefined}
+          onSwap={() => undefined}
+        />
+        <TranslationOptions
+          twoWayEnabled={false}
+          threeWayEnabled={false}
+          onTwoWayToggle={() => undefined}
+          onThreeWayToggle={() => undefined}
+        />
+      </div>
+      <TranslationPanel
+        mode="translate"
+        status="idle"
+        statusLabel="Ready"
+        sourceLabel="Auto Detect"
+        targetLabel="Spanish"
+        originalText=""
+        translations={[{ language: "es", label: "Spanish (ES)", text: "", state: "ready" }]}
+        isConnected={false}
+        isRecording={false}
+        sessionSeconds={0}
+        chunkCount={0}
+        lastLatency={null}
+        historyCount={0}
+        onMicClick={() => navigate("signup")}
+        onClear={() => undefined}
+        onSave={() => undefined}
+      />
     </main>
   );
 
-  const renderDashboard = () => (
-    <main className="mx-auto grid w-full max-w-7xl grid-cols-1 gap-5 px-4 py-5 lg:grid-cols-[260px_1fr]">
-      <aside className="space-y-4">
-        <GlassPanel className="p-4">
-          <p className="mb-3 text-xs font-bold uppercase tracking-widest text-slate-500">Tools</p>
-          <div className="space-y-2">
-            <button onClick={() => { setPrivateMode(!privateMode); persistSetting("privateMode", !privateMode); }} className={`flex w-full items-center justify-between rounded-lg border px-3 py-2.5 text-sm font-bold ${privateMode ? "border-blue-500/20 bg-blue-500/10 text-blue-100" : "border-white/10 bg-slate-950/50 text-slate-400"}`}>
-              <span className="flex items-center gap-2"><Lock className="h-4 w-4" />Private Mode</span>
-              <span>{privateMode ? "On" : "Off"}</span>
-            </button>
-            <button onClick={() => { setShareableMode(!shareableMode); persistSetting("shareableMode", !shareableMode); }} className={`flex w-full items-center justify-between rounded-lg border px-3 py-2.5 text-sm font-bold ${shareableMode ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-200" : "border-white/10 bg-slate-950/50 text-slate-400"}`}>
-              <span className="flex items-center gap-2"><Share2 className="h-4 w-4" />Shareable</span>
-              <span>{shareableMode ? "On" : "Off"}</span>
-            </button>
-            {TOOL_ITEMS.map(({ mode: toolMode, label, icon: Icon }) => (
-              <button key={toolMode} disabled={isRecording} onClick={() => selectMode(toolMode)} className={`flex w-full items-center justify-between rounded-lg border px-3 py-2.5 text-sm font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${mode === toolMode ? "border-white/20 bg-white/10 text-white" : "border-white/10 bg-slate-950/50 text-slate-400 hover:text-white"}`}>
-                <span className="flex items-center gap-2"><Icon className="h-4 w-4" />{label}</span>
-              </button>
-            ))}
-          </div>
-        </GlassPanel>
+  const renderDashboard = () => {
+    const privacyMode: PrivacyMode = shareableMode ? "shareable" : "private";
+    const threeWayEnabled = targetLanguages.length > 1;
+    const sourceLabel = sourceLang === "auto"
+      ? detectedLanguage ? languageName(detectedLanguage) : "Auto Detect"
+      : languageName(detectedLanguage || sourceLang);
+    const targetLabel = targetLanguages.map(languageName).join(", ");
+    const translationEntries: TranscriptTranslationEntry[] = displayTranslationEntries.map(([language, translatedText, translationState]) => ({
+      language,
+      label: `${languageName(language)} (${language.toUpperCase()})`,
+      text: translatedText,
+      state: translationStateLabel(translationState)
+    }));
 
-      </aside>
+    const buildThreeWayTargets = (primaryLanguage: string, sourceLanguage = sourceLang) => {
+      const activeSource = normalizeLanguageCode(sourceLanguage);
+      const primary = normalizeLanguageCode(primaryLanguage) || DEFAULT_TARGET_LANGUAGES[0];
+      const candidates = [
+        primary,
+        ...targetLanguages,
+        ...DEFAULT_TARGET_LANGUAGES,
+        "fr",
+        "de",
+        "pt",
+        "it",
+        "zh",
+        "ja",
+        "ko"
+      ];
+      const nextTargets: string[] = [];
 
-      <section className="space-y-5">
-        <AnimatePresence>
-          {aiDegraded && (
-            <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
-              <div className="flex items-center gap-3 rounded-lg border border-blue-500/20 bg-blue-500/10 px-4 py-3 text-sm text-blue-100">
-                <AlertTriangle className="h-4 w-4 shrink-0 text-blue-400" />
-                <p><b>System Status:</b> High demand detected. Fallback AI processing is active to maintain low latency.</p>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+      for (const candidate of candidates) {
+        const code = normalizeLanguageCode(candidate);
+        if (!code || code === "auto" || code === activeSource || !SUPPORTED_LANGUAGE_CODES.has(code) || nextTargets.includes(code)) continue;
+        nextTargets.push(code);
+        if (nextTargets.length === MAX_TARGET_LANGUAGES) break;
+      }
 
-        <GlassPanel className="p-4">
-          <TargetLanguageTriangle sourceLang={sourceLang} targetLanguages={targetLanguages} disabled={isRecording} onSourceChange={setSourceLang} onToggleTarget={toggleTargetLanguage} onSwap={swapLanguages} />
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-4">
-            <button disabled={isRecording} onClick={() => setTwoWay((current) => !current)} className={`flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${twoWay ? "border-blue-500/20 bg-blue-500/10 text-blue-100" : "border-white/10 bg-slate-950/60 text-slate-400 hover:text-white"}`}>
-              <ArrowRightLeft className="h-4 w-4" />
-              Three-way translation
-            </button>
-          </div>
-        </GlassPanel>
+      return nextTargets.length > 0 ? nextTargets : ["es"];
+    };
 
-        <GlassPanel className="overflow-hidden">
-          <div className="flex flex-col gap-3 border-b border-white/10 px-5 py-4 md:flex-row md:items-center md:justify-between">
+    const handlePrivacyModeChange = (nextMode: PrivacyMode) => {
+      if (isRecording) return;
+      const nextPrivateMode = nextMode === "private";
+      const nextShareableMode = nextMode === "shareable";
+      setPrivateMode(nextPrivateMode);
+      setShareableMode(nextShareableMode);
+      persistSetting("privateMode", nextPrivateMode);
+      persistSetting("shareableMode", nextShareableMode);
+    };
+
+    const handleSourceLanguageChange = (language: string) => {
+      if (isRecording) return;
+      const nextSource = normalizeLanguageCode(language) || "en";
+      setSourceLang(nextSource);
+      persistSetting("preferredSourceLang", nextSource);
+
+      if (nextSource !== "auto" && targetLanguages.includes(nextSource)) {
+        const nextTargets = threeWayEnabled ? buildThreeWayTargets(targetLang, nextSource) : buildThreeWayTargets(targetLang, nextSource).slice(0, 1);
+        setTargetLanguages(nextTargets);
+        persistSetting("preferredTargetLanguages", nextTargets);
+      }
+    };
+
+    const handleTargetLanguageChange = (language: string) => {
+      if (isRecording) return;
+      const nextTarget = normalizeLanguageCode(language) || DEFAULT_TARGET_LANGUAGES[0];
+      const nextTargets = threeWayEnabled ? buildThreeWayTargets(nextTarget) : [nextTarget];
+      setTargetLanguages(nextTargets);
+      persistSetting("preferredTargetLang", nextTarget);
+      persistSetting("preferredTargetLanguages", nextTargets);
+    };
+
+    const handleSwapLanguages = () => {
+      if (isRecording) return;
+      const nextSource = targetLang;
+      const nextTarget = sourceLang === "auto" ? "en" : sourceLang;
+      const nextTargets = threeWayEnabled ? buildThreeWayTargets(nextTarget, nextSource) : [nextTarget];
+      setSourceLang(nextSource);
+      setTargetLanguages(nextTargets);
+      persistSetting("preferredSourceLang", nextSource);
+      persistSetting("preferredTargetLang", nextTargets[0]);
+      persistSetting("preferredTargetLanguages", nextTargets);
+    };
+
+    const handleThreeWayToggle = (enabled: boolean) => {
+      if (isRecording) return;
+      const nextTargets = enabled ? buildThreeWayTargets(targetLang) : [targetLang];
+      setTargetLanguages(nextTargets);
+      persistSetting("preferredTargetLanguages", nextTargets);
+    };
+
+    const handleTwoWayToggle = (enabled: boolean) => {
+      if (isRecording) return;
+      setTwoWay(enabled);
+    };
+
+    return (
+      <main className="mx-auto w-full max-w-5xl space-y-8 px-4 pb-16 sm:px-6">
+        <HeroSection />
+
+        <div className="space-y-6">
+          <ModeTabs activeMode={privacyMode} disabled={isRecording} onChange={handlePrivacyModeChange} />
+          <ToolTabs activeTool={mode} disabled={isRecording} onChange={selectMode} />
+          <LanguageSelector
+            languages={LANGUAGES}
+            sourceLanguage={sourceLang}
+            targetLanguage={targetLang}
+            disabled={isRecording}
+            onSourceChange={handleSourceLanguageChange}
+            onTargetChange={handleTargetLanguageChange}
+            onSwap={handleSwapLanguages}
+          />
+          <TranslationOptions
+            twoWayEnabled={twoWay}
+            threeWayEnabled={threeWayEnabled}
+            disabled={isRecording}
+            onTwoWayToggle={handleTwoWayToggle}
+            onThreeWayToggle={handleThreeWayToggle}
+          />
+        </div>
+
+        <TranslationPanel
+          mode={mode}
+          status={status}
+          statusLabel={statusLabel}
+          sourceLabel={sourceLabel}
+          targetLabel={targetLabel}
+          originalText={latestOriginal}
+          interimText={interimOriginal}
+          translations={translationEntries}
+          isConnected={socketConnected}
+          isRecording={isRecording}
+          sessionSeconds={sessionSeconds}
+          chunkCount={chunkCount}
+          lastLatency={lastLatency}
+          historyCount={history.length}
+          alert={alert}
+          aiDegraded={aiDegraded}
+          onMicClick={!isRecording ? () => void startSession() : stopSession}
+          onClear={clearLiveSession}
+          onSave={saveHistoryAsPdf}
+        />
+
+        <section className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm sm:p-5">
+          <div className="flex flex-col gap-1 border-b border-gray-100 pb-4 sm:flex-row sm:items-end sm:justify-between">
             <div>
-              <h1 className="text-xl font-black text-white">Live AI Interpreter</h1>
-              <p className="mt-1 text-sm font-semibold text-slate-400">{languageName(detectedLanguage || sourceLang)} <span className="text-slate-600">-&gt;</span> {targetLanguages.map(languageName).join(", ")}</p>
+              <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">Conversation history</p>
+              <h2 className="mt-1 text-lg font-semibold text-gray-950">{history.length} saved transcript lines</h2>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className={`w-fit rounded-full border px-3 py-1 text-xs font-bold uppercase tracking-wider ${status === "listening" ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-300" : status === "error" ? "border-red-500/20 bg-red-500/10 text-red-200" : "border-white/10 bg-slate-950/60 text-slate-400"}`}>
-                {statusLabel}
-              </span>
-              <span className="rounded-full border border-white/10 bg-slate-950/60 px-3 py-1 text-xs font-bold uppercase tracking-wider text-slate-400">{mode}</span>
-              {mode === "dubbing" && <span className="rounded-full border border-blue-500/20 bg-blue-500/10 px-3 py-1 text-xs font-bold uppercase tracking-wider text-blue-100">Dubbing queue</span>}
-            </div>
-          </div>
-
-          <div className="flex min-h-[430px] flex-col justify-between p-4 sm:p-5">
-            <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col justify-center text-center">
-              <p className="mb-3 text-xs font-bold uppercase tracking-widest text-slate-500">Original text</p>
-              <p className="mx-auto min-h-12 max-w-3xl text-base font-semibold leading-7 text-slate-300 md:text-lg">
-                <TypingSubtitle text={latestOriginal} muted={Boolean(interimOriginal)} empty="Waiting for speech." />
-              </p>
-
-              <div className="mx-auto mt-6 w-full max-w-4xl rounded-xl border border-blue-500/10 bg-blue-500/[0.045] p-4 text-left md:p-6">
-                <div className="mb-3 flex items-center justify-between gap-3">
-                  <p className="text-xs font-bold uppercase tracking-widest text-blue-100/70">Translations</p>
-                  {isRecording && mode !== "transcribe" && <span className="rounded-full border border-white/10 bg-slate-950/55 px-2.5 py-1 text-[11px] font-black uppercase tracking-widest text-slate-400">live queue</span>}
-                </div>
-                {mode === "transcribe" ? (
-                  <p className="min-h-20 text-2xl font-black leading-snug tracking-normal text-white sm:text-3xl">
-                    <TypingSubtitle text={latestOriginal} empty="Transcribed subtitles appear here." />
-                  </p>
-                ) : displayTranslationEntries.length > 0 ? (
-                  <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
-                    {displayTranslationEntries.map(([language, translatedText, translationState]) => (
-                      <div key={language} className={`rounded-lg border p-3 transition ${translatedText ? "border-white/10 bg-slate-950/40" : "border-white/5 bg-slate-950/20"}`}>
-                        <div className="mb-2 flex items-center justify-between gap-2">
-                          <span className="flex min-w-0 items-center gap-2 text-sm font-black text-blue-100"><span aria-hidden="true">{languageFlag(language)}</span>{language.toUpperCase()}</span>
-                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-black uppercase tracking-widest ${translationStateClass(translationState)}`}>{translationStateLabel(translationState)}</span>
-                        </div>
-                        <p className="min-h-20 text-base font-black leading-7 text-white md:text-lg">
-                          <TypingSubtitle text={translatedText} empty={translationState === "failed" ? "Translation did not complete." : isRecording ? "Translating..." : "Translated subtitles appear here."} />
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="min-h-20 text-2xl font-black leading-snug tracking-normal text-white sm:text-3xl">
-                    <TypingSubtitle text={latestTranslation} empty="Translated subtitles appear here." />
-                  </p>
-                )}
-              </div>
-            </div>
-
-            <div className="mt-7 flex flex-col items-center gap-3">
-              <button onClick={!isRecording ? () => void startSession() : stopSession} disabled={status === "stopping"} className={`relative flex h-20 w-20 items-center justify-center rounded-full text-white shadow-2xl transition duration-150 hover:scale-105 active:scale-95 disabled:cursor-wait disabled:opacity-70 ${status === "listening" ? "bg-red-500 shadow-red-500/25" : status === "connecting" ? "bg-blue-400 text-white shadow-blue-400/25" : "bg-blue-500 text-white shadow-blue-500/25"}`} aria-label={isRecording ? "Stop recording" : "Start recording"}>
-                {isRecording && <span className="pulse-ring absolute inset-0 rounded-full border border-white/70" />}
-                {isRecording ? <CircleStop className="h-8 w-8" /> : <Mic className="h-8 w-8" />}
-              </button>
-              <p className="text-sm font-bold text-slate-300">{status === "connecting" ? "Starting live session..." : isRecording ? "Listening now" : "Tap to start interpreting"}</p>
-              <div className="flex flex-wrap justify-center gap-2 text-xs">
-                <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 font-mono text-slate-300"><Timer className="h-3.5 w-3.5 text-slate-500" />{formatTime(sessionSeconds)}</span>
-                <span className="rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 font-bold uppercase tracking-wider text-slate-500">1 hr safety limit</span>
-                {chunkCount > 0 && <span className="rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 font-bold text-slate-500">{chunkCount} chunks</span>}
-                {lastLatency !== null && <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 font-bold text-emerald-300">{lastLatency}ms</span>}
-              </div>
-            </div>
-          </div>
-        </GlassPanel>
-
-        <GlassPanel className="overflow-hidden">
-          <div className="flex flex-col gap-3 border-b border-white/10 px-5 py-4 md:flex-row md:items-center md:justify-between">
-            <div>
-              <p className="text-xs font-bold uppercase tracking-widest text-slate-500">Conversation history</p>
-              <p className="mt-1 text-sm font-semibold text-slate-400">{history.length} saved transcript lines</p>
-            </div>
-            <button onClick={saveHistoryAsPdf} disabled={history.length === 0} className="flex w-fit items-center gap-2 rounded-lg border border-white/10 bg-slate-950/70 px-4 py-2 text-sm font-bold text-slate-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40">
-              <Download className="h-4 w-4" />
-              Save as PDF
+            <button type="button" onClick={() => navigate("history")} className="w-fit text-sm font-semibold text-blue-600 transition hover:text-blue-700">
+              View history
             </button>
           </div>
-          <div className="max-h-72 overflow-y-auto px-5 py-4">
+
+          <div className="max-h-72 overflow-y-auto pt-4">
             {history.length === 0 ? (
-              <p className="rounded-lg border border-white/10 bg-slate-950/50 p-4 text-sm text-slate-500">Final transcripts will stay here during long sessions and after refresh.</p>
+              <p className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-500">Final transcripts will appear here during the session.</p>
             ) : (
               <div className="space-y-3">
                 {visibleHistory.map((entry) => (
-                  <div key={entry.id} className="rounded-lg border border-white/10 bg-slate-950/55 p-4">
-                    <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-600">[{formatHistoryTimestamp(entry.timestamp)}]</p>
-                    <p className="text-sm leading-6 text-slate-300"><span className="font-black text-slate-100">{entry.sourceLang.toUpperCase()}:</span> {entry.original || "No transcript text"}</p>
+                  <article key={entry.id} className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+                    <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-400">[{formatHistoryTimestamp(entry.timestamp)}]</p>
+                    <p className="text-sm leading-6 text-gray-700"><span className="font-semibold text-gray-950">{entry.sourceLang.toUpperCase()}:</span> {entry.original || "No transcript text"}</p>
                     <div className="mt-2 space-y-1.5">
                       {orderedTranslationEntries(normalizeTranslationMap(entry.translations, entry.translated, entry.targetLang, { sourceText: entry.original }), entry.targetLanguages || [entry.targetLang]).map(([language, translatedText]) => (
-                        <p key={language} className="text-sm leading-6 text-blue-50"><span className="font-black text-blue-200">{languageFlag(language)} {language.toUpperCase()}:</span> {translatedText || "No translation text"}</p>
+                        <p key={language} className="text-sm leading-6 text-blue-900">
+                          <span className="font-semibold text-blue-700">{language.toUpperCase()}:</span> {translatedText || "No translation text"}
+                        </p>
                       ))}
                     </div>
-                  </div>
+                  </article>
                 ))}
                 <div ref={historyEndRef} />
               </div>
             )}
           </div>
-        </GlassPanel>
-
-        <AnimatePresence>
-          {alert && (
-            <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-100">
-              <div className="flex items-start gap-3">
-                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
-                <p>{alert}</p>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        <div className="flex justify-end">
-          <button onClick={clearLiveSession} className="text-sm font-bold text-slate-500 hover:text-white">Clear subtitles</button>
-        </div>
-      </section>
-    </main>
-  );
+        </section>
+      </main>
+    );
+  };
 
   const renderPricing = () => {
     const yearly = billingCycle === "yearly";
@@ -2726,22 +2775,22 @@ export default function App() {
     return (
       <main className="mx-auto w-full max-w-7xl px-5 py-10">
         <div className="mb-8 flex flex-col gap-4 text-center md:items-center">
-          <p className="text-xs font-bold uppercase tracking-widest text-blue-300">Pricing</p>
-          <h1 className="text-4xl font-black text-white md:text-5xl">Plans for every live workflow</h1>
-          <div className="inline-flex items-center justify-center gap-2 rounded-full border border-white/10 bg-slate-950/70 p-1">
-            <button onClick={() => setBillingCycle("monthly")} className={`rounded-full px-4 py-2 text-sm font-bold ${billingCycle === "monthly" ? "bg-white text-slate-950" : "text-slate-400"}`}>Monthly</button>
-            <button onClick={() => setBillingCycle("yearly")} className={`rounded-full px-4 py-2 text-sm font-bold ${billingCycle === "yearly" ? "bg-blue-500 text-white" : "text-slate-400"}`}>Yearly</button>
-            <span className="pr-3 text-xs font-bold uppercase tracking-widest text-blue-300">Save 20% yearly</span>
+          <p className="text-xs font-bold uppercase tracking-widest text-blue-600">Pricing</p>
+          <h1 className="text-4xl font-black text-gray-950 md:text-5xl">Plans for every live workflow</h1>
+          <div className="inline-flex items-center justify-center gap-2 rounded-full border border-gray-200 bg-white p-1 shadow-sm">
+            <button onClick={() => setBillingCycle("monthly")} className={`rounded-full px-4 py-2 text-sm font-bold ${billingCycle === "monthly" ? "bg-gray-950 text-white" : "text-gray-500"}`}>Monthly</button>
+            <button onClick={() => setBillingCycle("yearly")} className={`rounded-full px-4 py-2 text-sm font-bold ${billingCycle === "yearly" ? "bg-blue-600 text-white" : "text-gray-500"}`}>Yearly</button>
+            <span className="pr-3 text-xs font-bold uppercase tracking-widest text-blue-600">Save 20% yearly</span>
           </div>
         </div>
 
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
           {PRICING_PLANS.map((plan) => (
             <GlassPanel key={plan.name} className={`p-5 ${plan.highlighted ? "border-blue-500/35" : ""}`}>
-              {plan.highlighted && <span className="mb-3 inline-flex rounded-full bg-blue-500 px-3 py-1 text-xs font-black uppercase tracking-wider text-slate-950">Popular</span>}
-              <p className="text-xl font-black text-white">{plan.name}</p>
-              <p className="mt-4 text-4xl font-black text-white">${priceFor(plan.monthly)}<span className="text-sm text-slate-500">/mo</span></p>
-              <ul className="mt-5 space-y-3 text-sm text-slate-300">
+              {plan.highlighted && <span className="mb-3 inline-flex rounded-full bg-blue-600 px-3 py-1 text-xs font-black uppercase tracking-wider text-white">Popular</span>}
+              <p className="text-xl font-black text-gray-950">{plan.name}</p>
+              <p className="mt-4 text-4xl font-black text-gray-950">${priceFor(plan.monthly)}<span className="text-sm text-gray-500">/mo</span></p>
+              <ul className="mt-5 space-y-3 text-sm text-gray-600">
                 {plan.features.map((feature) => (
                   <li key={feature} className="flex items-start gap-2">
                     <Check className="mt-0.5 h-4 w-4 shrink-0 text-blue-300" />
@@ -2749,16 +2798,16 @@ export default function App() {
                   </li>
                 ))}
               </ul>
-              <button onClick={() => void upgradePlan()} className={`mt-6 w-full rounded-lg px-4 py-3 text-sm font-black ${plan.highlighted ? "bg-blue-500 text-white hover:bg-white" : "border border-white/10 bg-white/5 text-white hover:bg-white/10"}`}>
+              <button onClick={() => void upgradePlan()} className={`mt-6 w-full rounded-lg px-4 py-3 text-sm font-black ${plan.highlighted ? "bg-blue-600 text-white hover:bg-blue-700" : "border border-gray-200 bg-white text-gray-800 hover:bg-gray-50"}`}>
                 Subscribe
               </button>
             </GlassPanel>
           ))}
 
           <GlassPanel className="p-5">
-            <p className="text-xl font-black text-white">Enterprise</p>
-            <p className="mt-4 text-3xl font-black text-white">Custom</p>
-            <ul className="mt-5 space-y-3 text-sm text-slate-300">
+            <p className="text-xl font-black text-gray-950">Enterprise</p>
+            <p className="mt-4 text-3xl font-black text-gray-950">Custom</p>
+            <ul className="mt-5 space-y-3 text-sm text-gray-600">
               {["Custom pricing", "Dedicated onboarding", "Security review", "Contact form"].map((feature) => (
                 <li key={feature} className="flex items-start gap-2">
                   <Check className="mt-0.5 h-4 w-4 shrink-0 text-blue-300" />
@@ -2766,7 +2815,7 @@ export default function App() {
                 </li>
               ))}
             </ul>
-            <button onClick={() => setAlert("Enterprise contact form is ready for your sales workflow.")} className="mt-6 w-full rounded-lg border border-white/10 bg-white/5 px-4 py-3 text-sm font-black text-white hover:bg-white/10">
+            <button onClick={() => setAlert("Enterprise contact form is ready for your sales workflow.")} className="mt-6 w-full rounded-lg border border-gray-200 bg-white px-4 py-3 text-sm font-black text-gray-800 hover:bg-gray-50">
               Contact sales
             </button>
           </GlassPanel>
@@ -2779,10 +2828,10 @@ export default function App() {
     <main className="mx-auto w-full max-w-6xl px-5 py-8">
       <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div>
-          <p className="text-xs font-bold uppercase tracking-widest text-slate-500">History</p>
-          <h1 className="mt-2 text-4xl font-black text-white">Session history</h1>
+          <p className="text-xs font-bold uppercase tracking-widest text-gray-500">History</p>
+          <h1 className="mt-2 text-4xl font-black text-gray-950">Session history</h1>
         </div>
-        <button onClick={() => void fetchHistory()} className="rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-sm font-bold text-slate-200 hover:bg-white/10">Refresh</button>
+        <button onClick={() => void fetchHistory()} className="rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-bold text-gray-700 hover:bg-gray-50">Refresh</button>
       </div>
       <div className="space-y-3">
         {savedHistory.length === 0 && <GlassPanel className="p-6 text-sm text-slate-500">No saved sessions yet.</GlassPanel>}
@@ -2790,23 +2839,23 @@ export default function App() {
           <GlassPanel key={item.id} className="p-5">
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
-                <p className="font-black text-white">{item.title}</p>
-                <p className="mt-1 text-xs font-bold uppercase tracking-widest text-slate-500">{languageName(item.sourceLang)} to {languageName(item.targetLang)} - {new Date(item.createdAt).toLocaleString()}</p>
+                <p className="font-black text-gray-950">{item.title}</p>
+                <p className="mt-1 text-xs font-bold uppercase tracking-widest text-gray-500">{languageName(item.sourceLang)} to {languageName(item.targetLang)} - {new Date(item.createdAt).toLocaleString()}</p>
               </div>
-              <button onClick={() => (isPro ? setAlert("History export prepared.") : navigate("pricing"))} className="flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm font-bold text-slate-300 hover:bg-white/5">
+              <button onClick={() => (isPro ? setAlert("History export prepared.") : navigate("pricing"))} className="flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-sm font-bold text-gray-700 hover:bg-gray-50">
                 <Download className="h-4 w-4" />
                 Export
                 {!isPro && <Lock className="h-3.5 w-3.5 text-amber-300" />}
               </button>
             </div>
             <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
-              <p className="rounded-lg border border-white/10 bg-slate-950/60 p-3 text-sm text-slate-300">{item.originalText || "No transcript text"}</p>
-              <div className="rounded-lg border border-blue-500/10 bg-blue-500/5 p-3 text-sm text-blue-50">
+              <p className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm text-gray-700">{item.originalText || "No transcript text"}</p>
+              <div className="rounded-lg border border-blue-100 bg-blue-50 p-3 text-sm text-blue-900">
                 {orderedTranslationEntries(
                   normalizeTranslationMap(item.translations, item.translatedText, item.targetLang, { sourceText: item.originalText }),
                   item.targetLanguages || [item.targetLang]
                 ).map(([language, translatedText]) => (
-                  <p key={language}><span className="font-black text-blue-200">{language.toUpperCase()}:</span> {translatedText}</p>
+                  <p key={language}><span className="font-black text-blue-700">{language.toUpperCase()}:</span> {translatedText}</p>
                 ))}
               </div>
             </div>
@@ -2818,7 +2867,7 @@ export default function App() {
 
   const renderHelp = () => (
     <main className="mx-auto w-full max-w-5xl px-5 py-10">
-      <h1 className="text-5xl font-black text-white">Help</h1>
+      <h1 className="text-5xl font-black text-gray-950">Help</h1>
       <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-3">
         {[
           ["Microphone", "Allow microphone permission in your browser or Android WebView."],
@@ -2827,8 +2876,8 @@ export default function App() {
         ].map(([title, text]) => (
           <GlassPanel key={title} className="p-5">
             <BadgeHelp className="h-5 w-5 text-blue-300" />
-            <p className="mt-4 font-black text-white">{title}</p>
-            <p className="mt-2 text-sm leading-6 text-slate-500">{text}</p>
+            <p className="mt-4 font-black text-gray-950">{title}</p>
+            <p className="mt-2 text-sm leading-6 text-gray-500">{text}</p>
           </GlassPanel>
         ))}
       </div>
@@ -2927,15 +2976,15 @@ export default function App() {
   const renderSettings = () => (
     <main className="mx-auto w-full max-w-6xl px-5 py-8">
       <div className="mb-6">
-        <p className="text-xs font-bold uppercase tracking-widest text-slate-500">Settings</p>
-        <h1 className="mt-2 text-4xl font-black text-white">Workspace preferences</h1>
+        <p className="text-xs font-bold uppercase tracking-widest text-gray-500">Settings</p>
+        <h1 className="mt-2 text-4xl font-black text-gray-950">Workspace preferences</h1>
       </div>
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
         <GlassPanel className="p-5">
           <div className="mb-4 flex items-center gap-2">
             <ListChecks className="h-5 w-5 text-blue-300" />
-            <p className="font-black text-white">General settings</p>
+            <p className="font-black text-gray-950">General settings</p>
           </div>
           <div className="space-y-3">
             <ToggleRow label="Save transcript" value={saveTranscript} onChange={(value) => { setSaveTranscript(value); persistSetting("saveTranscript", value); }} />
@@ -2957,7 +3006,7 @@ export default function App() {
         <GlassPanel className="p-5">
           <div className="mb-4 flex items-center gap-2">
             <Mic className="h-5 w-5 text-blue-300" />
-            <p className="font-black text-white">Audio processing</p>
+            <p className="font-black text-gray-950">Audio processing</p>
           </div>
           <div className="space-y-3">
             <SelectControl label="Microphone" value={microphoneId} onChange={(value) => { setMicrophoneId(value); persistSetting("microphoneId", value); }}>
@@ -2977,7 +3026,7 @@ export default function App() {
         <GlassPanel className="p-5">
           <div className="mb-4 flex items-center gap-2">
             <Sparkles className="h-5 w-5 text-blue-300" />
-            <p className="font-black text-white">AI settings</p>
+            <p className="font-black text-gray-950">AI settings</p>
           </div>
           <div className="space-y-3">
             <SelectControl label="Summary length" value={summaryLength} onChange={(value) => { setSummaryLength(value as SummaryLength); persistSetting("summaryLength", value as SummaryLength); }}>
@@ -3005,8 +3054,8 @@ export default function App() {
             <ToggleRow label="Per-speaker summary" value={perSpeakerSummary} onChange={(value) => { setPerSpeakerSummary(value); persistSetting("perSpeakerSummary", value); }} />
             <ToggleRow label="Sentiment tracking" value={sentimentTracking} onChange={(value) => { setSentimentTracking(value); persistSetting("sentimentTracking", value); }} />
             <ToggleRow label="Keywords extraction" value={keywordsExtraction} onChange={(value) => { setKeywordsExtraction(value); persistSetting("keywordsExtraction", value); }} />
-            <div className="mt-4 border-t border-white/5 pt-4">
-              <p className="text-[10px] font-black uppercase tracking-widest text-slate-500">Live AI Latency</p>
+            <div className="mt-4 border-t border-gray-100 pt-4">
+              <p className="text-[10px] font-black uppercase tracking-widest text-gray-500">Live AI Latency</p>
               <LatencyGraph data={latencyHistory} />
             </div>
           </div>
@@ -3015,13 +3064,13 @@ export default function App() {
         <GlassPanel className="p-5">
           <div className="mb-4 flex items-center gap-2">
             <User className="h-5 w-5 text-blue-300" />
-            <p className="font-black text-white">Account</p>
+            <p className="font-black text-gray-950">Account</p>
           </div>
-          <div className="space-y-3 text-sm text-slate-300">
-            <div className="rounded-lg border border-white/10 bg-slate-950/45 p-4">
-              <p className="font-black text-white">{user?.name}</p>
-              <p className="mt-1 text-slate-500">{user?.email}</p>
-              <p className="mt-3 w-fit rounded-full border border-blue-500/20 bg-blue-500/10 px-3 py-1 text-xs font-black uppercase tracking-widest text-blue-100">{user?.plan || "free"} plan</p>
+          <div className="space-y-3 text-sm text-gray-600">
+            <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+              <p className="font-black text-gray-950">{user?.name}</p>
+              <p className="mt-1 text-gray-500">{user?.email}</p>
+              <p className="mt-3 w-fit rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-black uppercase tracking-widest text-blue-700">{user?.plan || "free"} plan</p>
             </div>
             <button onClick={() => void logout()} className="flex w-full items-center justify-center gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 font-bold text-red-100 hover:bg-red-500/15">
               <LogOut className="h-4 w-4" />
@@ -3034,8 +3083,7 @@ export default function App() {
   );
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100">
-      <div className="fixed inset-0 -z-10 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.14),transparent_30%),radial-gradient(circle_at_82%_14%,rgba(16,185,129,0.1),transparent_26%),linear-gradient(180deg,#020617,#0f172a_62%,#020617)]" />
+    <div className="min-h-screen bg-gray-50 text-gray-900">
       {renderTopNav()}
       {view === "landing" && renderLanding()}
       {view === "login" && <AuthPage mode="login" authProvider={authProvider} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleError={setAuthError} onNavigate={navigate} />}
@@ -3047,8 +3095,8 @@ export default function App() {
       {view === "help" && renderHelp()}
       {view === "settings" && isAuthed && renderSettings()}
 
-      <footer className="border-t border-white/10 px-5 py-5">
-        <div className="mx-auto flex w-full max-w-7xl flex-col gap-2 text-xs text-slate-600 md:flex-row md:items-center md:justify-between">
+      <footer className="border-t border-gray-200 bg-white px-5 py-5">
+        <div className="mx-auto flex w-full max-w-7xl flex-col gap-2 text-xs text-gray-500 md:flex-row md:items-center md:justify-between">
           <span>InterpShield - Built by Isaac David</span>
           <span>Live captions, translation, dubbing, summaries, and session history.</span>
         </div>

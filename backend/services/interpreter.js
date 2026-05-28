@@ -25,10 +25,10 @@ const SUPPORTED_LANGUAGE_CODES = new Set(["en", "fr", "es", "de", "it", "pt", "n
 const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
 const FAST_LOCAL_LANGUAGE_CODES = new Set(["sw"]);
 const FAST_LOCAL_MAX_ACTIVE_TRANSLATIONS = 8;
-const PROVIDER_MAX_ACTIVE_TRANSLATIONS = 2;
+const PROVIDER_MAX_ACTIVE_TRANSLATIONS = 6;
 const MAX_TRANSLATION_LANE_QUEUE_SIZE = 24;
-const QUEUED_JOB_TIMEOUT = 45000;
-const PROCESSING_JOB_TIMEOUT = 90000;
+const QUEUED_JOB_TIMEOUT = 15000;
+const PROCESSING_JOB_TIMEOUT = 20000;
 const SEQUENTIAL_JOB_HARD_TIMEOUT = 180000;
 const TRANSLATION_RATE_LIMIT_DELAY_MS = 80;
 const CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS = 3000;
@@ -66,10 +66,10 @@ const PROVIDER_TRANSLATION_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const PARTIAL_TRANSLATION_PREVIEW_THROTTLE_MS = 140;
 const ADMIN_STATS_EMIT_MS = 10000;
 const PROVIDER_TIMEOUT_MS = {
-  gemini: 25000,
-  openai: 22000
+  gemini: 8000,
+  openai: 8000
 };
-const PROVIDER_FAILURE_THRESHOLD = 3;
+const PROVIDER_FAILURE_THRESHOLD = 6;
 const PROVIDER_COOLDOWN_MS = 45000;
 const SESSION_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
 const SESSION_HEALTH_CHECK_MS = 2500;
@@ -612,7 +612,8 @@ const isTargetLanguageText = ({ text = "", targetLang = "" } = {}) => {
     return markerScore >= 2 || (markerScore >= 1 && englishScore === 0 && tokenCount <= 4);
   }
 
-  if (englishScore >= 3) return false;
+  if (tokenCount <= 4) return true;
+  if (englishScore >= 6) return false;
   return true;
 };
 
@@ -1073,7 +1074,7 @@ export const createInterpreterSession = async ({
 
     const avg = lane.latencyHistory.reduce((a, b) => a + b, 0) / lane.latencyHistory.length;
     const previouslyTripped = lane.tripped;
-    lane.tripped = lane.latencyHistory.length >= 3 && avg > CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS;
+    lane.tripped = lane.latencyHistory.length >= 5 && avg > CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS * 2;
 
     if (lane.tripped && !previouslyTripped) {
       onWarning?.("AI_PROVIDER_DEGRADED");
@@ -1163,6 +1164,10 @@ export const createInterpreterSession = async ({
 
   const getHealthyProviders = () => {
     refreshProviderCooldowns();
+    let primaryChoice = userPlan === "pro" ? "openai" : "gemini";
+    if (preferredProvider && preferredProvider !== "auto") {
+      primaryChoice = preferredProvider;
+    }
     const providers = Object.entries(providerHealth)
       .filter(([name, health]) => {
         const hasKey = name === "gemini" ? env.geminiApiKey : env.openaiApiKey;
@@ -1171,11 +1176,6 @@ export const createInterpreterSession = async ({
 
     return providers.sort((a, b) => {
       if (a[1].failures !== b[1].failures) return a[1].failures - b[1].failures;
-
-      let primaryChoice = userPlan === "pro" ? "openai" : "gemini";
-      if (userPlan === "pro" && preferredProvider && preferredProvider !== "auto") {
-        primaryChoice = preferredProvider;
-      }
 
       if (a[0] === primaryChoice && b[0] !== primaryChoice) return -1;
       if (b[0] === primaryChoice && a[0] !== primaryChoice) return 1;
@@ -1469,9 +1469,8 @@ export const createInterpreterSession = async ({
 
     refreshProviderCooldowns();
     const providerOrder = [
-      env.openaiApiKey && providerAvailable("openai") ? "openai" : "",
-      env.geminiApiKey && providerAvailable("gemini") ? "gemini" : ""
-    ].filter(Boolean);
+      ...getHealthyProviders()
+    ];
 
     if (providerOrder.length === 0) {
       logTranslationEvent("TRANSLATION_FAILED", {
@@ -1521,6 +1520,14 @@ export const createInterpreterSession = async ({
 
         if (attempt > 0) {
           translationMetrics.retryCount += 1;
+          setTranslationLanguageStatus(translationJobs.get(jobId), language, "retrying");
+          logTranslationEvent("PROVIDER_RETRY", {
+            sessionId,
+            jobId,
+            provider,
+            targetLang: language,
+            attempt: attempt + 1
+          }, "warn");
           await delay(PROVIDER_RETRY_DELAY_MS * attempt);
           if (staleTranslationJobs.has(jobId)) break;
         }
@@ -1544,6 +1551,15 @@ export const createInterpreterSession = async ({
         const retryable = Boolean(result?.error || result?.timedOut);
         if (!retryable) break;
       }
+
+      logTranslationEvent("PROVIDER_FALLBACK", {
+        sessionId,
+        jobId,
+        provider,
+        targetLang: language,
+        nextProvider: providerOrder[providerOrder.indexOf(provider) + 1] || "none",
+        error: lastError?.message || lastError
+      }, "warn");
     }
 
     noteTranslationFailure(language, lastError);
@@ -1744,6 +1760,8 @@ export const createInterpreterSession = async ({
       jobId: job.id,
       sourceLang: job.direction?.source,
       targetLang: language,
+      completedLanguages: [...(job.completedLanguages || new Set())],
+      remainingLanguages: [...(job.pendingLanguages || new Set()), ...(job.runningLanguages || new Set())],
       provider,
       latencyMs: Date.now() - job.startedAt,
       error: reason
@@ -2202,9 +2220,17 @@ export const createInterpreterSession = async ({
         job.runningLanguages?.size === 0 &&
         !isActiveFifoJob &&
         now - (job.createdAt || now) > QUEUED_JOB_TIMEOUT;
-      const processingTooLong =
-        job.runningLanguages?.size > 0 &&
-        activeAge > (isActiveFifoJob ? SEQUENTIAL_JOB_HARD_TIMEOUT : PROCESSING_JOB_TIMEOUT);
+      const processingTooLong = false;
+      if (job.runningLanguages?.size > 0 && activeAge > PROCESSING_JOB_TIMEOUT) {
+        logTranslationEvent("STALE_JOB_CLEANUP_SKIPPED_ACTIVE", {
+          sessionId,
+          jobId: job.id,
+          sourceLang: job.direction?.source,
+          targetLanguages: job.direction?.targets,
+          latency: activeAge,
+          activeFifo: isActiveFifoJob
+        }, "warn");
+      }
 
       if (queuedTooLong || processingTooLong) {
         markTranslationJobStale(job, queuedTooLong ? "queued_too_long" : "processing_timeout");
@@ -2220,6 +2246,14 @@ export const createInterpreterSession = async ({
         task.stale = true;
 
         if (job) {
+          logTranslationEvent("LANGUAGE_TIMEOUT", {
+            sessionId,
+            jobId: task.jobId,
+            language: task.language,
+            provider: lane.group,
+            latency: now - task.startedAt,
+            preservedTranslations: Object.keys(job.translations || {})
+          }, "warn");
           markTranslationLanguageFailed(job, task.language, "processing_timeout", lane.group);
           if (lane.group === TRANSLATION_LANE_PROVIDER) noteTranslationFailure(task.language, new Error("Translation task became stale"));
           finalizeTranslationJobIfReady(job);
@@ -2232,6 +2266,13 @@ export const createInterpreterSession = async ({
         if (!task?.createdAt || now - task.createdAt < QUEUED_JOB_TIMEOUT) continue;
 
         lane.queue.splice(index, 1);
+        logTranslationEvent("LANE_QUEUE_TIMEOUT", {
+          sessionId,
+          lane: lane.id,
+          jobId: task.jobId,
+          language: task.language,
+          latency: now - task.createdAt
+        }, "warn");
         discardQueuedTranslationTask(lane, task, "queued_too_long");
       }
     }
@@ -2256,8 +2297,8 @@ export const createInterpreterSession = async ({
   }
 
   const clearPendingTranslationQueue = (reason = "newer_final_transcript", nextJob = null) => {
-    const pendingCount = sessionTranslationQueue.queue.length;
-    sessionTranslationQueue.queue.length = 0;
+    const droppedJobs = sessionTranslationQueue.queue.splice(0);
+    const pendingCount = droppedJobs.length;
     logTranslationEvent("QUEUE_CLEAR", {
       sessionId,
       sequence: nextJob?.sequence || sessionTranslationQueue.sequence,
@@ -2268,23 +2309,10 @@ export const createInterpreterSession = async ({
       pendingCount
     });
 
-    const activeJob = sessionTranslationQueue.activeJob || activeSequentialTranslationJob;
-    if (
-      activeJob &&
-      activeJob.id !== nextJob?.id &&
-      !activeJob.completed &&
-      !activeJob.stale
-    ) {
-      markTranslationJobStale(activeJob, reason);
+    for (const droppedJob of droppedJobs) {
+      if (!droppedJob || droppedJob.id === nextJob?.id || droppedJob.completed || droppedJob.stale) continue;
+      markTranslationJobStale(droppedJob, reason);
     }
-
-    for (const existingJob of [...translationJobs.values()]) {
-      if (existingJob.id === nextJob?.id || existingJob.completed || existingJob.stale) continue;
-      markTranslationJobStale(existingJob, reason);
-    }
-
-    sessionTranslationQueue.currentAbortController?.abort?.();
-    sessionTranslationQueue.currentAbortController = null;
 
     for (const retryTimer of backgroundRetryTimers) {
       clearTimeout(retryTimer);

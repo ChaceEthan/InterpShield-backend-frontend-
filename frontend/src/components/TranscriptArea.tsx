@@ -1,0 +1,98 @@
+import { useEffect, useRef } from "react";
+import { Languages } from "lucide-react";
+import { AnimatePresence, motion } from "motion/react";
+
+export interface TranscriptTranslationEntry {
+  language: string;
+  label: string;
+  text: string;
+  state: string;
+}
+
+interface TranscriptAreaProps {
+  mode: "transcribe" | "translate" | "dubbing";
+  originalText: string;
+  interimText?: string;
+  translations: TranscriptTranslationEntry[];
+  isRecording: boolean;
+}
+
+export function TranscriptArea({ mode, originalText, interimText = "", translations, isRecording }: TranscriptAreaProps) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const visibleOriginal = interimText || originalText;
+  const hasTranslations = translations.some((entry) => entry.text.trim());
+  const isTranscribe = mode === "transcribe";
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [visibleOriginal, translations]);
+
+  return (
+    <div
+      ref={scrollRef}
+      className="mx-auto flex max-h-[360px] min-h-[220px] w-full max-w-4xl flex-col gap-4 overflow-y-auto px-1 py-2 sm:max-h-[390px]"
+    >
+      <AnimatePresence mode="popLayout">
+        {visibleOriginal ? (
+          <motion.article
+            key="source-card"
+            layout
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            className="rounded-2xl border border-gray-200 bg-white p-5 text-left shadow-sm sm:p-6"
+          >
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <span className="text-xs font-semibold uppercase tracking-wide text-gray-400">Live subtitles</span>
+              {isRecording && <span className="h-2 w-2 rounded-full bg-red-500 shadow-sm shadow-red-200" />}
+            </div>
+            <p className="break-words text-lg font-medium leading-8 text-gray-950 sm:text-xl">{visibleOriginal}</p>
+          </motion.article>
+        ) : (
+          <motion.div
+            key="empty-card"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="grid min-h-[190px] place-items-center rounded-2xl border border-dashed border-gray-200 bg-white/70 p-8 text-center"
+          >
+            <div>
+              <div className="mx-auto grid h-11 w-11 place-items-center rounded-full bg-blue-50 text-blue-600">
+                <Languages className="h-5 w-5" />
+              </div>
+              <p className="mt-4 text-sm font-medium text-gray-500">Press and start talking</p>
+            </div>
+          </motion.div>
+        )}
+
+        {!isTranscribe && (hasTranslations || isRecording) && (
+          <motion.div
+            key="translation-grid"
+            layout
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            className="grid grid-cols-1 gap-3 md:grid-cols-3"
+          >
+            {translations.map((entry) => (
+              <motion.article
+                layout
+                key={entry.language}
+                className="rounded-2xl border border-blue-100 bg-blue-50/80 p-4 text-left shadow-sm"
+              >
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <span className="truncate text-xs font-semibold uppercase tracking-wide text-blue-700">{entry.label}</span>
+                  <span className="rounded-full bg-white px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-gray-500 shadow-sm">
+                    {entry.state}
+                  </span>
+                </div>
+                <p className="min-h-16 break-words text-base font-semibold leading-7 text-gray-950">
+                  {entry.text || (isRecording ? "Translating..." : "Translation will appear here.")}
+                </p>
+              </motion.article>
+            ))}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
