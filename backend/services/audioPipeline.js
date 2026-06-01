@@ -1,20 +1,20 @@
 // @ts-nocheck
+import {
+  SUPPORTED_LANGUAGE_CODES,
+  normalizeLanguageCode
+} from "../../shared/languages.mjs";
+
 const MIN_AUDIO_CHUNK_BYTES = 48;
 const DUPLICATE_HASH_WINDOW = 24;
 const MIN_CHUNK_INTERVAL_MS = 20;
 const LOW_AUDIO_LEVEL = 0.0008;
 const MAX_TRANSLATED_SPEECH_QUEUE = 24;
 const TRANSLATED_SPEECH_TTL_MS = 45000;
-const SUPPORTED_LANGUAGE_CODES = new Set(["en", "fr", "es", "de", "it", "pt", "nl", "ar", "zh", "ja", "ko", "hi", "tr", "pl", "ru", "sw"]);
-const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
 
 const normalizeLanguage = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
   if (!normalized) return "";
-  if (FORBIDDEN_LANGUAGE_CODES.has(normalized) || normalized.startsWith("rw") || normalized.startsWith("rn")) return "en";
-  if (normalized.startsWith("sw")) return "sw";
-  if (normalized.startsWith("zh")) return "zh";
-  const code = normalized.split("-")[0] || normalized;
+  const code = normalizeLanguageCode(normalized);
   return SUPPORTED_LANGUAGE_CODES.has(code) ? code : "en";
 };
 

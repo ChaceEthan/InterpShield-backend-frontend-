@@ -10,20 +10,23 @@ import {
   resolveLocalTranslation
 } from "../utils/translationEnhancer.js";
 import { LOCAL_LANGUAGE_MARKERS } from "../data/languageMemory.js";
+import {
+  SUPPORTED_LANGUAGE_CODES,
+  normalizeLanguageCode as normalizeSharedLanguageCode
+} from "../../shared/languages.mjs";
 
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
 const MAX_TRANSCRIPT_HISTORY = 500;
 const MAX_STORED_SESSIONS = 100;
 const MAX_TARGET_LANGUAGES = 3;
-const SENTENCE_DEBOUNCE_MS = 950;
-const SHORT_PAUSE_DEBOUNCE_MS = 700;
-const SILENCE_DEBOUNCE_MS = 1300;
+const SENTENCE_DEBOUNCE_MS = 380;
+const SHORT_PAUSE_DEBOUNCE_MS = 220;
+const SILENCE_DEBOUNCE_MS = 650;
 const LOCAL_LANGUAGE_CONFIDENCE_THRESHOLD = 0.7;
 const TRANSLATION_LANE_FAST_LOCAL = "fastLocal";
 const TRANSLATION_LANE_PROVIDER = "provider";
-const SUPPORTED_LANGUAGE_CODES = new Set(["en", "fr", "es", "de", "it", "pt", "nl", "ar", "zh", "ja", "ko", "hi", "tr", "pl", "ru", "sw"]);
-const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
-const FAST_LOCAL_LANGUAGE_CODES = new Set(["sw"]);
+const LOCAL_BRIDGE_LANGUAGE_CODES = new Set(["rw", "rn", "lg"]);
+const FAST_LOCAL_LANGUAGE_CODES = new Set(["sw", "rw", "rn", "lg"]);
 const FAST_LOCAL_MAX_ACTIVE_TRANSLATIONS = 8;
 const PROVIDER_MAX_ACTIVE_TRANSLATIONS = 6;
 const MAX_TRANSLATION_LANE_QUEUE_SIZE = 24;
@@ -64,6 +67,9 @@ const MAX_TRANSLATION_CACHE_ENTRIES = 1200;
 const FAST_LOCAL_TRANSLATION_CACHE_TTL_MS = 25 * 60 * 1000;
 const PROVIDER_TRANSLATION_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const PARTIAL_TRANSLATION_PREVIEW_THROTTLE_MS = 140;
+const PROVIDER_STREAMING_PREVIEW_THROTTLE_MS = 650;
+const PROVIDER_STREAMING_PREVIEW_MIN_WORDS = 2;
+const PROVIDER_STREAMING_PREVIEW_MIN_CHARS = 6;
 const ADMIN_STATS_EMIT_MS = 10000;
 const PROVIDER_TIMEOUT_MS = {
   gemini: 25000,
@@ -240,26 +246,15 @@ const normalizeInterpreterLanguageCode = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
   if (!normalized) return "";
   if (normalized === "auto") return "auto";
-  if (normalized === "ug" || normalized === "lg" || normalized === "lg-ug" || normalized === "lug" || normalized === "luganda") return "luganda";
-  if (normalized.startsWith("rw")) return "rw";
-  if (normalized.startsWith("rn")) return "rn";
-  if (normalized.startsWith("sw")) return "sw";
-  if (normalized.startsWith("en")) return "en";
-  if (normalized.startsWith("zh")) return "zh";
-  if (normalized.startsWith("es")) return "es";
-  return normalized.split("-")[0] || normalized;
+  return normalizeSharedLanguageCode(normalized) || normalized.split("-")[0] || normalized;
 };
 
-const isForbiddenLanguageCode = (language = "") => {
-  const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
-  const code = normalizeInterpreterLanguageCode(normalized);
-  return FORBIDDEN_LANGUAGE_CODES.has(normalized) || FORBIDDEN_LANGUAGE_CODES.has(code);
-};
+const isLocalBridgeLanguageCode = (language = "") => LOCAL_BRIDGE_LANGUAGE_CODES.has(normalizeInterpreterLanguageCode(language));
 
 const sourceLanguageForProvider = (language = "") => {
   const code = normalizeInterpreterLanguageCode(language);
   if (!code || code === "auto") return "auto";
-  if (isForbiddenLanguageCode(code) || !SUPPORTED_LANGUAGE_CODES.has(code)) return "auto";
+  if (!SUPPORTED_LANGUAGE_CODES.has(code)) return "auto";
   return code;
 };
 
@@ -273,7 +268,7 @@ const isFastLocalLaneLanguage = ({ sourceLang = "", targetLang = "" } = {}) => {
   const target = normalizeInterpreterLanguageCode(targetLang);
 
   if (FAST_LOCAL_LANGUAGE_CODES.has(target)) return true;
-  if (target === "en" && isForbiddenLanguageCode(source)) return true;
+  if (target === "en" && isLocalBridgeLanguageCode(source)) return true;
   if (target === "en" && FAST_LOCAL_LANGUAGE_CODES.has(source)) return true;
   return source === "en" && target === "en";
 };
@@ -633,7 +628,6 @@ const isTargetLanguageText = ({ text = "", targetLang = "" } = {}) => {
 
 export const isTranslationDisplayable = ({ text = "", sourceText = "", sourceLang = "", targetLang = "", provider = "" } = {}) => {
   const cleanText = cleanTranscriptText(text);
-  if (isForbiddenLanguageCode(targetLang)) return false;
   if (!cleanText || isProviderFailureText(cleanText)) return false;
   if (isSourceTaggedFallbackText(cleanText)) return false;
   if (provider === "failed" || provider === "source") return false;
@@ -934,6 +928,9 @@ export const createInterpreterSession = async ({
   let translationEmitSequence = 0;
   let lastStreamingPreviewAt = 0;
   let lastStreamingPreviewSignature = "";
+  let lastProviderStreamingPreviewAt = 0;
+  let lastProviderStreamingPreviewSignature = "";
+  let providerStreamingPreviewSequence = 0;
   let lastAdminStatsAt = 0;
   const sessionId = createSessionId();
   const providerHealth = {
@@ -1381,6 +1378,14 @@ export const createInterpreterSession = async ({
     const unregisterAbortController = trackProviderAbortController(jobId, abortController);
     sessionTranslationQueue.currentAbortController = abortController;
     try {
+      logTranslationEvent("TRANSLATION_REQUEST", {
+        sessionId,
+        jobId,
+        provider,
+        sourceLang: direction.source,
+        targetLang: language,
+        chars: translationInput.length
+      });
       const translatedText = await withTimeout(
         providerRunner(provider)({
           apiKey: provider === "gemini" ? env.geminiApiKey : env.openaiApiKey,
@@ -1423,6 +1428,14 @@ export const createInterpreterSession = async ({
         })
       ) {
         trackUsage(provider, 150);
+        logTranslationEvent("TRANSLATION_COMPLETE", {
+          sessionId,
+          jobId,
+          provider,
+          targetLang: language,
+          latencyMs: responseTimeMs,
+          chars: safeTranslatedText.length
+        });
         return {
           provider,
           translatedText: safeTranslatedText,
@@ -1491,6 +1504,14 @@ export const createInterpreterSession = async ({
     const providerOrder = [
       ...getHealthyProviders()
     ];
+    logTranslationEvent("PROVIDER_SELECTION", {
+      sessionId,
+      jobId,
+      targetLang: language,
+      provider: providerOrder.join(",") || "none",
+      preferredProvider,
+      userPlan
+    });
 
     if (providerOrder.length === 0) {
       logTranslationEvent("TRANSLATION_FAILED", {
@@ -1789,12 +1810,109 @@ export const createInterpreterSession = async ({
     emitTranslationStatusUpdate(job, language, "failed", provider);
   };
 
+  const emitStreamingProviderPreviewForLanguage = ({ previewId, cleanSentence, translationInput, direction, detectedLanguage, language }) => {
+    const providers = getHealthyProviders();
+    if (providers.length === 0) return;
+
+    const languageTranslationContext = languageTranslationContextFor(
+      language,
+      buildTranslationContext({ sentence: cleanSentence, direction, detectedLanguage })
+    );
+
+    logTranslationEvent("STREAMING_PREVIEW_REQUEST", {
+      sessionId,
+      previewId,
+      sourceLang: direction.source,
+      targetLang: language,
+      provider: providers.join(","),
+      chars: translationInput.length,
+      text: cleanSentence
+    });
+
+    void (async () => {
+      for (const provider of providers) {
+        const result = await runProviderTranslationAttempt({
+          provider,
+          language,
+          translationInput,
+          direction,
+          languageTranslationContext,
+          jobId: `preview-${previewId}-${language}`
+        });
+
+        if (previewId !== providerStreamingPreviewSequence || result?.stale) return;
+
+        const safeTranslatedText = cleanTranscriptText(result?.translatedText || "");
+        if (
+          safeTranslatedText &&
+          isTranslationDisplayable({
+            text: safeTranslatedText,
+            sourceText: translationInput,
+            sourceLang: direction.source,
+            targetLang: language,
+            provider: result.provider
+          })
+        ) {
+          noteProviderSuccess(result.provider);
+          noteTranslationSuccess(language, safeTranslatedText, languageTranslationContext);
+          rememberCachedTranslation(
+            translationCache,
+            translationCacheKey({ source: direction.source, target: language, text: translationInput }),
+            safeTranslatedText,
+            {
+              source: direction.source,
+              target: language,
+              sourceText: translationInput,
+              provider: result.provider
+            }
+          );
+
+          onResult?.({
+            original: cleanSentence,
+            originalText: cleanSentence,
+            ...createTranslationPayloadMetadata(),
+            translatedText: safeTranslatedText,
+            translations: { [language]: safeTranslatedText },
+            translationOutputs: translationOutputsForTranslations(direction, { [language]: safeTranslatedText }),
+            translationStatus: { [language]: "translated" },
+            failedLanguages: [],
+            lang: language,
+            status: "translated",
+            isFinal: true,
+            isTranslationPartial: true,
+            isStreamingPreview: true,
+            translationComplete: false,
+            sourceLang: direction.source,
+            targetLang: direction.target,
+            targetLanguages: direction.targets,
+            detectedLanguage,
+            latencyMs: result.responseTimeMs || 0,
+            provider: result.provider || provider,
+            mode: "production"
+          });
+          return;
+        }
+
+        if (result?.error && isProviderNonRetryableFailure(result.error)) {
+          noteProviderFailure(provider, result.error);
+          break;
+        }
+      }
+
+      logTranslationEvent("STREAMING_PREVIEW_SKIPPED", {
+        sessionId,
+        previewId,
+        targetLang: language,
+        reason: "no_displayable_preview"
+      }, "warn");
+    })();
+  };
+
   const emitStreamingTranslationPreview = ({ sentence = "", direction, detectedLanguage }) => {
     if (!shouldTranslate || !direction?.targets?.length) return;
 
     const cleanSentence = cleanTranscriptText(sentence);
     if (!cleanSentence || !hasMeaningfulTranslationText(cleanSentence)) return;
-    if (wordCount(cleanSentence) <= 1 && !sentenceEnds(cleanSentence)) return;
 
     const now = Date.now();
     if (now - lastStreamingPreviewAt < PARTIAL_TRANSLATION_PREVIEW_THROTTLE_MS) return;
@@ -1831,33 +1949,84 @@ export const createInterpreterSession = async ({
     }
 
     const translatedText = translations[direction.target] || Object.values(translations).find(Boolean) || "";
-    if (!translatedText) return;
-
     const signature = `${normalizeTranscript(cleanSentence)}|${JSON.stringify(translations)}`;
-    if (signature === lastStreamingPreviewSignature) return;
+    if (translatedText && signature !== lastStreamingPreviewSignature) {
+      lastStreamingPreviewAt = now;
+      lastStreamingPreviewSignature = signature;
 
-    lastStreamingPreviewAt = now;
-    lastStreamingPreviewSignature = signature;
+      onResult?.({
+        original: cleanSentence,
+        originalText: cleanSentence,
+        ...createTranslationPayloadMetadata(),
+        translatedText,
+        translations,
+        translationOutputs: translationOutputsForTranslations(direction, translations),
+        isFinal: true,
+        isTranslationPartial: true,
+        isStreamingPreview: true,
+        translationComplete: false,
+        sourceLang: direction.source,
+        targetLang: direction.target,
+        targetLanguages: direction.targets,
+        detectedLanguage,
+        latencyMs: 0,
+        provider: "stream",
+        mode: "production"
+      });
+    }
 
-    onResult?.({
-      original: cleanSentence,
-      originalText: cleanSentence,
-      ...createTranslationPayloadMetadata(),
-      translatedText,
-      translations,
-      translationOutputs: translationOutputsForTranslations(direction, translations),
-      isFinal: true,
-      isTranslationPartial: true,
-      isStreamingPreview: true,
-      translationComplete: false,
-      sourceLang: direction.source,
-      targetLang: direction.target,
-      targetLanguages: direction.targets,
-      detectedLanguage,
-      latencyMs: 0,
-      provider: "stream",
-      mode: "production"
-    });
+    const missingLanguages = direction.targets
+      .slice(0, MAX_TARGET_LANGUAGES)
+      .filter((language) => !translations[language]);
+    const providerPreviewReady =
+      missingLanguages.length > 0 &&
+      cleanSentence.length >= PROVIDER_STREAMING_PREVIEW_MIN_CHARS &&
+      wordCount(cleanSentence) >= PROVIDER_STREAMING_PREVIEW_MIN_WORDS;
+    const providerSignature = `${normalizeTranscript(cleanSentence)}|${missingLanguages.join(",")}`;
+
+    if (
+      providerPreviewReady &&
+      providerSignature !== lastProviderStreamingPreviewSignature &&
+      now - lastProviderStreamingPreviewAt >= PROVIDER_STREAMING_PREVIEW_THROTTLE_MS
+    ) {
+      lastProviderStreamingPreviewAt = now;
+      lastProviderStreamingPreviewSignature = providerSignature;
+      providerStreamingPreviewSequence += 1;
+      const previewId = providerStreamingPreviewSequence;
+
+      onResult?.({
+        original: cleanSentence,
+        originalText: cleanSentence,
+        ...createTranslationPayloadMetadata(),
+        translatedText: "",
+        translations: {},
+        translationOutputs: [],
+        translationStatus: Object.fromEntries(missingLanguages.map((language) => [language, "processing"])),
+        failedLanguages: [],
+        isFinal: true,
+        isTranslationPartial: true,
+        isStreamingPreview: true,
+        translationComplete: false,
+        sourceLang: direction.source,
+        targetLang: direction.target,
+        targetLanguages: direction.targets,
+        detectedLanguage,
+        latencyMs: 0,
+        provider: "stream",
+        mode: "production"
+      });
+
+      for (const language of missingLanguages) {
+        emitStreamingProviderPreviewForLanguage({
+          previewId,
+          cleanSentence,
+          translationInput,
+          direction,
+          detectedLanguage,
+          language
+        });
+      }
+    }
   };
 
   const rememberTranscriptEntry = (job, translatedText) => {
@@ -2347,14 +2516,16 @@ export const createInterpreterSession = async ({
   const processSequentialTranslationJob = async (job) => {
     const targetLanguages = job.direction.targets.slice(0, MAX_TARGET_LANGUAGES);
 
-    for (const language of targetLanguages) {
-      if (job.stale || job.completed || staleTranslationJobs.has(job.id)) break;
-      if (job.translations?.[language] || job.completedLanguages?.has?.(language)) continue;
+    const processLanguage = async (language) => {
+      if (job.stale || job.completed || staleTranslationJobs.has(job.id)) return;
+      if (job.translations?.[language] || job.completedLanguages?.has?.(language)) return;
 
       job.pendingLanguages.delete(language);
       job.runningLanguages.add(language);
-      job.activeLanguage = language;
-      job.activeLanguageStartedAt = Date.now();
+      if (!job.activeLanguage) {
+        job.activeLanguage = language;
+        job.activeLanguageStartedAt = Date.now();
+      }
       activeTranslationLanguageLocks.add(language);
       setTranslationLanguageStatus(job, language, "processing");
       logTranslationEvent("LANGUAGE_START", {
@@ -2366,13 +2537,11 @@ export const createInterpreterSession = async ({
         jobId: job.id
       });
 
-      const languageStartedAt = job.activeLanguageStartedAt;
+      const languageStartedAt = Date.now();
       let result = null;
-      let releaseLanguageLock = null;
 
       try {
-        releaseLanguageLock = await translationMutex.acquire(sessionId);
-        const englishBridgeText = isForbiddenLanguageCode(job.direction.source)
+        const englishBridgeText = isLocalBridgeLanguageCode(job.direction.source)
           ? cleanTranscriptText(resolveLocalTranslation({
             text: job.translationInput,
             sourceLang: job.direction.source,
@@ -2396,7 +2565,7 @@ export const createInterpreterSession = async ({
           jobId: job.id
         });
 
-        if (job.stale || staleTranslationJobs.has(job.id)) break;
+        if (job.stale || staleTranslationJobs.has(job.id)) return;
         result = result?.text ? result : localResult?.text ? localResult : null;
 
         if (!result?.text && localResult?.needsProviderFallback !== false) {
@@ -2409,7 +2578,7 @@ export const createInterpreterSession = async ({
           });
         }
 
-        if (job.stale || staleTranslationJobs.has(job.id) || result?.stale) break;
+        if (job.stale || staleTranslationJobs.has(job.id) || result?.stale) return;
 
         const provider = result?.provider || "unknown";
         const translatedText = cleanTranscriptText(result?.text || "");
@@ -2461,7 +2630,6 @@ export const createInterpreterSession = async ({
           });
         }
       } finally {
-        releaseLanguageLock?.();
         activeTranslationLanguageLocks.delete(language);
         job.runningLanguages.delete(language);
         if (job.activeLanguage === language) {
@@ -2474,7 +2642,9 @@ export const createInterpreterSession = async ({
           durationMs: Date.now() - languageStartedAt
         });
       }
-    }
+    };
+
+    await Promise.allSettled(targetLanguages.map((language) => processLanguage(language)));
 
     finalizeTranslationJobIfReady(job);
   };
@@ -2495,7 +2665,7 @@ export const createInterpreterSession = async ({
           sequence: job.sequence,
           language: job.direction.targets.join(","),
           provider: "queue",
-          latency: 0,
+          latency: Date.now() - (job.createdAt || Date.now()),
           jobId: job.id
         });
 
@@ -2756,11 +2926,6 @@ export const createInterpreterSession = async ({
       if (!isFinal) {
         const previewText = appendSentenceChunk(currentSentence, displayText);
         const previewNormalized = normalizeTranscript(previewText);
-        const tinyPreviewFragment = wordCount(previewText) <= 1 && !sentenceEnds(previewText);
-
-        if (tinyPreviewFragment) {
-          return;
-        }
 
         if (previewNormalized === lastInterimTranscript || normalized === lastFinalTranscript) {
           return;

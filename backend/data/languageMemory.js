@@ -1,24 +1,8 @@
+import { LANGUAGE_NAMES as SHARED_LANGUAGE_NAMES } from "../../shared/languages.mjs";
+
 export const LANGUAGE_NAMES = {
-  en: "English",
-  es: "Spanish",
-  fr: "French",
-  de: "German",
-  it: "Italian",
-  pt: "Portuguese",
-  nl: "Dutch",
-  ar: "Arabic",
-  zh: "Chinese",
-  ja: "Japanese",
-  ko: "Korean",
-  hi: "Hindi",
-  tr: "Turkish",
-  pl: "Polish",
-  ru: "Russian",
-  rw: "Kinyarwanda",
-  rn: "Kirundi",
-  sw: "Swahili",
-  luganda: "Luganda",
-  lg: "Luganda"
+  ...SHARED_LANGUAGE_NAMES,
+  luganda: "Luganda"
 };
 
 export const LOCAL_PHRASES = {
@@ -81,6 +65,7 @@ export const LOCAL_TRANSLATIONS = {
   es: {
     en: {
       hello: "hola",
+      "hello everyone": "hola a todos",
       "how are you": "como estas?",
       "good morning": "buenos dias",
       "good evening": "buenas noches",
@@ -100,6 +85,7 @@ export const LOCAL_TRANSLATIONS = {
   fr: {
     en: {
       hello: "bonjour",
+      "hello everyone": "bonjour a tous",
       "how are you": "comment allez-vous?",
       "good morning": "bonjour",
       "good evening": "bonsoir",
@@ -119,6 +105,7 @@ export const LOCAL_TRANSLATIONS = {
   de: {
     en: {
       hello: "hallo",
+      "hello everyone": "hallo zusammen",
       "how are you": "wie geht es dir?",
       "good morning": "guten morgen",
       "good evening": "guten abend",
@@ -138,6 +125,7 @@ export const LOCAL_TRANSLATIONS = {
   zh: {
     en: {
       hello: "你好",
+      "hello everyone": "大家好",
       "how are you": "你好吗?",
       "good morning": "早上好",
       "good evening": "晚上好",
@@ -157,6 +145,7 @@ export const LOCAL_TRANSLATIONS = {
   ja: {
     en: {
       hello: "こんにちは",
+      "hello everyone": "みなさん、こんにちは",
       "how are you": "お元気ですか?",
       "good morning": "おはようございます",
       "good evening": "こんばんは",
@@ -242,6 +231,7 @@ export const LOCAL_TRANSLATIONS = {
     en: {
       "how are you": "amakuru?",
       hello: "muraho",
+      "hello everyone": "muraho mwese",
       "good morning": "mwaramutse",
       "good evening": "mwiriwe",
       "thank you": "murakoze",
@@ -260,6 +250,7 @@ export const LOCAL_TRANSLATIONS = {
     en: {
       "how are you": "amakuru meza?",
       hello: "amahoro",
+      "hello everyone": "amahoro mwese",
       "good morning": "mwaramutse",
       "thank you": "urakoze cane",
       "thank you very much": "urakoze cane",
@@ -297,6 +288,7 @@ export const LOCAL_TRANSLATIONS = {
       madam: "nyabo",
       friend: "mukwano",
       please: "banange",
+      "hello everyone": "mwasuze mutya mwenna",
       "can you please give me your book": "osobola okumpa ekitabo kyo",
       "well done": "gyebale"
     }

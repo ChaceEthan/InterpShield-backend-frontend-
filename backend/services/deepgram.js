@@ -1,10 +1,11 @@
 // @ts-nocheck
 import { DeepgramClient } from "@deepgram/sdk";
+import { normalizeLanguageCode } from "../../shared/languages.mjs";
 
 const createClient = (apiKey) => new DeepgramClient({ apiKey });
 const DEEPGRAM_LANGUAGE_ALIASES = {
-  luganda: "multi",
   lg: "multi",
+  luganda: "multi",
   ug: "multi",
   rw: "multi",
   rn: "multi",
@@ -12,11 +13,9 @@ const DEEPGRAM_LANGUAGE_ALIASES = {
 };
 
 const normalizeDeepgramLanguage = (sourceLang = "") => {
-  const normalized = String(sourceLang || "").trim().toLowerCase().replace("_", "-");
+  const normalized = normalizeLanguageCode(sourceLang) || String(sourceLang || "").trim().toLowerCase().replace("_", "-");
   if (!normalized || normalized === "auto") return { language: "multi" };
   if (DEEPGRAM_LANGUAGE_ALIASES[normalized]) return { language: DEEPGRAM_LANGUAGE_ALIASES[normalized] };
-  if (normalized.startsWith("rw") || normalized.startsWith("rn") || normalized.startsWith("sw")) return { language: "multi" };
-  if (normalized === "lg-ug" || normalized === "lug") return { language: "multi" };
   return { language: normalized };
 };
 

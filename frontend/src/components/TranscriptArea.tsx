@@ -30,7 +30,9 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
-      endRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+      const container = scrollRef.current;
+      if (!container) return;
+      container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
     });
 
     return () => window.cancelAnimationFrame(frame);
@@ -39,7 +41,7 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
   return (
     <div
       ref={scrollRef}
-      className="mx-auto flex max-h-[360px] min-h-[220px] w-full max-w-4xl scroll-smooth flex-col gap-4 overflow-y-auto overscroll-contain px-1 py-2 pr-2 [scrollbar-gutter:stable] sm:max-h-[390px]"
+      className="mx-auto flex max-h-[360px] min-h-[220px] w-full max-w-4xl scroll-smooth flex-col gap-4 overflow-y-auto overscroll-contain px-1 pb-5 pt-2 pr-2 [scrollbar-gutter:stable] sm:max-h-[390px]"
     >
       <AnimatePresence mode="popLayout">
         {visibleOriginal ? (

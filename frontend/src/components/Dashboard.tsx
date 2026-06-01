@@ -5,6 +5,7 @@ import { Navbar } from "./Navbar";
 import { ToolTabs, type ToolType } from "./ToolTabs";
 import { TranslationOptions } from "./TranslationOptions";
 import { TranslationPanel } from "./TranslationPanel";
+import { LANGUAGE_CATALOG } from "../../../shared/languages.mjs";
 
 interface DashboardProps {
   user?: { name: string; email: string; plan: string } | null;
@@ -33,18 +34,7 @@ interface DashboardProps {
   onLogout?: () => void;
 }
 
-const DASHBOARD_LANGUAGES = [
-  { code: "en", name: "English" },
-  { code: "es", name: "Spanish" },
-  { code: "fr", name: "French" },
-  { code: "de", name: "German" },
-  { code: "it", name: "Italian" },
-  { code: "pt", name: "Portuguese" },
-  { code: "zh", name: "Chinese" },
-  { code: "ja", name: "Japanese" },
-  { code: "ko", name: "Korean" },
-  { code: "ru", name: "Russian" }
-];
+const DASHBOARD_LANGUAGES = LANGUAGE_CATALOG.map(({ code, name }) => ({ code, name }));
 
 export function Dashboard({
   user,

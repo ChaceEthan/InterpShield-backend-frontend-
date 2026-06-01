@@ -43,7 +43,9 @@ export const LiveTranscriptPanel: React.FC<LiveTranscriptPanelProps> = ({
 
   React.useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
-      endRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+      const container = scrollRef.current;
+      if (!container) return;
+      container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
     });
 
     return () => window.cancelAnimationFrame(frame);
@@ -73,7 +75,7 @@ export const LiveTranscriptPanel: React.FC<LiveTranscriptPanelProps> = ({
       </div>
 
       {/* Transcript list */}
-      <div ref={scrollRef} className="max-h-[400px] scroll-smooth space-y-0 overflow-y-auto overscroll-contain pr-1 [scrollbar-gutter:stable]">
+      <div ref={scrollRef} className="max-h-[400px] scroll-smooth space-y-0 overflow-y-auto overscroll-contain pb-4 pr-1 [scrollbar-gutter:stable]">
         <AnimatePresence mode="popLayout">
           {displayEntries.map((entry, index) => (
             <motion.button

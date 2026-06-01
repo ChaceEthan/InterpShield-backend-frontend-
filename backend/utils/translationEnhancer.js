@@ -8,12 +8,11 @@ import {
   REGION_VARIANTS,
   ROBOTIC_PHRASES
 } from "../data/languageMemory.js";
-
-const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
+import { normalizeLanguageCode as normalizeSharedLanguageCode } from "../../shared/languages.mjs";
 
 const toLanguageList = (languages, fallback = "") => {
   const requested = Array.isArray(languages) ? languages : languages ? [languages] : [fallback];
-  return requested.map((language) => String(language || "").trim().toLowerCase()).filter(Boolean);
+  return requested.map((language) => normalizeLanguageCode(language) || String(language || "").trim().toLowerCase()).filter(Boolean);
 };
 
 const normalizeProfileText = (text = "") =>
@@ -30,19 +29,10 @@ const countMarkerMatches = (normalizedText, markers = []) =>
 const normalizeLanguageCode = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
   if (!normalized) return "";
-  if (normalized === "ug" || normalized === "lg" || normalized === "lg-ug" || normalized === "lug" || normalized === "luganda") return "luganda";
-  if (normalized.startsWith("rw")) return "rw";
-  if (normalized.startsWith("rn")) return "rn";
-  if (normalized.startsWith("sw")) return "sw";
-  if (normalized.startsWith("en")) return "en";
-  return normalized.split("-")[0] || normalized;
+  return normalizeSharedLanguageCode(normalized) || normalized.split("-")[0] || normalized;
 };
 
-const isForbiddenLanguageCode = (language = "") => {
-  const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
-  const code = normalizeLanguageCode(normalized);
-  return FORBIDDEN_LANGUAGE_CODES.has(normalized) || FORBIDDEN_LANGUAGE_CODES.has(code);
-};
+const localLanguageKey = (language = "") => (normalizeLanguageCode(language) === "lg" ? "luganda" : normalizeLanguageCode(language));
 
 const escapeRegExp = (value = "") => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -88,11 +78,13 @@ const exactPhraseCorrection = (text = "", phrases = {}) => {
 const resolveExactLocalTranslation = ({ text = "", sourceLang = "", targetLang = "" } = {}) => {
   const source = normalizeLanguageCode(sourceLang);
   const target = normalizeLanguageCode(targetLang);
+  const sourceKey = localLanguageKey(source);
+  const targetKey = localLanguageKey(target);
   const cleanText = normalizePunctuation(text).replace(/[.!?]+$/g, "").trim();
 
   if (!source || !target || source === target || !cleanText) return "";
 
-  const directPhrases = LOCAL_TRANSLATIONS[target]?.[source] || {};
+  const directPhrases = LOCAL_TRANSLATIONS[targetKey]?.[sourceKey] || {};
   const directTranslation = exactPhraseCorrection(cleanText, directPhrases);
   if (directTranslation) return directTranslation;
 
@@ -306,23 +298,28 @@ export const detectRegionAccent = ({ text = "", sourceLang, targetLang, targetLa
 export const resolveLocalTranslation = ({ text = "", sourceLang = "", targetLang = "" } = {}) => {
   const language = normalizeLanguageCode(targetLang);
   const source = normalizeLanguageCode(sourceLang);
+  const languageKey = localLanguageKey(language);
+  const sourceKey = localLanguageKey(source);
   const cleanText = normalizePunctuation(text).replace(/[.!?]+$/g, "").trim();
 
   if (!cleanText) return "";
-  if (isForbiddenLanguageCode(language)) return "";
 
   const exactTranslation = resolveExactLocalTranslation({ text: cleanText, sourceLang: source, targetLang: language });
   if (exactTranslation) return exactTranslation;
+
+  if (languageKey === "rw" || languageKey === "rn" || languageKey === "luganda") {
+    return exactPhraseCorrection(cleanText, LOCAL_TRANSLATIONS[languageKey]?.[sourceKey] || {}) || "";
+  }
 
   if (language === "sw") {
     return exactPhraseCorrection(cleanText, LOCAL_PHRASES.sw) || "";
   }
 
   if (language === "en") {
-    if (source === "luganda") return exactPhraseCorrection(cleanText, LOCAL_TRANSLATIONS.en.luganda) || "";
-    if (source === "rw") return exactPhraseCorrection(cleanText, LOCAL_TRANSLATIONS.en.rw) || "";
-    if (source === "rn") return exactPhraseCorrection(cleanText, LOCAL_TRANSLATIONS.en.rn) || "";
-    if (source === "sw") return exactPhraseCorrection(cleanText, LOCAL_TRANSLATIONS.en.sw) || "";
+    if (sourceKey === "luganda") return exactPhraseCorrection(cleanText, LOCAL_TRANSLATIONS.en.luganda) || "";
+    if (sourceKey === "rw") return exactPhraseCorrection(cleanText, LOCAL_TRANSLATIONS.en.rw) || "";
+    if (sourceKey === "rn") return exactPhraseCorrection(cleanText, LOCAL_TRANSLATIONS.en.rn) || "";
+    if (sourceKey === "sw") return exactPhraseCorrection(cleanText, LOCAL_TRANSLATIONS.en.sw) || "";
     return exactPhraseCorrection(cleanText, LOCAL_PHRASES.ugandaMix) || "";
   }
 

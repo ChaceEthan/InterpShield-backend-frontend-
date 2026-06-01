@@ -35,6 +35,13 @@ import { ToolTabs } from "./components/ToolTabs";
 import { TranslationOptions } from "./components/TranslationOptions";
 import { TranslationPanel } from "./components/TranslationPanel";
 import type { TranscriptTranslationEntry } from "./components/TranscriptArea";
+import {
+  LANGUAGE_CATALOG,
+  LANGUAGE_FLAGS,
+  SPEECH_SYNTHESIS_LANGS,
+  SUPPORTED_LANGUAGE_CODES,
+  normalizeLanguageCode as normalizeSharedLanguageCode
+} from "../../shared/languages.mjs";
 
 type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
@@ -215,7 +222,7 @@ const LIVE_TEXT_WINDOW_CHARS = 900;
 const LIVE_SEGMENT_WINDOW = 6;
 const MAX_LIVE_SEGMENTS = 18;
 const VISIBLE_HISTORY_ITEMS = 40;
-const PARTIAL_SUBTITLE_THROTTLE_MS = 120;
+const PARTIAL_SUBTITLE_THROTTLE_MS = 60;
 const HISTORY_PERSIST_DEBOUNCE_MS = 250;
 const MAX_DUBBING_QUEUE_ITEMS = 6;
 const MAX_SPOKEN_DUBBING_KEYS = 180;
@@ -227,8 +234,6 @@ const CLIENT_HEARTBEAT_MS = 25000;
 const DUBBING_QUEUE_SETTLE_MS = 180;
 const STALE_TRANSLATION_STATE_MS = 45000;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
-const SUPPORTED_LANGUAGE_CODES = new Set(["en", "fr", "es", "de", "it", "pt", "nl", "ar", "zh", "ja", "ko", "hi", "tr", "pl", "ru", "sw"]);
-const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
 const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
@@ -295,68 +300,13 @@ const initializeGoogleIdentityOnce = ({
   googleIdentityInitializedClientId = GOOGLE_CLIENT_ID;
 };
 
-const LANGUAGES: Language[] = [
-  { code: "en", name: "English", region: "United States" },
-  { code: "es", name: "Spanish", region: "Spain / LATAM" },
-  { code: "fr", name: "French", region: "France" },
-  { code: "de", name: "German", region: "Germany" },
-  { code: "it", name: "Italian", region: "Italy" },
-  { code: "pt", name: "Portuguese", region: "Brazil / Portugal" },
-  { code: "nl", name: "Dutch", region: "Netherlands" },
-  { code: "ar", name: "Arabic", region: "MENA" },
-  { code: "zh", name: "Chinese", region: "China" },
-  { code: "ja", name: "Japanese", region: "Japan" },
-  { code: "ko", name: "Korean", region: "Korea" },
-  { code: "hi", name: "Hindi", region: "India" },
-  { code: "tr", name: "Turkish", region: "Turkiye" },
-  { code: "pl", name: "Polish", region: "Poland" },
-  { code: "ru", name: "Russian", region: "Global" },
-  { code: "sw", name: "Swahili", region: "East Africa" }
-];
+const LANGUAGES: Language[] = LANGUAGE_CATALOG.map(({ code, name, region }) => ({ code, name, region }));
 
 const TOOL_ITEMS: Array<{ mode: Mode; label: string; icon: LucideIcon }> = [
   { mode: "transcribe", label: "Transcribe", icon: FileText },
   { mode: "translate", label: "Translate", icon: Languages },
   { mode: "dubbing", label: "Dubbing", icon: Volume2 }
 ];
-
-const LANGUAGE_FLAGS: Record<string, string> = {
-  en: "🇺🇸",
-  es: "🇪🇸",
-  fr: "🇫🇷",
-  de: "🇩🇪",
-  it: "🇮🇹",
-  pt: "🇵🇹",
-  nl: "🇳🇱",
-  ar: "🇸🇦",
-  zh: "🇨🇳",
-  ja: "🇯🇵",
-  ko: "🇰🇷",
-  hi: "🇮🇳",
-  tr: "🇹🇷",
-  pl: "🇵🇱",
-  ru: "🇷🇺",
-  sw: "SW",
-};
-
-const SPEECH_SYNTHESIS_LANGS: Record<string, string> = {
-  en: "en-US",
-  es: "es-ES",
-  fr: "fr-FR",
-  de: "de-DE",
-  it: "it-IT",
-  pt: "pt-PT",
-  nl: "nl-NL",
-  ar: "ar-SA",
-  zh: "zh-CN",
-  ja: "ja-JP",
-  ko: "ko-KR",
-  hi: "hi-IN",
-  tr: "tr-TR",
-  pl: "pl-PL",
-  ru: "ru-RU",
-  sw: "sw-KE",
-};
 
 const PRICING_PLANS = [
   {
@@ -401,11 +351,7 @@ const normalizeTargetLanguages = (languages?: unknown, fallback = DEFAULT_TARGET
 const normalizeLanguageCode = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
   if (!normalized || normalized === "auto") return normalized;
-  if (FORBIDDEN_LANGUAGE_CODES.has(normalized) || normalized.startsWith("rw") || normalized.startsWith("rn")) return "en";
-  if (normalized.startsWith("sw")) return "sw";
-  if (normalized.startsWith("zh")) return "zh";
-  const baseCode = normalized.split("-")[0] || normalized;
-  return SUPPORTED_LANGUAGE_CODES.has(baseCode) ? baseCode : "en";
+  return normalizeSharedLanguageCode(normalized) || "en";
 };
 
 const normalizeComparableText = (text = "") =>
@@ -761,7 +707,10 @@ const formatTime = (seconds: number) => {
   return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
 };
 
-const languageName = (code: string) => LANGUAGES.find((language) => language.code === code)?.name || code;
+const languageName = (code: string) => {
+  const normalized = normalizeLanguageCode(code);
+  return LANGUAGES.find((language) => language.code === normalized)?.name || code;
+};
 
 const formatHistoryTimestamp = (timestamp: string) => {
   const date = new Date(timestamp);
@@ -1314,6 +1263,7 @@ export default function App() {
   const lastSubtitleUpdateAtRef = useRef(0);
   const pendingPartialTranscriptRef = useRef<PartialTranscriptPayload | null>(null);
   const historyPersistTimerRef = useRef<number | null>(null);
+  const conversationHistoryRef = useRef<HTMLDivElement | null>(null);
   const historyEndRef = useRef<HTMLDivElement | null>(null);
   const dubbingQueueRef = useRef<DubbingQueueItem[]>([]);
   const dubbingSpeakingRef = useRef(false);
@@ -1636,6 +1586,11 @@ export default function App() {
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
+      const container = conversationHistoryRef.current;
+      if (container) {
+        container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+        return;
+      }
       historyEndRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
     });
 
@@ -1708,12 +1663,7 @@ export default function App() {
     lastSubtitleUpdateAtRef.current = Date.now();
     if (pending.detectedLanguage) setDetectedLanguage(pending.detectedLanguage);
     setLiveText(pending.text);
-
-    if (interimTimerRef.current) window.clearTimeout(interimTimerRef.current);
-    interimTimerRef.current = window.setTimeout(() => {
-      setInterimOriginal(pending.text);
-      interimTimerRef.current = null;
-    }, 45);
+    setInterimOriginal(pending.text);
 
     setStatus("listening");
   }, []);
@@ -2013,7 +1963,7 @@ export default function App() {
       activeBackendTranslationJobIdRef.current = jobId || "";
       const transcriptSequence = Number(sequence);
       if (Number.isFinite(transcriptSequence)) {
-        latestTranslationSequenceRef.current = Math.max(latestTranslationSequenceRef.current, transcriptSequence);
+        latestTranslationSequenceRef.current = transcriptSequence;
       }
       updateTranslationStatuses(Object.fromEntries(pendingTargetLanguages.map((language) => [language, "queued"])));
       spokenDubbingKeysRef.current = compactSetToLimit(spokenDubbingKeysRef.current, MAX_SPOKEN_DUBBING_KEYS);
@@ -2043,9 +1993,11 @@ export default function App() {
       }
     });
 
-    const handleTranslationUpdate = ({ original, text, translations, statusByLanguage, failedLanguages, latencyMs, provider, sessionId, jobId, sequence, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete, lang, status }: { original?: string; text?: string; translations?: Record<string, string>; statusByLanguage?: Record<string, string>; failedLanguages?: string[]; latencyMs?: number; provider?: string; sessionId?: string; jobId?: string | number; sequence?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean; lang?: string; status?: string }) => {
+    const handleTranslationUpdate = ({ original, text, translations, statusByLanguage, failedLanguages, latencyMs, provider, sessionId, jobId, sequence, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete, streaming, lang, status }: { original?: string; text?: string; translations?: Record<string, string>; statusByLanguage?: Record<string, string>; failedLanguages?: string[]; latencyMs?: number; provider?: string; sessionId?: string; jobId?: string | number; sequence?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean; streaming?: boolean; lang?: string; status?: string }) => {
       const pendingTranscript = pendingFinalTranscriptRef.current;
       const updateOriginal = original?.trim() || "";
+      const previewJob = typeof jobId === "string" && jobId.startsWith("preview-");
+      const streamingPreview = Boolean(streaming || previewJob);
 
       if (sessionId && activeBackendSessionIdRef.current && sessionId !== activeBackendSessionIdRef.current) {
         return;
@@ -2055,17 +2007,17 @@ export default function App() {
       }
 
       const incomingSequence = Number(sequence);
-      if (Number.isFinite(incomingSequence) && incomingSequence < latestTranslationSequenceRef.current) {
+      if (!streamingPreview && Number.isFinite(incomingSequence) && incomingSequence < latestTranslationSequenceRef.current) {
         return;
       }
 
       if (pendingTranscript && updateOriginal && updateOriginal !== pendingTranscript.original) {
         return;
       }
-      if (!pendingTranscript && updateOriginal && lastFinalOriginalRef.current && updateOriginal !== lastFinalOriginalRef.current) {
+      if (!streamingPreview && !pendingTranscript && updateOriginal && lastFinalOriginalRef.current && updateOriginal !== lastFinalOriginalRef.current) {
         return;
       }
-      if (jobId && activeBackendTranslationJobIdRef.current && String(jobId) !== String(activeBackendTranslationJobIdRef.current)) {
+      if (!streamingPreview && jobId && activeBackendTranslationJobIdRef.current && String(jobId) !== String(activeBackendTranslationJobIdRef.current)) {
         return;
       }
 
@@ -2073,7 +2025,8 @@ export default function App() {
       const sourceText = updateOriginal || pendingTranscript?.original || lastFinalOriginalRef.current;
       const singleLanguage = lang || eventTargetLang || nextTargetLanguages[0];
       const nextTranslations = normalizeTranslationMap(translations, text || "", singleLanguage, { sourceText });
-      const mergedTranslations: Record<string, string> = { ...finalTranslationsRef.current };
+      const newStreamingPreviewSource = streamingPreview && updateOriginal && updateOriginal !== lastTranslationOriginalRef.current;
+      const mergedTranslations: Record<string, string> = newStreamingPreviewSource ? {} : { ...finalTranslationsRef.current };
 
       for (const [language, translatedText] of Object.entries(nextTranslations)) {
         if (isValidTranslationText({ text: translatedText, sourceText, targetLang: language })) {
@@ -2114,10 +2067,10 @@ export default function App() {
       if (!incomingTranslation && !hasStatusUpdate) return;
       if (hasStatusUpdate) {
         updateTranslationStatuses(nextStatusUpdates);
-        if (Number.isFinite(incomingSequence)) {
+        if (!streamingPreview && Number.isFinite(incomingSequence)) {
           latestTranslationSequenceRef.current = Math.max(latestTranslationSequenceRef.current, incomingSequence);
         }
-        if (jobId) activeBackendTranslationJobIdRef.current = jobId;
+        if (!streamingPreview && jobId) activeBackendTranslationJobIdRef.current = jobId;
       }
       if (!incomingTranslation || !mergedTranslation) return;
       if (!isComplete && mergedTranslationSignature === lastFinalTranslationRef.current && !hasStatusUpdate) return;
@@ -2132,10 +2085,10 @@ export default function App() {
           sequence: Number.isFinite(incomingSequence) ? incomingSequence : undefined
         });
       }
-      if (Number.isFinite(incomingSequence)) {
+      if (!streamingPreview && Number.isFinite(incomingSequence)) {
         latestTranslationSequenceRef.current = Math.max(latestTranslationSequenceRef.current, incomingSequence);
       }
-      if (jobId) activeBackendTranslationJobIdRef.current = jobId;
+      if (!streamingPreview && jobId) activeBackendTranslationJobIdRef.current = jobId;
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
       trackLatency(latencyMs, provider);
 
@@ -2960,7 +2913,7 @@ export default function App() {
             </button>
           </div>
 
-          <div className="max-h-72 scroll-smooth overflow-y-auto overscroll-contain pt-4 pr-1 [scrollbar-gutter:stable]">
+          <div ref={conversationHistoryRef} className="max-h-72 scroll-smooth overflow-y-auto overscroll-contain pb-3 pt-4 pr-1 [scrollbar-gutter:stable]">
             {history.length === 0 ? (
               <p className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-500">Final transcripts will appear here during the session.</p>
             ) : (

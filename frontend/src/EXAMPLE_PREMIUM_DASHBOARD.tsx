@@ -12,17 +12,13 @@ import { useAudioStream, getSupportedAudioMimeType } from './hooks/useAudioStrea
 import { GlassPanel, StatusBadge, AnimatedIcon } from './components/GlassUI';
 import { AnimatedMic, LiveIndicator, SessionTimer } from './components/AnimatedMic';
 import { LiveTranscriptPanel, LanguageSelector, ConnectionStatus } from './components/TranscriptPanel';
+import { LANGUAGE_CATALOG, LANGUAGE_FLAGS } from '../../shared/languages.mjs';
 
-const SUPPORTED_LANGUAGES = [
-  { code: 'en', name: 'English', flag: '🇺🇸' },
-  { code: 'es', name: 'Spanish', flag: '🇪🇸' },
-  { code: 'fr', name: 'French', flag: '🇫🇷' },
-  { code: 'de', name: 'German', flag: '🇩🇪' },
-  { code: 'it', name: 'Italian', flag: '🇮🇹' },
-  { code: 'pt', name: 'Portuguese', flag: '🇵🇹' },
-  { code: 'zh', name: 'Chinese', flag: '🇨🇳' },
-  { code: 'ja', name: 'Japanese', flag: '🇯🇵' },
-];
+const SUPPORTED_LANGUAGES = LANGUAGE_CATALOG.map(({ code, name }) => ({
+  code,
+  name,
+  flag: LANGUAGE_FLAGS[code]
+}));
 
 /**
  * Premium Dashboard Component with Real-time AI Interpretation

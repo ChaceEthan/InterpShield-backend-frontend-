@@ -6,10 +6,12 @@ import {
   removeCallRoomParticipant,
   upsertCallRoomParticipant
 } from "../services/audioPipeline.js";
+import {
+  SUPPORTED_LANGUAGE_CODES,
+  normalizeLanguageCode as normalizeSharedLanguageCode
+} from "../../shared/languages.mjs";
 
 const MAX_TARGET_LANGUAGES = 3;
-const SUPPORTED_LANGUAGE_CODES = new Set(["en", "fr", "es", "de", "it", "pt", "nl", "ar", "zh", "ja", "ko", "hi", "tr", "pl", "ru", "sw"]);
-const FORBIDDEN_LANGUAGE_CODES = new Set(["rw", "rn", "lg", "lug", "luganda", "ug", "lg-ug"]);
 const LOG_TEXT_PREVIEW_CHARS = 96;
 const callRooms = new Map();
 
@@ -32,11 +34,7 @@ const normalizeSocketLanguageCode = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
   if (!normalized) return "";
   if (normalized === "auto") return "auto";
-  if (FORBIDDEN_LANGUAGE_CODES.has(normalized) || normalized.startsWith("rw") || normalized.startsWith("rn")) return "en";
-  if (normalized.startsWith("sw")) return "sw";
-  if (normalized.startsWith("zh")) return "zh";
-  const code = normalized.split("-")[0] || normalized;
-  return SUPPORTED_LANGUAGE_CODES.has(code) ? code : "en";
+  return normalizeSharedLanguageCode(normalized) || "en";
 };
 
 const audioPayloadToBuffer = (audio) => {
