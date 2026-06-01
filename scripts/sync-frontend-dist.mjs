@@ -1,10 +1,9 @@
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { ensureProjectDirectories, getProjectPaths } from "../project-paths.js";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const frontendDist = path.join(repoRoot, "frontend", "dist");
-const rootDist = path.join(repoRoot, "dist");
+const projectPaths = ensureProjectDirectories(getProjectPaths());
+const frontendDist = projectPaths.frontendDist;
+const rootDist = projectPaths.rootDist;
 
 if (!fs.existsSync(frontendDist)) {
   throw new Error(`Expected frontend build output at ${frontendDist}`);

@@ -2,12 +2,15 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
+import { configureProjectRuntimePaths, getProjectPaths } from "../../project-paths.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const backendRoot = path.resolve(__dirname, "..");
 
 dotenv.config({ path: path.join(backendRoot, ".env"), quiet: true });
+const projectPaths = getProjectPaths();
+const runtimePathStatus = configureProjectRuntimePaths(projectPaths);
 
 const placeholderValues = new Set([
   "",
@@ -67,6 +70,8 @@ export const env = {
   openaiApiKey: readSecret(process.env.OPENAI_API_KEY),
   hasJwtSecret: Boolean(readSecret(process.env.JWT_SECRET)),
   jwtSecret: readSecret(process.env.JWT_SECRET),
+  paths: projectPaths,
+  runtimePathStatus,
   maxSessionSeconds: 3600,
   audioChunkMs: 700
 };
@@ -86,7 +91,8 @@ export const getPublicConfig = () => ({
   hasOpenAIKey: Boolean(env.openaiApiKey),
   mode: getMode(),
   maxSessionSeconds: env.maxSessionSeconds,
-  audioChunkMs: env.audioChunkMs
+  audioChunkMs: env.audioChunkMs,
+  runtimeRoot: projectPaths.root
 });
 
 export const warnAboutMissingConfig = () => {
@@ -108,6 +114,10 @@ export const warnAboutMissingConfig = () => {
 
   if (!env.hasJwtSecret) {
     console.warn("JWT_SECRET is missing. Auth tokens are disabled until JWT_SECRET is set.");
+  }
+
+  for (const warning of runtimePathStatus.warnings) {
+    console.warn(`Runtime path warning: ${warning}`);
   }
 
 };

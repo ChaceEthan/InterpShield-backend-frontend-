@@ -1636,7 +1636,7 @@ export default function App() {
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
-      historyEndRef.current?.scrollIntoView({ block: "end" });
+      historyEndRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
     });
 
     return () => window.cancelAnimationFrame(frame);
@@ -2023,6 +2023,9 @@ export default function App() {
       setFinalText((current) => appendTextWindow(current, originalText));
       setOriginalSegments((current) => [...current, originalText].slice(-MAX_LIVE_SEGMENTS));
       if (!keepStreamingTranslation) {
+        finalTranslationsRef.current = {};
+        lastFinalTranslationRef.current = "";
+        setFinalTranslations({});
         setTranslationStatuses(Object.fromEntries(pendingTargetLanguages.map((language) => [language, "queued" as TranslationLifecycleState])));
       }
       lastCompletedTranslationRef.current = "";
@@ -2957,7 +2960,7 @@ export default function App() {
             </button>
           </div>
 
-          <div className="max-h-72 overflow-y-auto pt-4">
+          <div className="max-h-72 scroll-smooth overflow-y-auto overscroll-contain pt-4 pr-1 [scrollbar-gutter:stable]">
             {history.length === 0 ? (
               <p className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-500">Final transcripts will appear here during the session.</p>
             ) : (

@@ -9,8 +9,8 @@
   ],
   "scripts": {
     "dev": "concurrently -n backend,frontend -c blue,green \"npm run dev --workspace backend\" \"npm run dev --workspace frontend\"",
-    "build": "npm run build --workspace backend && npm run build --workspace frontend && npm run sync:frontend-dist",
-    "lint": "npm run lint --workspace backend && npm run lint --workspace frontend",
+    "build": "node --check project-paths.js && npm run build --workspace backend && npm run build --workspace frontend && npm run sync:frontend-dist",
+    "lint": "node --check project-paths.js && npm run lint --workspace backend && npm run lint --workspace frontend",
     "start": "npm run start --workspace backend",
     "sync:frontend-dist": "node scripts/sync-frontend-dist.mjs",
     "clean": "npm run clean --workspace backend && npm run clean --workspace frontend"

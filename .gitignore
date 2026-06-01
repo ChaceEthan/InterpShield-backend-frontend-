@@ -1,5 +1,6 @@
 node_modules/
-.npm-cache/
+.cache/
+.vite/
 .browser-profile/
 dev-check*.png
 .env
@@ -7,8 +8,15 @@ dev-check*.png
 .env.*
 build/
 dist/
+frontend/dist/
 coverage/
 .data/
+logs/
+uploads/
+temp/
+runtime/
+audio-cache/
+translation-cache/
 .DS_Store
 *.log
 *.tsbuildinfo

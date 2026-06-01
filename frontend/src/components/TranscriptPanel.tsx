@@ -33,6 +33,21 @@ export const LiveTranscriptPanel: React.FC<LiveTranscriptPanelProps> = ({
   onEntryClick,
 }) => {
   const displayEntries = entries.slice(-maxEntries);
+  const scrollRef = React.useRef<HTMLDivElement | null>(null);
+  const endRef = React.useRef<HTMLDivElement | null>(null);
+  const scrollSignature = [
+    ...displayEntries.map((entry) => `${entry.id}:${entry.original}:${entry.translated}`),
+    currentOriginal || "",
+    currentTranslation || ""
+  ].join("|");
+
+  React.useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      endRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [scrollSignature]);
 
   return (
     <motion.div
@@ -58,7 +73,7 @@ export const LiveTranscriptPanel: React.FC<LiveTranscriptPanelProps> = ({
       </div>
 
       {/* Transcript list */}
-      <div className="max-h-[400px] space-y-0 overflow-y-auto">
+      <div ref={scrollRef} className="max-h-[400px] scroll-smooth space-y-0 overflow-y-auto overscroll-contain pr-1 [scrollbar-gutter:stable]">
         <AnimatePresence mode="popLayout">
           {displayEntries.map((entry, index) => (
             <motion.button
@@ -117,6 +132,7 @@ export const LiveTranscriptPanel: React.FC<LiveTranscriptPanelProps> = ({
             <p className="text-sm text-slate-500">Start speaking to see transcripts here...</p>
           </div>
         )}
+          <div ref={endRef} className="h-px" />
       </div>
     </motion.div>
   );

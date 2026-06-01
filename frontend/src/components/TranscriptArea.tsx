@@ -19,18 +19,27 @@ interface TranscriptAreaProps {
 
 export function TranscriptArea({ mode, originalText, interimText = "", translations, isRecording }: TranscriptAreaProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const endRef = useRef<HTMLDivElement | null>(null);
   const visibleOriginal = interimText || originalText;
   const hasTranslations = translations.some((entry) => entry.text.trim());
   const isTranscribe = mode === "transcribe";
+  const scrollSignature = [
+    visibleOriginal,
+    ...translations.map((entry) => `${entry.language}:${entry.state}:${entry.text}`)
+  ].join("|");
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [visibleOriginal, translations]);
+    const frame = window.requestAnimationFrame(() => {
+      endRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [scrollSignature]);
 
   return (
     <div
       ref={scrollRef}
-      className="mx-auto flex max-h-[360px] min-h-[220px] w-full max-w-4xl flex-col gap-4 overflow-y-auto px-1 py-2 sm:max-h-[390px]"
+      className="mx-auto flex max-h-[360px] min-h-[220px] w-full max-w-4xl scroll-smooth flex-col gap-4 overflow-y-auto overscroll-contain px-1 py-2 pr-2 [scrollbar-gutter:stable] sm:max-h-[390px]"
     >
       <AnimatePresence mode="popLayout">
         {visibleOriginal ? (
@@ -93,6 +102,7 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
           </motion.div>
         )}
       </AnimatePresence>
+      <div ref={endRef} className="h-px shrink-0" />
     </div>
   );
 }

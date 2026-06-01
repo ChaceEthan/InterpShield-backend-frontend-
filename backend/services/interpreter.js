@@ -27,8 +27,8 @@ const FAST_LOCAL_LANGUAGE_CODES = new Set(["sw"]);
 const FAST_LOCAL_MAX_ACTIVE_TRANSLATIONS = 8;
 const PROVIDER_MAX_ACTIVE_TRANSLATIONS = 6;
 const MAX_TRANSLATION_LANE_QUEUE_SIZE = 24;
-const QUEUED_JOB_TIMEOUT = 15000;
-const PROCESSING_JOB_TIMEOUT = 20000;
+const QUEUED_JOB_TIMEOUT = 90000;
+const PROCESSING_JOB_TIMEOUT = 90000;
 const SEQUENTIAL_JOB_HARD_TIMEOUT = 180000;
 const TRANSLATION_RATE_LIMIT_DELAY_MS = 80;
 const CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS = 3000;
@@ -66,11 +66,12 @@ const PROVIDER_TRANSLATION_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const PARTIAL_TRANSLATION_PREVIEW_THROTTLE_MS = 140;
 const ADMIN_STATS_EMIT_MS = 10000;
 const PROVIDER_TIMEOUT_MS = {
-  gemini: 8000,
-  openai: 8000
+  gemini: 25000,
+  openai: 22000
 };
 const PROVIDER_FAILURE_THRESHOLD = 6;
 const PROVIDER_COOLDOWN_MS = 45000;
+const PROVIDER_HARD_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const SESSION_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
 const SESSION_HEALTH_CHECK_MS = 2500;
 const MAX_STALE_TRANSLATION_JOBS = 40;
@@ -355,6 +356,19 @@ const translationCacheTtlMs = ({ source, target } = {}) =>
 
 const isProviderFailureText = (text = "") =>
   /\b(temporar(?:il)y unavailable|temporar(?:il)y failed|translation unavailable|provider failed|timed out|timeout)\b/i.test(String(text || ""));
+
+const providerErrorMessage = (error = {}) => String(error?.message || error || "");
+
+const isProviderNonRetryableFailure = (error = {}) =>
+  /\b(401|403|429)\b|rate[_ -]?limit|quota|insufficient|credit|billing|unauthori[sz]ed|forbidden|invalid api key|permission|resource_exhausted/i.test(
+    providerErrorMessage(error)
+  );
+
+const isRetryableProviderError = (error = {}) => {
+  const message = providerErrorMessage(error);
+  if (!message) return false;
+  return !isProviderNonRetryableFailure(error);
+};
 
 const isSourceTaggedFallbackText = (text = "") => /^\[[a-z]{2,12}(?:-[a-z0-9]{2,12})?\]\s+/i.test(cleanTranscriptText(text));
 
@@ -1134,12 +1148,18 @@ export const createInterpreterSession = async ({
   const noteProviderFailure = (provider, error) => {
     const health = providerHealth[provider];
     if (!health) return;
-    void error;
+    const nonRetryable = isProviderNonRetryableFailure(error);
 
-    health.failures += 1;
+    health.failures = nonRetryable ? PROVIDER_FAILURE_THRESHOLD : health.failures + 1;
     if (health.failures < PROVIDER_FAILURE_THRESHOLD) return;
 
-    health.cooldownUntil = Date.now() + PROVIDER_COOLDOWN_MS;
+    health.cooldownUntil = Date.now() + (nonRetryable ? PROVIDER_HARD_FAILURE_COOLDOWN_MS : PROVIDER_COOLDOWN_MS);
+    logTranslationEvent("PROVIDER_COOLDOWN", {
+      sessionId,
+      provider,
+      reason: nonRetryable ? "non_retryable_failure" : "failure_threshold",
+      error: providerErrorMessage(error)
+    }, "warn");
     emitProviderHealth();
   };
 
@@ -1548,7 +1568,7 @@ export const createInterpreterSession = async ({
         const translatedText = consumeProviderResult(result);
         if (translatedText?.text) return translatedText;
 
-        const retryable = Boolean(result?.error || result?.timedOut);
+        const retryable = Boolean(result?.timedOut || (result?.error && isRetryableProviderError(result.error)));
         if (!retryable) break;
       }
 
@@ -2213,24 +2233,20 @@ export const createInterpreterSession = async ({
     for (const job of [...translationJobs.values()]) {
       if (!job || job.completed || job.stale || staleTranslationJobs.has(job.id)) continue;
       const isActiveFifoJob = sessionTranslationQueue.activeJob?.id === job.id || activeSequentialTranslationJob?.id === job.id;
+      const isQueuedInSessionFifo = sessionTranslationQueue.queue.some((queuedJob) => queuedJob?.id === job.id);
+      const isWaitingBehindActiveFifoJob = isQueuedInSessionFifo && Boolean(sessionTranslationQueue.activeJob || activeSequentialTranslationJob);
       const activeAge = now - (job.activeLanguageStartedAt || job.startedAt || job.createdAt || now);
 
       const queuedTooLong =
         job.pendingLanguages?.size > 0 &&
         job.runningLanguages?.size === 0 &&
         !isActiveFifoJob &&
+        !isWaitingBehindActiveFifoJob &&
         now - (job.createdAt || now) > QUEUED_JOB_TIMEOUT;
-      const processingTooLong = false;
-      if (job.runningLanguages?.size > 0 && activeAge > PROCESSING_JOB_TIMEOUT) {
-        logTranslationEvent("STALE_JOB_CLEANUP_SKIPPED_ACTIVE", {
-          sessionId,
-          jobId: job.id,
-          sourceLang: job.direction?.source,
-          targetLanguages: job.direction?.targets,
-          latency: activeAge,
-          activeFifo: isActiveFifoJob
-        }, "warn");
-      }
+      const processingTimeoutMs = isActiveFifoJob ? SEQUENTIAL_JOB_HARD_TIMEOUT : PROCESSING_JOB_TIMEOUT;
+      const processingTooLong =
+        job.runningLanguages?.size > 0 &&
+        activeAge > processingTimeoutMs;
 
       if (queuedTooLong || processingTooLong) {
         markTranslationJobStale(job, queuedTooLong ? "queued_too_long" : "processing_timeout");
