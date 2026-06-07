@@ -86,9 +86,16 @@ const MAX_PENDING_SENTENCE_CHARS = 1400;
 const LOG_TEXT_PREVIEW_CHARS = 96;
 const sessionHistoryStore = new Map();
 const sharedTranslationCache = new Map();
+const debugFlagEnabled = (flag) =>
+  ["1", "true", "yes", "on"].includes(String(process.env[flag] || process.env.DEBUG || "").trim().toLowerCase());
 
 const logTranslationEvent = (event, payload = {}, level = "info") => {
-  if (process.env.NODE_ENV === "production") return;
+  const providerEvent = /^PROVIDER_|^TRANSLATION_REQUEST|^TRANSLATION_COMPLETE/.test(event);
+  const shouldLog =
+    process.env.NODE_ENV !== "production" ||
+    debugFlagEnabled("TRANSLATION_DEBUG") ||
+    (providerEvent && debugFlagEnabled("PROVIDER_DEBUG"));
+  if (!shouldLog) return;
 
   const safePayload = {};
 
@@ -971,9 +978,45 @@ export const createInterpreterSession = async ({
   };
 
   const logTranslationMetrics = (reason, extra = {}) => {
-    void reason;
-    void extra;
+    if (!debugFlagEnabled("TRANSLATION_DEBUG")) return;
+    logTranslationEvent("TRANSLATION_METRICS", { reason, ...extra });
   };
+
+  const getTranslationHealth = () => ({
+    sessionId,
+    sourceLang,
+    targetLanguages: sessionTargetLanguages,
+    queue: {
+      fifoQueuedJobs: sessionTranslationQueue.queue.length,
+      fifoProcessing: sessionTranslationQueue.processing,
+      activeJobId: sessionTranslationQueue.activeJob?.id || null,
+      activeSequentialJobId: activeSequentialTranslationJob?.id || null,
+      trackedJobs: translationJobs.size,
+      staleJobs: staleTranslationJobs.size,
+      retryTimers: backgroundRetryTimers.size
+    },
+    lanes: allTranslationLanes().map((lane) => ({
+      id: lane.id,
+      group: lane.group,
+      language: lane.language,
+      queuedTasks: lane.queue.length,
+      activeTasks: lane.activeTasks.size,
+      tripped: lane.tripped,
+      avgLatencyMs: lane.latencyHistory.length > 0
+        ? Math.round(lane.latencyHistory.reduce((sum, value) => sum + value, 0) / lane.latencyHistory.length)
+        : 0
+    })),
+    providers: {
+      gemini: { ...providerHealth.gemini, available: providerAvailable("gemini") },
+      openai: { ...providerHealth.openai, available: providerAvailable("openai") }
+    },
+    metrics: {
+      timeoutCount: translationMetrics.timeoutCount,
+      retryCount: translationMetrics.retryCount,
+      completedCount: translationMetrics.completedCount,
+      failedCount: translationMetrics.failedCount
+    }
+  });
 
   const createTranslationPayloadMetadata = (jobOrId = null) => {
     const jobId = typeof jobOrId === "object" && jobOrId !== null
@@ -3002,6 +3045,7 @@ export const createInterpreterSession = async ({
   session.id = sessionId;
   session.sessionId = sessionId;
   session.transcriptHistory = [];
+  session.getTranslationHealth = getTranslationHealth;
   rememberSessionHistory(sessionId, session.transcriptHistory);
   const stopDeepgramSession = session.stop;
   session.stop = () => {

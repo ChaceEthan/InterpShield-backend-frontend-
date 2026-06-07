@@ -134,7 +134,8 @@ const verifyGoogleCredential = async ({ credential }, env) => {
   try {
     googleClient ||= new OAuth2Client();
     const ticket = await googleClient.verifyIdToken({
-      idToken: credential
+      idToken: credential,
+      ...(env.googleClientId ? { audience: env.googleClientId } : {})
     });
     const payload = ticket.getPayload();
 

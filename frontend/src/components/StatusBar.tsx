@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Activity, Clock3, Radio, Wifi, WifiOff } from "lucide-react";
+import { Activity, Clock3, Mic, Radio, Wifi, WifiOff } from "lucide-react";
 
 type ConnectionState = "ready" | "connecting" | "connected" | "listening" | "translating" | "reconnecting";
 
@@ -10,9 +10,10 @@ interface StatusBarProps {
   chunkCount?: number;
   lastLatency?: number | null;
   sessionActive: boolean;
+  microphoneLabel?: string;
 }
 
-export function StatusBar({ isConnected, connectionState, elapsedSeconds, chunkCount = 0, lastLatency, sessionActive }: StatusBarProps) {
+export function StatusBar({ isConnected, connectionState, elapsedSeconds, chunkCount = 0, lastLatency, sessionActive, microphoneLabel }: StatusBarProps) {
   const resolvedConnectionState = connectionState || (sessionActive ? (isConnected ? "listening" : "reconnecting") : (isConnected ? "connected" : "ready"));
   const connectionLabel = {
     ready: "Ready",
@@ -34,6 +35,9 @@ export function StatusBar({ isConnected, connectionState, elapsedSeconds, chunkC
         icon={connectionIcon}
         label={connectionLabel}
       />
+      {microphoneLabel && (
+        <StatusPill icon={<Mic className="h-3.5 w-3.5 text-blue-500" />} label={microphoneLabel} />
+      )}
       <StatusPill icon={<Clock3 className="h-3.5 w-3.5 text-gray-400" />} label={sessionActive ? formatTime(elapsedSeconds) : "00:00"} mono />
       <StatusPill icon={<Radio className="h-3.5 w-3.5 text-gray-400" />} label={chunkCount > 0 ? `${chunkCount} chunks` : "Ready"} />
       {typeof lastLatency === "number" && (

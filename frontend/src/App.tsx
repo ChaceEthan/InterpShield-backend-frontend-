@@ -49,6 +49,7 @@ type SessionStatus = "idle" | "connecting" | "listening" | "stopping" | "error";
 type TranslationLifecycleState = "ready" | "queued" | "processing" | "translating" | "retrying" | "translated" | "done" | "failed" | "stale" | "cancelled";
 type SocketConnectionState = "ready" | "connecting" | "connected" | "listening" | "translating" | "reconnecting";
 type MicrophonePermissionState = "unknown" | "prompt" | "granted" | "denied" | "unsupported";
+type MicrophoneRuntimeState = "idle" | "checking" | "requesting" | "ready" | "recording" | "recovering" | "blocked" | "failed";
 type Plan = "free" | "pro";
 type SummaryLength = "short" | "standard" | "long";
 type AuthProvider = "manual" | "google";
@@ -170,6 +171,16 @@ interface EnhancedAudioStream {
   getAudioLevel: () => number;
 }
 
+interface AudioDiagnosticState {
+  state: MicrophoneRuntimeState;
+  message: string;
+  deviceLabel?: string;
+  mimeType?: string;
+  webAudio?: boolean;
+  lastError?: string;
+  lastRestartReason?: string;
+}
+
 interface ProviderHealthStatus {
   status: 'healthy' | 'cooldown';
   cooldownUntil: number;
@@ -220,7 +231,7 @@ declare global {
 }
 
 const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
-const SOCKET_URL = (import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL)?.replace(/\/$/, "");
+const SOCKET_URL = (import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_WS_URL || import.meta.env.VITE_API_URL)?.replace(/\/$/, "");
 const CLIENT_URL = import.meta.env.VITE_CLIENT_URL?.replace(/\/$/, "") || window.location.origin;
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const TRANSCRIPT_HISTORY_STORAGE_KEY = "interp_history";
@@ -242,10 +253,66 @@ const MAX_PENDING_FINAL_TRANSCRIPTS = 16;
 const CLIENT_HEARTBEAT_MS = 25000;
 const DUBBING_QUEUE_SETTLE_MS = 180;
 const STALE_TRANSLATION_STATE_MS = 45000;
+const SOCKET_HEARTBEAT_STALE_MS = 75000;
+const MAX_AUDIO_RECOVERY_ATTEMPTS = 2;
+const AUDIO_RECOVERY_DELAY_MS = 900;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
-const AUDIO_MIME_TYPES = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
+const AUDIO_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
+
+const readViteBoolean = (value?: string) => ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
+const frontendDebugEnabled = (flag: "audio" | "socket" | "translation" | "env") => {
+  const flags = {
+    audio: import.meta.env.VITE_AUDIO_DEBUG,
+    socket: import.meta.env.VITE_SOCKET_DEBUG,
+    translation: import.meta.env.VITE_TRANSLATION_DEBUG,
+    env: import.meta.env.VITE_ENV_DEBUG
+  };
+  return readViteBoolean(flags[flag]);
+};
+
+const logFrontendDebug = (flag: "audio" | "socket" | "translation" | "env", event: string, payload: Record<string, unknown> = {}) => {
+  if (!frontendDebugEnabled(flag)) return;
+  console.info(`[${event}]`, payload);
+};
+
+const validateFrontendConfig = () => {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const endpointEntries = [
+    ["VITE_API_URL", API],
+    ["VITE_SOCKET_URL/VITE_WS_URL", SOCKET_URL],
+    ["VITE_CLIENT_URL", CLIENT_URL]
+  ] as const;
+
+  for (const [name, value] of endpointEntries) {
+    if (!value) {
+      errors.push(`${name} is required.`);
+      continue;
+    }
+
+    try {
+      const parsed = new URL(value);
+      const local = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+      const allowedProtocol = name.includes("SOCKET")
+        ? ["https:", "wss:", "http:", "ws:"].includes(parsed.protocol)
+        : ["https:", "http:"].includes(parsed.protocol);
+      if (!allowedProtocol) errors.push(`${name} has an unsupported protocol.`);
+      if (!local && ["http:", "ws:"].includes(parsed.protocol)) errors.push(`${name} must use HTTPS/WSS in production.`);
+    } catch {
+      errors.push(`${name} is malformed.`);
+    }
+  }
+
+  if (!GOOGLE_CLIENT_ID) warnings.push("VITE_GOOGLE_CLIENT_ID is missing; Google sign-in is disabled.");
+
+  const diagnostics = { ok: errors.length === 0, errors, warnings, apiUrl: API, socketUrl: SOCKET_URL, clientUrl: CLIENT_URL };
+  logFrontendDebug("env", "FRONTEND_ENV_DIAGNOSTICS", diagnostics);
+  return diagnostics;
+};
+
+const FRONTEND_CONFIG_DIAGNOSTICS = validateFrontendConfig();
 
 let googleIdentityScriptPromise: Promise<void> | null = null;
 let googleIdentityInitializedClientId = "";
@@ -649,6 +716,10 @@ const getSupportedMimeType = () => {
   return AUDIO_MIME_TYPES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) || "";
 };
 
+const isDeviceConstraintError = (error: unknown) =>
+  error instanceof DOMException &&
+  ["OverconstrainedError", "ConstraintNotSatisfiedError", "NotFoundError", "DevicesNotFoundError"].includes(error.name);
+
 const buildAudioConstraints = ({
   microphoneId,
   echoCancellation,
@@ -671,6 +742,74 @@ const buildAudioConstraints = ({
   if (supportedConstraints.sampleSize) audio.sampleSize = { ideal: 16 };
   if (microphoneId !== "default") audio.deviceId = { exact: microphoneId };
   return audio;
+};
+
+const requestMicrophoneStream = async (audio: MediaTrackConstraints, fallbackAudio: MediaTrackConstraints) => {
+  try {
+    return await navigator.mediaDevices.getUserMedia({ audio });
+  } catch (error) {
+    if (!("deviceId" in audio) || !isDeviceConstraintError(error)) throw error;
+
+    logFrontendDebug("audio", "AUDIO_DEVICE_FALLBACK", {
+      reason: error instanceof Error ? error.name : "unknown",
+      requestedDeviceId: audio.deviceId
+    });
+    return navigator.mediaDevices.getUserMedia({ audio: fallbackAudio });
+  }
+};
+
+const createMediaRecorderWithFallback = (preferredStream: MediaStream, fallbackStream: MediaStream, preferredMimeType: string) => {
+  const streams = preferredStream === fallbackStream
+    ? [{ stream: preferredStream, label: "microphone" }]
+    : [
+        { stream: preferredStream, label: "enhanced" },
+        { stream: fallbackStream, label: "microphone" }
+      ];
+  const mimeTypes = [...new Set([preferredMimeType, ...AUDIO_MIME_TYPES, ""].filter((value) => value !== undefined))];
+  const errors: string[] = [];
+
+  for (const { stream, label } of streams) {
+    for (const mimeType of mimeTypes) {
+      try {
+        const options: MediaRecorderOptions = {
+          ...(mimeType ? { mimeType } : {}),
+          audioBitsPerSecond: 128_000
+        };
+        const recorder = new MediaRecorder(stream, options);
+        return { recorder, stream, mimeType: mimeType || recorder.mimeType || "", source: label };
+      } catch (error) {
+        errors.push(`${label}:${mimeType || "default"}:${error instanceof Error ? error.message : String(error)}`);
+      }
+
+      try {
+        const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+        return { recorder, stream, mimeType: mimeType || recorder.mimeType || "", source: label };
+      } catch (error) {
+        errors.push(`${label}:${mimeType || "default"}:basic:${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  throw new Error(`MediaRecorder could not start with available audio streams. ${errors.slice(-3).join(" | ")}`);
+};
+
+const mediaErrorMessage = (error: unknown) => {
+  if (error instanceof DOMException) {
+    if (["NotAllowedError", "PermissionDeniedError", "SecurityError"].includes(error.name)) {
+      return "Microphone permission denied. Allow microphone access to start live translation.";
+    }
+    if (["NotFoundError", "DevicesNotFoundError"].includes(error.name)) {
+      return "No microphone input was found.";
+    }
+    if (["NotReadableError", "TrackStartError"].includes(error.name)) {
+      return "Microphone is busy in another app or browser tab.";
+    }
+    if (["OverconstrainedError", "ConstraintNotSatisfiedError"].includes(error.name)) {
+      return "Selected microphone is unavailable. Retrying with the system default microphone.";
+    }
+  }
+
+  return "Unable to start microphone. Check browser audio permissions and try again.";
 };
 
 const createAmplifiedAudioStream = (stream: MediaStream): EnhancedAudioStream => {
@@ -1206,6 +1345,10 @@ export default function App() {
   const [microphones, setMicrophones] = useState<MediaDeviceInfo[]>([]);
   const [microphonePermission, setMicrophonePermission] = useState<MicrophonePermissionState>("unknown");
   const [microphoneAvailable, setMicrophoneAvailable] = useState<boolean | null>(null);
+  const [audioDiagnostic, setAudioDiagnostic] = useState<AudioDiagnosticState>({
+    state: "idle",
+    message: "Microphone ready"
+  });
 
   const [mode, setMode] = useState<Mode>("translate");
   const [sourceLang, setSourceLang] = useState("en");
@@ -1283,6 +1426,9 @@ export default function App() {
   const lastAudioChunkSentAtRef = useRef(0);
   const queuedAudioChunksRef = useRef<AudioChunkPayload[]>([]);
   const clientHeartbeatTimerRef = useRef<number | null>(null);
+  const audioRecoveryTimerRef = useRef<number | null>(null);
+  const audioRestartAttemptsRef = useRef(0);
+  const lastServerHeartbeatAtRef = useRef(0);
   const sessionStartedAtRef = useRef<number | null>(null);
   const lastInterimRef = useRef("");
   const lastFinalOriginalRef = useRef("");
@@ -1319,6 +1465,7 @@ export default function App() {
   const sessionSecondsRef = useRef(sessionSeconds);
   const sessionActionInFlightRef = useRef(false);
   const authRequestRef = useRef<AuthProvider | null>(null);
+  const startSessionRef = useRef<(() => Promise<void>) | null>(null);
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro";
@@ -1345,6 +1492,9 @@ export default function App() {
     const state: TranslationLifecycleState = translatedText ? "translated" : translationStatuses[language] || (isRecording && mode !== "transcribe" ? "queued" : "ready");
     return [language, translatedText, state] as const;
   });
+  const microphoneStatusLabel = audioDiagnostic.state === "recording" && audioDiagnostic.mimeType
+    ? `${audioDiagnostic.message} (${audioDiagnostic.mimeType.replace(/^audio\//, "")})`
+    : audioDiagnostic.message;
   const visibleHistory = useMemo(() => history.slice(-VISIBLE_HISTORY_ITEMS), [history]);
   const visibleHistoryScrollSignature = useMemo(
     () => visibleHistory.map((entry) => `${entry.id}:${entry.original}:${entry.translated}`).join("|"),
@@ -1367,6 +1517,11 @@ export default function App() {
   useEffect(() => {
     finalTranslationsRef.current = finalTranslations;
   }, [finalTranslations]);
+
+  useEffect(() => {
+    if (FRONTEND_CONFIG_DIAGNOSTICS.ok) return;
+    setAlert(FRONTEND_CONFIG_DIAGNOSTICS.errors[0] || "Frontend environment configuration is invalid.");
+  }, []);
 
   const stopDubbingPlayback = useCallback((clearQueue = true) => {
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
@@ -1764,7 +1919,15 @@ export default function App() {
     [flushPendingPartialTranscript]
   );
 
-  const cleanupMedia = useCallback(() => {
+  const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean } = {}) => {
+    if (!options.preserveRecoveryTimer && audioRecoveryTimerRef.current) {
+      window.clearTimeout(audioRecoveryTimerRef.current);
+      audioRecoveryTimerRef.current = null;
+    }
+    if (!options.preserveRestartAttempts) {
+      audioRestartAttemptsRef.current = 0;
+    }
+    recordingRef.current = false;
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") recorder.stop();
     mediaRecorderRef.current = null;
@@ -1774,7 +1937,6 @@ export default function App() {
     streamRef.current = null;
     void audioContextRef.current?.close().catch(() => undefined);
     audioContextRef.current = null;
-    recordingRef.current = false;
     activeSessionPayloadRef.current = null;
     shouldRestartSessionOnReconnectRef.current = false;
     sessionStartedAtRef.current = null;
@@ -1801,15 +1963,66 @@ export default function App() {
     pendingPartialTranscriptRef.current = null;
   }, [stopDubbingPlayback]);
 
+  const scheduleAudioRecovery = useCallback((reason: string) => {
+    if (!recordingRef.current || status === "stopping") return;
+
+    if (audioRestartAttemptsRef.current >= MAX_AUDIO_RECOVERY_ATTEMPTS) {
+      setAudioDiagnostic({
+        state: "failed",
+        message: "Microphone recovery failed",
+        lastRestartReason: reason
+      });
+      setStatus("error");
+      setAlert("Microphone stopped unexpectedly and could not recover.");
+      cleanupMedia();
+      return;
+    }
+
+    audioRestartAttemptsRef.current += 1;
+    setAudioDiagnostic((current) => ({
+      ...current,
+      state: "recovering",
+      message: "Recovering microphone",
+      lastRestartReason: reason
+    }));
+    logFrontendDebug("audio", "AUDIO_RECOVERY_SCHEDULED", {
+      reason,
+      attempt: audioRestartAttemptsRef.current
+    });
+
+    if (audioRecoveryTimerRef.current) window.clearTimeout(audioRecoveryTimerRef.current);
+    audioRecoveryTimerRef.current = window.setTimeout(() => {
+      audioRecoveryTimerRef.current = null;
+      socketRef.current?.emit("end_session");
+      sessionActionInFlightRef.current = false;
+      cleanupMedia({ preserveRecoveryTimer: true, preserveRestartAttempts: true });
+      setStatus("connecting");
+      window.setTimeout(() => {
+        void startSessionRef.current?.();
+      }, 150);
+    }, AUDIO_RECOVERY_DELAY_MS);
+  }, [cleanupMedia, status]);
+
   const emitAudioChunkPayload = useCallback((payload: AudioChunkPayload) => {
     const activeSocket = socketRef.current;
 
     if (activeSocket?.connected) {
       activeSocket.emit("audio_chunk", payload);
+      if (payload.sequence === 1 || payload.sequence % 25 === 0) {
+        logFrontendDebug("audio", "AUDIO_CHUNK_SENT", {
+          sequence: payload.sequence,
+          mimeType: payload.mimeType,
+          audioLevel: payload.audioLevel
+        });
+      }
       return true;
     }
 
     queuedAudioChunksRef.current = [...queuedAudioChunksRef.current, payload].slice(-MAX_QUEUED_AUDIO_CHUNKS);
+    logFrontendDebug("audio", "AUDIO_CHUNK_QUEUED", {
+      sequence: payload.sequence,
+      queued: queuedAudioChunksRef.current.length
+    });
     return false;
   }, []);
 
@@ -1818,6 +2031,7 @@ export default function App() {
     if (!activeSocket?.connected || queuedAudioChunksRef.current.length === 0) return;
 
     const queuedChunks = queuedAudioChunksRef.current.splice(0, queuedAudioChunksRef.current.length);
+    logFrontendDebug("socket", "AUDIO_CHUNKS_FLUSHED", { count: queuedChunks.length });
     for (const chunk of queuedChunks) {
       activeSocket.emit("audio_chunk", chunk);
     }
@@ -1830,6 +2044,7 @@ export default function App() {
     cleanupMedia();
     socketRef.current?.emit("end_session");
     sessionActionInFlightRef.current = false;
+    setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
     setStatus("idle");
   }, [cleanupMedia, status]);
 
@@ -1855,9 +2070,24 @@ export default function App() {
 
     const startClientHeartbeat = () => {
       stopClientHeartbeat();
+      lastServerHeartbeatAtRef.current = Date.now();
       clientHeartbeatTimerRef.current = window.setInterval(() => {
         if (socketRef.current?.connected) {
           socketRef.current.emit("ping", { timestamp: Date.now() });
+        }
+        if (
+          recordingRef.current &&
+          socketRef.current?.connected &&
+          lastServerHeartbeatAtRef.current &&
+          Date.now() - lastServerHeartbeatAtRef.current > SOCKET_HEARTBEAT_STALE_MS
+        ) {
+          logFrontendDebug("socket", "SOCKET_HEARTBEAT_STALE", {
+            ageMs: Date.now() - lastServerHeartbeatAtRef.current
+          });
+          setSocketReconnecting(true);
+          shouldRestartSessionOnReconnectRef.current = true;
+          socketRef.current.disconnect();
+          socketRef.current.connect();
         }
       }, CLIENT_HEARTBEAT_MS);
     };
@@ -1878,8 +2108,10 @@ export default function App() {
     socketRef.current = socket;
 
     socket.on("connect", () => {
+      logFrontendDebug("socket", "SOCKET_CONNECTED", { id: socket.id, url: SOCKET_URL });
       setSocketConnected(true);
       setSocketReconnecting(false);
+      lastServerHeartbeatAtRef.current = Date.now();
       startClientHeartbeat();
       setAlert((current) => (current === "Unable to reach InterpShield. Please try again." ? null : current));
       setTranslationStatuses((current) => {
@@ -1893,11 +2125,18 @@ export default function App() {
 
       if (shouldRestartSessionOnReconnectRef.current && activeSessionPayloadRef.current) {
         shouldRestartSessionOnReconnectRef.current = false;
-        socket.emit("start_session", activeSessionPayloadRef.current);
+        socket.timeout(30000).emit("start_session", activeSessionPayloadRef.current, (timeoutError: Error | null, response?: { ok?: boolean; error?: string }) => {
+          if (timeoutError || response?.error) {
+            shouldRestartSessionOnReconnectRef.current = true;
+            setSocketReconnecting(true);
+            setAlert(response?.error || "Unable to resume the live interpreter.");
+          }
+        });
       }
     });
 
     socket.on("disconnect", () => {
+      logFrontendDebug("socket", "SOCKET_DISCONNECTED", { recording: recordingRef.current });
       stopClientHeartbeat();
       setSocketConnected(false);
       if (recordingRef.current) {
@@ -1910,19 +2149,23 @@ export default function App() {
       }
     });
 
-    socket.on("connect_error", () => {
+    socket.on("connect_error", (error) => {
+      logFrontendDebug("socket", "SOCKET_CONNECT_ERROR", { message: error?.message });
       setSocketConnected(false);
       setSocketReconnecting(recordingRef.current);
       if (recordingRef.current) setAlert("Unable to reach the live interpreter.");
     });
 
     const handleReconnectAttempt = () => {
+      logFrontendDebug("socket", "SOCKET_RECONNECT_ATTEMPT", {});
       if (recordingRef.current) setSocketReconnecting(true);
     };
     const handleReconnect = () => {
+      logFrontendDebug("socket", "SOCKET_RECONNECTED", {});
       setSocketReconnecting(false);
     };
     const handleReconnectError = () => {
+      logFrontendDebug("socket", "SOCKET_RECONNECT_ERROR", {});
       if (recordingRef.current) setSocketReconnecting(true);
     };
     socket.io.on("reconnect_attempt", handleReconnectAttempt);
@@ -1931,7 +2174,11 @@ export default function App() {
 
     socket.on("server-config", (serverConfig: AppConfig) => setConfig(serverConfig));
     socket.on("session:heartbeat", () => {
+      lastServerHeartbeatAtRef.current = Date.now();
       socket.emit("session:pong", { ts: Date.now() });
+    });
+    socket.on("pong", () => {
+      lastServerHeartbeatAtRef.current = Date.now();
     });
 
     const markSessionReady = () => {
@@ -1943,6 +2190,13 @@ export default function App() {
         setSessionSeconds(0);
       }
       flushQueuedAudioChunks();
+      audioRestartAttemptsRef.current = 0;
+      setAudioDiagnostic((current) => ({
+        ...current,
+        state: "recording",
+        message: "Microphone streaming",
+        lastError: undefined
+      }));
       setStatus("listening");
     };
 
@@ -2442,9 +2696,16 @@ export default function App() {
       return;
     }
 
+    if (!FRONTEND_CONFIG_DIAGNOSTICS.ok) {
+      setStatus("error");
+      setAlert(FRONTEND_CONFIG_DIAGNOSTICS.errors[0] || "Frontend environment configuration is invalid.");
+      return;
+    }
+
     sessionActionInFlightRef.current = true;
     setAlert(null);
     setStatus("connecting");
+    setAudioDiagnostic({ state: "checking", message: "Checking microphone" });
     setDetectedLanguage(null);
     setChunkCount(0);
     setLastLatency(null);
@@ -2481,6 +2742,7 @@ export default function App() {
       setStatus("error");
       setMicrophonePermission("unsupported");
       setMicrophoneAvailable(false);
+      setAudioDiagnostic({ state: "failed", message: "Microphone unsupported" });
       setAlert("Microphone access is not supported in this browser.");
       return;
     }
@@ -2488,6 +2750,7 @@ export default function App() {
     if (!("MediaRecorder" in window)) {
       sessionActionInFlightRef.current = false;
       setStatus("error");
+      setAudioDiagnostic({ state: "failed", message: "Recording unsupported" });
       setAlert("Microphone recording is not supported in this browser.");
       return;
     }
@@ -2532,8 +2795,15 @@ export default function App() {
         noiseSuppression,
         autoGainControl
       });
+      const fallbackAudio = buildAudioConstraints({
+        microphoneId: "default",
+        echoCancellation,
+        noiseSuppression,
+        autoGainControl
+      });
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio });
+      setAudioDiagnostic({ state: "requesting", message: "Requesting microphone permission" });
+      const stream = await requestMicrophoneStream(audio, fallbackAudio);
       streamRef.current = stream;
       setMicrophonePermission("granted");
       setMicrophoneAvailable(true);
@@ -2547,11 +2817,28 @@ export default function App() {
       }
 
       const mimeType = getSupportedMimeType();
-      const recorder = new MediaRecorder(enhancedAudio.stream, {
-        ...(mimeType ? { mimeType } : {}),
-        audioBitsPerSecond: 128_000
-      });
+      const recorderSetup = createMediaRecorderWithFallback(enhancedAudio.stream, stream, mimeType);
+      const recorder = recorderSetup.recorder;
+      const recorderMimeType = recorderSetup.mimeType || mimeType || "audio/webm";
       mediaRecorderRef.current = recorder;
+      const deviceLabel = stream.getAudioTracks()[0]?.label || (microphoneId === "default" ? "System default microphone" : "Selected microphone");
+      setAudioDiagnostic({
+        state: "ready",
+        message: "Microphone ready",
+        deviceLabel,
+        mimeType: recorderMimeType,
+        webAudio: Boolean(enhancedAudio.audioContext && recorderSetup.source === "enhanced")
+      });
+      logFrontendDebug("audio", "AUDIO_RECORDER_READY", {
+        mimeType: recorderMimeType,
+        recorderSource: recorderSetup.source,
+        webAudio: Boolean(enhancedAudio.audioContext),
+        deviceLabel
+      });
+
+      for (const track of stream.getAudioTracks()) {
+        track.onended = () => scheduleAudioRecovery("track_ended");
+      }
 
       recorder.ondataavailable = (event) => {
         if (event.data.size < MIN_MEDIA_CHUNK_BYTES) return;
@@ -2570,15 +2857,26 @@ export default function App() {
           audioLevel,
           chunkMs: audioChunkMsRef.current,
           capturedAt,
-          mimeType: mimeType || "audio/webm"
+          mimeType: recorderMimeType
         });
         if (sequenceRef.current % 3 === 0) setChunkCount(sequenceRef.current);
       };
 
-      recorder.onerror = () => {
-        setStatus("error");
-        setAlert("Microphone recording stopped unexpectedly.");
-        cleanupMedia();
+      recorder.onerror = (event) => {
+        const message = "Microphone recording stopped unexpectedly.";
+        setAudioDiagnostic((current) => ({
+          ...current,
+          state: "recovering",
+          message,
+          lastError: event instanceof Event ? event.type : "recorder_error"
+        }));
+        scheduleAudioRecovery("recorder_error");
+      };
+
+      recorder.onstop = () => {
+        if (recordingRef.current && status !== "stopping") {
+          scheduleAudioRecovery("recorder_stopped");
+        }
       };
 
       const activeSourceLang = normalizeLanguageCode(sourceLang) || "en";
@@ -2589,14 +2887,14 @@ export default function App() {
         targetLanguages: activeTargetLanguages,
         translate: modeRef.current !== "transcribe",
         twoWay: activeTargetLanguages.length > 1,
-        mimeType: mimeType || "audio/webm",
+        mimeType: recorderMimeType,
         roomId: shareableMode ? `live:${user?.id || "guest"}` : undefined,
         participantId: user?.id || socketRef.current?.id || "browser",
         audioProfile: {
           noiseSuppression,
           echoCancellation,
           autoGainControl,
-          webAudio: Boolean(enhancedAudio.audioContext)
+          webAudio: Boolean(enhancedAudio.audioContext && recorderSetup.source === "enhanced")
         },
         preferredProvider,
         userPlan: user?.plan || "free"
@@ -2620,22 +2918,38 @@ export default function App() {
       sessionActionInFlightRef.current = false;
       cleanupMedia();
       setStatus("error");
+      const message = mediaErrorMessage(error);
+      setAudioDiagnostic({
+        state: message.includes("permission") ? "blocked" : "failed",
+        message,
+        lastError: error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+      });
 
       if (error instanceof DOMException && (error.name === "NotFoundError" || error.name === "DevicesNotFoundError")) {
         setMicrophoneAvailable(false);
-        setAlert("No microphone input was found.");
+        setAlert(message);
         return;
       }
 
       if (error instanceof DOMException && (error.name === "NotAllowedError" || error.name === "PermissionDeniedError")) {
         setMicrophonePermission("denied");
-        setAlert("Microphone permission denied. Allow microphone access to start live translation.");
+        setAlert(message);
         return;
       }
 
-      setAlert("Unable to start microphone. Check browser audio permissions and try again.");
+      if (isDeviceConstraintError(error)) {
+        setMicrophoneId("default");
+        setAlert(message);
+        return;
+      }
+
+      setAlert(message);
     }
-  }, [autoGainControl, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, shareableMode, sourceLang, stopDubbingPlayback, targetLang, targetLanguages, user?.id, user?.plan]);
+  }, [autoGainControl, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, scheduleAudioRecovery, shareableMode, sourceLang, stopDubbingPlayback, targetLang, targetLanguages, user?.id, user?.plan, status]);
+
+  useEffect(() => {
+    startSessionRef.current = startSession;
+  }, [startSession]);
 
   const selectMode = (nextMode: Mode) => {
     if (isRecording) return;
@@ -3018,6 +3332,7 @@ export default function App() {
           chunkCount={chunkCount}
           lastLatency={lastLatency}
           historyCount={history.length}
+          microphoneLabel={microphoneStatusLabel}
           alert={alert || microphoneNotice}
           aiDegraded={aiDegraded}
           onMicClick={!isRecording ? () => void startSession() : stopSession}

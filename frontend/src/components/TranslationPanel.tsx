@@ -24,6 +24,7 @@ interface TranslationPanelProps {
   chunkCount: number;
   lastLatency: number | null;
   historyCount: number;
+  microphoneLabel?: string;
   alert?: string | null;
   aiDegraded?: boolean;
   onMicClick: () => void;
@@ -47,6 +48,7 @@ export function TranslationPanel({
   chunkCount,
   lastLatency,
   historyCount,
+  microphoneLabel,
   alert,
   aiDegraded = false,
   onMicClick,
@@ -135,6 +137,7 @@ export function TranslationPanel({
           chunkCount={chunkCount}
           lastLatency={lastLatency}
           sessionActive={isRecording}
+          microphoneLabel={microphoneLabel}
         />
       </div>
     </motion.section>

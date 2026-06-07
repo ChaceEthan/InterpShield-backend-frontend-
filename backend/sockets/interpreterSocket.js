@@ -14,9 +14,31 @@ import {
 const MAX_TARGET_LANGUAGES = 3;
 const LOG_TEXT_PREVIEW_CHARS = 96;
 const callRooms = new Map();
+const socketRuntime = {
+  startedAt: Date.now(),
+  connectedSockets: 0,
+  totalConnections: 0,
+  totalDisconnects: 0,
+  totalSessionsStarted: 0,
+  totalSessionErrors: 0,
+  totalAudioChunks: 0,
+  totalAudioDropped: 0,
+  totalTranslationEvents: 0,
+  lastConnectionAt: null,
+  lastDisconnectAt: null,
+  lastAudioAt: null,
+  lastTranslationAt: null,
+  lastError: "",
+  activeSessions: new Map(),
+  latestAudio: null,
+  providers: {}
+};
+
+const debugFlagEnabled = (flag) =>
+  ["1", "true", "yes", "on"].includes(String(process.env[flag] || process.env.DEBUG || "").trim().toLowerCase());
 
 const logSocketTranslationEvent = (event, payload = {}) => {
-  if (process.env.NODE_ENV === "production") return;
+  if (process.env.NODE_ENV === "production" && !debugFlagEnabled("SOCKET_DEBUG")) return;
 
   const safePayload = {};
 
@@ -28,6 +50,68 @@ const logSocketTranslationEvent = (event, payload = {}) => {
   }
 
   console.info(`[${event}]`, safePayload);
+};
+
+const roomHealthSnapshot = () => ({
+  activeRooms: callRooms.size,
+  rooms: [...callRooms.values()].map((room) => ({
+    id: room.id,
+    participantCount: room.participants?.size || 0,
+    updatedAt: room.updatedAt
+  }))
+});
+
+export const getInterpreterSocketHealth = () => {
+  const sessions = [...socketRuntime.activeSessions.values()].map((session) => ({
+    ...session,
+    translationHealth: session.getTranslationHealth?.() || session.translationHealth || null,
+    getTranslationHealth: undefined
+  }));
+  const translationQueues = sessions
+    .map((session) => session.translationHealth)
+    .filter(Boolean);
+
+  return {
+    socket: {
+      uptimeMs: Date.now() - socketRuntime.startedAt,
+      connectedSockets: socketRuntime.connectedSockets,
+      totalConnections: socketRuntime.totalConnections,
+      totalDisconnects: socketRuntime.totalDisconnects,
+      activeSessions: sessions.length,
+      totalSessionsStarted: socketRuntime.totalSessionsStarted,
+      totalSessionErrors: socketRuntime.totalSessionErrors,
+      lastConnectionAt: socketRuntime.lastConnectionAt,
+      lastDisconnectAt: socketRuntime.lastDisconnectAt,
+      lastError: socketRuntime.lastError
+    },
+    rooms: roomHealthSnapshot(),
+    audio: {
+      totalAudioChunks: socketRuntime.totalAudioChunks,
+      totalAudioDropped: socketRuntime.totalAudioDropped,
+      lastAudioAt: socketRuntime.lastAudioAt,
+      latest: socketRuntime.latestAudio,
+      sessions: sessions.map((session) => ({
+        socketId: session.socketId,
+        sessionId: session.sessionId,
+        roomId: session.roomId,
+        participantId: session.participantId,
+        audio: session.audio
+      }))
+    },
+    translation: {
+      totalTranslationEvents: socketRuntime.totalTranslationEvents,
+      lastTranslationAt: socketRuntime.lastTranslationAt,
+      queues: translationQueues,
+      activeSessions: sessions.map((session) => ({
+        socketId: session.socketId,
+        sessionId: session.sessionId,
+        sourceLang: session.sourceLang,
+        targetLanguages: session.targetLanguages,
+        translationHealth: session.translationHealth
+      }))
+    },
+    providers: socketRuntime.providers
+  };
 };
 
 const normalizeSocketLanguageCode = (language = "") => {
@@ -162,6 +246,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       socket.data.deepgramStream = null;
       socket.data.audioPipeline = null;
       socket.data.callRoom = null;
+      socketRuntime.activeSessions.delete(socket.id);
 
       if (sessionTimer) {
         clearTimeout(sessionTimer);
@@ -189,6 +274,9 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     };
 
     logSocketTranslationEvent("SOCKET_CONNECTED", { socketId: socket.id });
+    socketRuntime.connectedSockets += 1;
+    socketRuntime.totalConnections += 1;
+    socketRuntime.lastConnectionAt = new Date().toISOString();
     socket.emit("server-config", getPublicConfig());
     startHeartbeat();
 
@@ -208,6 +296,12 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           lang: payload.lang,
           status: payload.status
         });
+        socketRuntime.totalTranslationEvents += 1;
+        socketRuntime.lastTranslationAt = new Date().toISOString();
+        const activeHealth = socketRuntime.activeSessions.get(socket.id);
+        if (activeHealth) {
+          activeHealth.translationHealth = session?.getTranslationHealth?.() || activeHealth.translationHealth;
+        }
         socket.emit("translation_update", payload);
         socket.emit("translation_result", payload);
         socket.emit("translated_text", payload);
@@ -357,7 +451,10 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
             logSocketTranslationEvent("SOCKET_PROVIDER_WARNING", { socketId: socket.id, message }, "warn");
             socket.emit("warning", { message });
           },
-          onProviderHealth: (health) => socket.emit("provider_health", health),
+          onProviderHealth: (health) => {
+            socketRuntime.providers = health || {};
+            socket.emit("provider_health", health);
+          },
           onClosed: () => socket.emit("warning", { message: "Provider stream closed; reconnecting if session is active." }),
           onResult: emitInterpreterResult
         });
@@ -402,10 +499,23 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           audioProfile: payload.audioProfile || {}
         });
         socket.data.audioPipeline = audioPipeline.getSnapshot();
+        socketRuntime.totalSessionsStarted += 1;
+        socketRuntime.activeSessions.set(socket.id, {
+          socketId: socket.id,
+          sessionId: session.sessionId,
+          roomId,
+          participantId,
+          sourceLang,
+          targetLanguages,
+          startedAt: new Date().toISOString(),
+          audio: socket.data.audioPipeline,
+          translationHealth: session.getTranslationHealth?.() || null,
+          getTranslationHealth: session.getTranslationHealth
+        });
 
         sessionTimer = setTimeout(() => {
           stopSession();
-          socket.emit("warning", { message: "One hour safety session limit reached." });
+          socket.emit("warning", { message: "Session safety limit reached." });
           socket.emit("session:closed");
         }, env.maxSessionSeconds * 1000);
         sessionTimer.unref?.();
@@ -420,6 +530,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       } catch (error) {
         console.error("Interpreter session start failed:", error?.message || error);
         const message = startErrorMessage(error);
+        socketRuntime.totalSessionErrors += 1;
+        socketRuntime.lastError = message;
         ack?.({ ok: false, error: message });
         socket.emit("session_error", { message });
         socket.emit("app-error", { message });
@@ -443,14 +555,37 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           receivedAt: Number(payload?.capturedAt) || Date.now()
         }) || { accepted: true, buffer: audioBuffer };
 
+        socketRuntime.totalAudioChunks += 1;
         if (!processedAudio.accepted) {
+          socketRuntime.totalAudioDropped += 1;
           socket.data.audioPipeline = audioPipeline?.getSnapshot?.() || socket.data.audioPipeline;
+          socketRuntime.latestAudio = {
+            socketId: socket.id,
+            accepted: false,
+            reason: processedAudio.reason,
+            at: new Date().toISOString(),
+            snapshot: socket.data.audioPipeline
+          };
           return;
         }
 
         session.sendAudio(processedAudio.buffer);
         socket.data.audioPipeline = audioPipeline?.getSnapshot?.() || socket.data.audioPipeline;
+        socketRuntime.lastAudioAt = new Date().toISOString();
+        socketRuntime.latestAudio = {
+          socketId: socket.id,
+          accepted: true,
+          sequence: Number.isFinite(sequence) ? sequence : undefined,
+          at: socketRuntime.lastAudioAt,
+          snapshot: socket.data.audioPipeline
+        };
+        const activeHealth = socketRuntime.activeSessions.get(socket.id);
+        if (activeHealth) {
+          activeHealth.audio = socket.data.audioPipeline;
+          activeHealth.translationHealth = session.getTranslationHealth?.() || activeHealth.translationHealth;
+        }
       } catch {
+        socketRuntime.lastError = "Invalid audio chunk received.";
         socket.emit("warning", { message: "Invalid audio chunk received." });
       }
     };
@@ -483,6 +618,10 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
     socket.on("disconnect", (reason) => {
       logSocketTranslationEvent("SOCKET_DISCONNECTED", { socketId: socket.id, reason });
+      socketRuntime.connectedSockets = Math.max(0, socketRuntime.connectedSockets - 1);
+      socketRuntime.totalDisconnects += 1;
+      socketRuntime.lastDisconnectAt = new Date().toISOString();
+      socketRuntime.activeSessions.delete(socket.id);
       stopHeartbeat();
       stopSession();
     });

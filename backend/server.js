@@ -4,12 +4,13 @@ import cors from "cors";
 import express from "express";
 import { Server } from "socket.io";
 import { connectDatabase, getDatabaseStatus } from "./config/database.js";
-import { env, getPublicConfig, warnAboutMissingConfig } from "./config/env.js";
+import { env, getConfigDiagnostics, getPublicConfig, validateStartupConfig, warnAboutMissingConfig } from "./config/env.js";
 import { createAuthRouter } from "./routes/auth.js";
 import { createUserRouter } from "./routes/user.js";
 import { getInterpreterSessionHistory } from "./services/interpreter.js";
-import { registerInterpreterSocket } from "./sockets/interpreterSocket.js";
+import { getInterpreterSocketHealth, registerInterpreterSocket } from "./sockets/interpreterSocket.js";
 
+validateStartupConfig();
 warnAboutMissingConfig();
 
 const app = express();
@@ -69,16 +70,55 @@ app.get("/", (_req, res) => {
   });
 });
 
+const baseHealthPayload = () => ({
+  status: "ok",
+  service: "interp-shield-backend",
+  database: getDatabaseStatus(),
+  config: getConfigDiagnostics(),
+  ...getPublicConfig()
+});
+
 app.get("/api/config", (_req, res) => {
   res.json(getPublicConfig());
 });
 
 app.get("/api/health", (_req, res) => {
+  res.json(baseHealthPayload());
+});
+
+app.get("/health", (_req, res) => {
+  res.json(baseHealthPayload());
+});
+
+app.get("/health/socket", (_req, res) => {
+  const health = getInterpreterSocketHealth();
   res.json({
     status: "ok",
     service: "interp-shield-backend",
-    database: getDatabaseStatus(),
-    ...getPublicConfig()
+    socket: {
+      connectedClients: io.engine.clientsCount,
+      ...health.socket,
+      rooms: health.rooms
+    }
+  });
+});
+
+app.get("/health/audio", (_req, res) => {
+  const health = getInterpreterSocketHealth();
+  res.json({
+    status: "ok",
+    service: "interp-shield-backend",
+    audio: health.audio
+  });
+});
+
+app.get("/health/translation", (_req, res) => {
+  const health = getInterpreterSocketHealth();
+  res.json({
+    status: "ok",
+    service: "interp-shield-backend",
+    translation: health.translation,
+    providers: health.providers
   });
 });
 

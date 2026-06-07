@@ -10,6 +10,13 @@ const MIN_CHUNK_INTERVAL_MS = 20;
 const LOW_AUDIO_LEVEL = 0.0008;
 const MAX_TRANSLATED_SPEECH_QUEUE = 24;
 const TRANSLATED_SPEECH_TTL_MS = 45000;
+const audioDebugEnabled = () =>
+  ["1", "true", "yes", "on"].includes(String(process.env.AUDIO_DEBUG || process.env.DEBUG || "").trim().toLowerCase());
+
+const logAudioDebug = (event, payload = {}) => {
+  if (!audioDebugEnabled()) return;
+  console.info(`[${event}]`, payload);
+};
 
 const normalizeLanguage = (language = "") => {
   const normalized = String(language || "").trim().toLowerCase().replace("_", "-");
@@ -99,6 +106,7 @@ export const createAudioPipelineSession = ({
   const preprocessAudioChunk = (buffer, { sequence, audioLevel, receivedAt = Date.now() } = {}) => {
     if (!buffer?.length || buffer.length < MIN_AUDIO_CHUNK_BYTES) {
       droppedChunks += 1;
+      logAudioDebug("AUDIO_CHUNK_DROPPED", { sessionId, reason: "too_small", bytes: buffer?.length || 0, droppedChunks });
       return { accepted: false, reason: "too_small", silenceConfidence: 1 };
     }
 
@@ -118,6 +126,13 @@ export const createAudioPipelineSession = ({
 
     if ((tooFast && likelySilentMicroChunk) || duplicateSpam) {
       droppedChunks += 1;
+      logAudioDebug("AUDIO_CHUNK_DROPPED", {
+        sessionId,
+        reason: duplicateSpam ? "duplicate_chunk" : "silent_micro_chunk",
+        bytes: buffer.length,
+        audioLevel,
+        droppedChunks
+      });
       return {
         accepted: false,
         reason: duplicateSpam ? "duplicate_chunk" : "silent_micro_chunk",
@@ -127,6 +142,16 @@ export const createAudioPipelineSession = ({
 
     acceptedChunks += 1;
     lastAcceptedAt = receivedAt;
+    if (acceptedChunks === 1 || acceptedChunks % 25 === 0) {
+      logAudioDebug("AUDIO_CHUNK_ACCEPTED", {
+        sessionId,
+        sequence,
+        bytes: buffer.length,
+        audioLevel,
+        acceptedChunks,
+        droppedChunks
+      });
+    }
 
     return {
       accepted: true,
