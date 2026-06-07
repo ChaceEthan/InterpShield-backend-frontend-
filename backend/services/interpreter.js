@@ -30,6 +30,7 @@ const FAST_LOCAL_LANGUAGE_CODES = new Set(["sw", "rw", "rn", "lg"]);
 const FAST_LOCAL_MAX_ACTIVE_TRANSLATIONS = 8;
 const PROVIDER_MAX_ACTIVE_TRANSLATIONS = 6;
 const MAX_TRANSLATION_LANE_QUEUE_SIZE = 24;
+const MAX_SESSION_TRANSLATION_QUEUE_SIZE = 12;
 const QUEUED_JOB_TIMEOUT = 90000;
 const PROCESSING_JOB_TIMEOUT = 90000;
 const SEQUENTIAL_JOB_HARD_TIMEOUT = 180000;
@@ -2505,6 +2506,32 @@ export const createInterpreterSession = async ({
     backgroundRetryTimers.clear();
   };
 
+  const pruneSessionTranslationQueue = (reason = "session_queue_overflow", nextJob = null) => {
+    const droppedJobs = [];
+
+    while (sessionTranslationQueue.queue.length > MAX_SESSION_TRANSLATION_QUEUE_SIZE) {
+      const droppedJob = sessionTranslationQueue.queue.shift();
+      if (droppedJob) droppedJobs.push(droppedJob);
+    }
+
+    if (droppedJobs.length === 0) return;
+
+    logTranslationEvent("QUEUE_CLEAR", {
+      sessionId,
+      sequence: nextJob?.sequence || sessionTranslationQueue.sequence,
+      language: nextJob?.direction?.targets?.join(",") || "all",
+      provider: "queue",
+      latency: 0,
+      reason,
+      pendingCount: droppedJobs.length
+    }, "warn");
+
+    for (const droppedJob of droppedJobs) {
+      if (!droppedJob || droppedJob.id === nextJob?.id || droppedJob.completed || droppedJob.stale) continue;
+      markTranslationJobStale(droppedJob, reason);
+    }
+  };
+
   const finishSequentialLanguage = (job, language, status) => {
     job.pendingLanguages?.delete?.(language);
     job.runningLanguages?.delete?.(language);
@@ -2697,7 +2724,6 @@ export const createInterpreterSession = async ({
   };
 
   const enqueueTranslationJob = (job) => {
-    clearPendingTranslationQueue("newer_final_transcript", job);
     translationJobs.set(job.id, job);
 
     for (const language of job.direction.targets.slice(0, MAX_TARGET_LANGUAGES)) {
@@ -2705,6 +2731,7 @@ export const createInterpreterSession = async ({
     }
 
     sessionTranslationQueue.queue.push(job);
+    pruneSessionTranslationQueue("session_queue_overflow", job);
     logTranslationEvent("QUEUE_ADD", {
       sessionId,
       sequence: job.sequence,

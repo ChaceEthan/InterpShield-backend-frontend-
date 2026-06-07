@@ -67,6 +67,24 @@ const extractGeminiText = (response = {}) => {
   return textParts.join(" ").trim();
 };
 
+const abortError = () => new Error("Gemini translation aborted");
+
+const createAbortPromise = (signal) => {
+  if (!signal) return { promise: null, cleanup: () => undefined };
+  if (signal.aborted) return { promise: Promise.reject(abortError()), cleanup: () => undefined };
+
+  let handleAbort = () => undefined;
+  const promise = new Promise((_, reject) => {
+    handleAbort = () => reject(abortError());
+    signal.addEventListener?.("abort", handleAbort, { once: true });
+  });
+
+  return {
+    promise,
+    cleanup: () => signal.removeEventListener?.("abort", handleAbort)
+  };
+};
+
 const contextInstructions = (translationContext = {}) => {
   const instructions = [];
   const accentProfile = translationContext.accentProfile;
@@ -103,7 +121,7 @@ const contextInstructions = (translationContext = {}) => {
   return instructions;
 };
 
-const translateOnce = async ({ apiKey, text, sourceLang, targetLang, translationContext, timeoutMs = GEMINI_TIMEOUT_MS }) => {
+const translateOnce = async ({ apiKey, text, sourceLang, targetLang, translationContext, timeoutMs = GEMINI_TIMEOUT_MS, signal }) => {
   if (!client || activeKey !== apiKey) {
     client = new GoogleGenAI({ apiKey });
     activeKey = apiKey;
@@ -112,16 +130,15 @@ const translateOnce = async ({ apiKey, text, sourceLang, targetLang, translation
   const targetLanguage = describeLanguage(targetLang);
   const sourceLanguage = sourceLang ? describeSourceLanguage(sourceLang) : "auto-detected language";
 
-  // Create a timeout promise
+  let timeout = null;
   const timeoutPromise = new Promise((_, reject) => {
-    const timer = setTimeout(() => {
+    timeout = setTimeout(() => {
       reject(new Error(`Gemini translation timed out for ${targetLanguage}`));
     }, timeoutMs);
-    timer.unref?.();
+    timeout.unref?.();
   });
-
-  // Race the actual request against the timeout
-  const response = await Promise.race([
+  const abortPromise = createAbortPromise(signal);
+  const pendingPromises = [
     client.models.generateContent({
       model: "gemini-2.5-flash",
       contents: [
@@ -159,7 +176,18 @@ const translateOnce = async ({ apiKey, text, sourceLang, targetLang, translation
       }
     }),
     timeoutPromise
-  ]);
+  ];
+
+  if (abortPromise.promise) pendingPromises.push(abortPromise.promise);
+
+  let response = null;
+
+  try {
+    response = await Promise.race(pendingPromises);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    abortPromise.cleanup();
+  }
 
   const translatedText = normalizeTranslatedText({ text: extractGeminiText(response), targetLang });
   if (!translatedText) {
@@ -191,7 +219,8 @@ export const translateWithGemini = async ({ apiKey, text, sourceLang, targetLang
       sourceLang, 
       targetLang, 
       translationContext,
-      timeoutMs: GEMINI_TIMEOUT_MS
+      timeoutMs: GEMINI_TIMEOUT_MS,
+      signal
     });
     
     if (signal?.aborted) {

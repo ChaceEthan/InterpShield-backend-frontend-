@@ -15,12 +15,6 @@ warnAboutMissingConfig();
 const app = express();
 const server = http.createServer(app);
 
-const DEFAULT_CLIENT_ORIGINS = [
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-  "https://interp-shield-backend-frontend-fron.vercel.app"
-];
-
 const isAllowedCorsOrigin = (origin) => {
   if (!origin) return true;
 
@@ -34,9 +28,9 @@ const isAllowedCorsOrigin = (origin) => {
   const hostname = parsed.hostname.toLowerCase();
   const normalizedOrigin = parsed.origin.toLowerCase();
 
-  const allowedOrigins = new Set([...DEFAULT_CLIENT_ORIGINS, ...env.clientOrigins].map((allowedOrigin) => allowedOrigin.toLowerCase()));
+  const allowedOrigins = new Set(env.clientOrigins.map((allowedOrigin) => allowedOrigin.toLowerCase()));
 
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname.endsWith(".vercel.app") || allowedOrigins.has(normalizedOrigin);
+  return allowedOrigins.has(normalizedOrigin) || (env.allowVercelPreviewOrigins && hostname.endsWith(".vercel.app"));
 };
 
 const corsOrigin = (origin, callback) => {

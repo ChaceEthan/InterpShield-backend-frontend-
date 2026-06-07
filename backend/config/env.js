@@ -36,9 +36,9 @@ const readNumber = (value, fallback) => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
-const localClientOrigin = "http://localhost:5173";
-const localClientOriginAlt = "http://127.0.0.1:5173";
-const productionClientOrigin = "https://interp-shield-backend-frontend-fron.vercel.app";
+const clampNumber = (value, min, max) => Math.max(min, Math.min(max, value));
+
+const localClientOrigins = ["http://localhost:5173", "http://127.0.0.1:5173"];
 
 const normalizeOrigin = (origin = "") => {
   const trimmed = origin.trim();
@@ -51,19 +51,25 @@ const normalizeOrigin = (origin = "") => {
   }
 };
 
-const readClientOrigins = (clientUrl) => {
-  const configuredOrigins = (clientUrl || "")
+const readClientOrigins = (...originValues) => {
+  const configuredOrigins = originValues
+    .filter(Boolean)
+    .join(",")
     .split(",")
     .map(normalizeOrigin)
     .filter(Boolean);
 
-  const origins = [localClientOrigin, localClientOriginAlt, productionClientOrigin, ...configuredOrigins];
+  const allowLocalOrigins =
+    process.env.ALLOW_LOCAL_ORIGINS === "true" ||
+    (process.env.ALLOW_LOCAL_ORIGINS !== "false" && process.env.NODE_ENV !== "production");
+  const origins = [...(allowLocalOrigins ? localClientOrigins : []), ...configuredOrigins];
   return [...new Set(origins)];
 };
 
 export const env = {
   port: readNumber(process.env.PORT, 10000),
-  clientOrigins: readClientOrigins(process.env.CLIENT_URL),
+  clientOrigins: readClientOrigins(process.env.CLIENT_URL, process.env.CORS_ORIGIN),
+  allowVercelPreviewOrigins: process.env.ALLOW_VERCEL_PREVIEW_ORIGINS === "true",
   mongoUri: readSecret(process.env.MONGO_URI),
   deepgramApiKey: readSecret(process.env.DEEPGRAM_API_KEY),
   geminiApiKey: readSecret(process.env.GEMINI_API_KEY),
@@ -73,7 +79,7 @@ export const env = {
   paths: projectPaths,
   runtimePathStatus,
   maxSessionSeconds: 3600,
-  audioChunkMs: 700
+  audioChunkMs: clampNumber(readNumber(process.env.AUDIO_CHUNK_MS, 700), 500, 800)
 };
 
 export const getMode = () => (env.deepgramApiKey && env.geminiApiKey ? "production" : "unavailable");

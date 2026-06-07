@@ -24,7 +24,7 @@ interface SocketStatus {
  */
 export const useSocket = (options: UseSocketOptions = {}) => {
   const {
-    url = import.meta.env.VITE_API_URL?.replace(/\/$/, ''),
+    url = (import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_API_URL)?.replace(/\/$/, ''),
     enabled = true,
     token,
     onConnect,
