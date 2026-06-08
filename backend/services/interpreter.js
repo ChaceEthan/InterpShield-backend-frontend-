@@ -29,17 +29,18 @@ const LOCAL_BRIDGE_LANGUAGE_CODES = new Set(["rw", "rn", "lg"]);
 const FAST_LOCAL_LANGUAGE_CODES = new Set(["sw", "rw", "rn", "lg"]);
 const FAST_LOCAL_MAX_ACTIVE_TRANSLATIONS = 8;
 const PROVIDER_MAX_ACTIVE_TRANSLATIONS = 6;
-const MAX_TRANSLATION_LANE_QUEUE_SIZE = 24;
-const MAX_SESSION_TRANSLATION_QUEUE_SIZE = 12;
-const QUEUED_JOB_TIMEOUT = 90000;
-const PROCESSING_JOB_TIMEOUT = 90000;
-const SEQUENTIAL_JOB_HARD_TIMEOUT = 180000;
+const MAX_TRANSLATION_LANE_QUEUE_SIZE = 96;
+const MAX_SESSION_TRANSLATION_QUEUE_SIZE = 96;
+const QUEUED_JOB_TIMEOUT = 10 * 60 * 1000;
+const PROCESSING_JOB_TIMEOUT = 3 * 60 * 1000;
+const SEQUENTIAL_JOB_HARD_TIMEOUT = 8 * 60 * 1000;
 const TRANSLATION_RATE_LIMIT_DELAY_MS = 80;
 const CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS = 3000;
 const LATENCY_WINDOW_SIZE = 5;
 const MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3;
 const MAX_PROVIDER_RETRY_ATTEMPTS = 1;
 const PROVIDER_RETRY_DELAY_MS = 900;
+const PROVIDER_RETRY_MAX_DELAY_MS = 8000;
 
 // Admin Dashboard Tracking (Simulated Persistent Store)
 const globalUsageStats = {
@@ -248,6 +249,8 @@ const prepareTextForTranslation = (text = "") => {
 const normalizeTranscript = (text = "") => cleanTranscriptText(text).toLowerCase();
 const sentenceEnds = (text = "") => /[.!?]$/.test(text.trim());
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const providerRetryDelay = (attempt) =>
+  Math.min(PROVIDER_RETRY_MAX_DELAY_MS, PROVIDER_RETRY_DELAY_MS * 2 ** Math.max(0, attempt - 1));
 const wordCount = (text = "") => text.split(/\s+/).filter(Boolean).length;
 
 const normalizeInterpreterLanguageCode = (language = "") => {
@@ -1010,6 +1013,7 @@ export const createInterpreterSession = async ({
       gemini: { ...providerHealth.gemini, available: providerAvailable("gemini") },
       openai: { ...providerHealth.openai, available: providerAvailable("openai") }
     },
+    deepgram: session?.getHealth?.() || null,
     metrics: {
       timeoutCount: translationMetrics.timeoutCount,
       retryCount: translationMetrics.retryCount,
@@ -1613,7 +1617,7 @@ export const createInterpreterSession = async ({
             targetLang: language,
             attempt: attempt + 1
           }, "warn");
-          await delay(PROVIDER_RETRY_DELAY_MS * attempt);
+          await delay(providerRetryDelay(attempt));
           if (staleTranslationJobs.has(jobId)) break;
         }
 
@@ -2329,7 +2333,7 @@ export const createInterpreterSession = async ({
 
       pruneTranslationLaneQueue(lane);
       scheduleTranslationDrain(lane.id);
-    }, PROVIDER_RETRY_DELAY_MS * (attempt + 1));
+    }, providerRetryDelay(attempt + 1));
     retryTimer.unref?.();
     backgroundRetryTimers.add(retryTimer);
 

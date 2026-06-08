@@ -11,6 +11,11 @@ const resolveProjectRoot = () => {
   return path.resolve(configuredRoot || moduleRoot);
 };
 
+const resolveDriveRoot = (root) => {
+  const parsed = path.parse(root);
+  return parsed.root || root;
+};
+
 const isWindowsAbsolutePath = (value = "") => /^[a-z]:[\\/]/i.test(String(value || ""));
 const isCDrivePath = (value = "") => /^c:[\\/]/i.test(path.resolve(value || "."));
 const isExpectedDrivePath = (value = "") => {
@@ -21,7 +26,9 @@ const isExpectedDrivePath = (value = "") => {
 
 export const getProjectPaths = () => {
   const root = resolveProjectRoot();
+  const driveRoot = resolveDriveRoot(root);
   const fromRoot = (...segments) => path.resolve(root, ...segments);
+  const fromDriveRoot = (...segments) => path.resolve(driveRoot, ...segments);
 
   return {
     root,
@@ -29,12 +36,15 @@ export const getProjectPaths = () => {
     frontendRoot: fromRoot("frontend"),
     nodeModules: fromRoot("node_modules"),
     cacheRoot: fromRoot(".cache"),
-    npmCache: fromRoot(".cache", "npm"),
+    npmCache: fromDriveRoot("npm-cache"),
+    npmPrefix: fromDriveRoot("npm-prefix"),
+    npmTemp: fromDriveRoot("npm-temp"),
+    nodeGypCache: fromDriveRoot("node-gyp-cache"),
     nodeCache: fromRoot(".cache", "node"),
     viteCache: fromRoot(".cache", "vite"),
     browserProfile: fromRoot(".browser-profile"),
     logs: fromRoot("logs"),
-    npmLogs: fromRoot("logs", "npm"),
+    npmLogs: fromDriveRoot("npm-cache", "_logs"),
     uploads: fromRoot("uploads"),
     temp: fromRoot("temp"),
     npmTmp: fromRoot("temp", "npm"),
@@ -51,6 +61,9 @@ export const projectPaths = getProjectPaths();
 export const runtimeDirectoryKeys = [
   "cacheRoot",
   "npmCache",
+  "npmPrefix",
+  "npmTemp",
+  "nodeGypCache",
   "nodeCache",
   "viteCache",
   "browserProfile",
@@ -109,6 +122,9 @@ export const configureProjectRuntimePaths = (paths = projectPaths) => {
   redirectEnvPath("TMP", paths.temp);
   redirectEnvPath("TMPDIR", paths.temp);
   redirectEnvPath("npm_config_cache", paths.npmCache);
+  redirectEnvPath("npm_config_prefix", paths.npmPrefix);
+  redirectEnvPath("npm_config_tmp", paths.npmTemp);
+  redirectEnvPath("npm_config_devdir", paths.nodeGypCache);
   redirectEnvPath("npm_config_logs_dir", paths.npmLogs);
   redirectEnvPath("VITE_CACHE_DIR", paths.viteCache);
   redirectEnvPath("NODE_COMPILE_CACHE", paths.nodeCache);

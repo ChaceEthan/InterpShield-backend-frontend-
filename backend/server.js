@@ -7,7 +7,9 @@ import { connectDatabase, getDatabaseStatus } from "./config/database.js";
 import { env, getConfigDiagnostics, getPublicConfig, validateStartupConfig, warnAboutMissingConfig } from "./config/env.js";
 import { createAuthRouter } from "./routes/auth.js";
 import { createUserRouter } from "./routes/user.js";
+import { getGeminiHealth } from "./services/gemini.js";
 import { getInterpreterSessionHistory } from "./services/interpreter.js";
+import { getOpenAIHealth } from "./services/openai.js";
 import { getInterpreterSocketHealth, registerInterpreterSocket } from "./sockets/interpreterSocket.js";
 
 validateStartupConfig();
@@ -90,6 +92,31 @@ app.get("/health", (_req, res) => {
   res.json(baseHealthPayload());
 });
 
+const fullHealthPayload = () => {
+  const realtime = getInterpreterSocketHealth();
+  const providers = {
+    socketSessions: realtime.providers,
+    gemini: getGeminiHealth(),
+    openai: getOpenAIHealth()
+  };
+
+  return {
+    ...baseHealthPayload(),
+    socket: {
+      connectedClients: io.engine.clientsCount,
+      ...realtime.socket,
+      rooms: realtime.rooms
+    },
+    translation: realtime.translation,
+    audio: realtime.audio,
+    providers
+  };
+};
+
+app.get("/health/full", (_req, res) => {
+  res.json(fullHealthPayload());
+});
+
 app.get("/health/socket", (_req, res) => {
   const health = getInterpreterSocketHealth();
   res.json({
@@ -122,6 +149,19 @@ app.get("/health/translation", (_req, res) => {
   });
 });
 
+app.get("/health/providers", (_req, res) => {
+  const health = getInterpreterSocketHealth();
+  res.json({
+    status: "ok",
+    service: "interp-shield-backend",
+    providers: {
+      socketSessions: health.providers,
+      gemini: getGeminiHealth(),
+      openai: getOpenAIHealth()
+    }
+  });
+});
+
 app.get("/api/history/:sessionId", (req, res) => {
   res.json({
     history: getInterpreterSessionHistory(req.params.sessionId)
@@ -147,6 +187,9 @@ const connectDatabaseSafely = async () => {
   try {
     await connectDatabase(env);
   } catch (error) {
+    if (env.nodeEnv === "production") {
+      throw error;
+    }
     console.warn("MongoDB connection unavailable:", error?.message || error);
   }
 };

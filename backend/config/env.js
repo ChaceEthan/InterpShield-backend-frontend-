@@ -44,6 +44,11 @@ const readBoolean = (value, fallback = false) => {
   return ["1", "true", "yes", "on"].includes(normalized);
 };
 
+const readNodeEnv = (value) => {
+  const normalized = String(value || "development").trim().toLowerCase();
+  return ["development", "test", "production"].includes(normalized) ? normalized : "development";
+};
+
 const localClientOrigins = ["http://localhost:5173", "http://127.0.0.1:5173"];
 
 const normalizeOrigin = (origin = "") => {
@@ -92,6 +97,7 @@ const debugFlags = {
 export const debugEnabled = (name) => Boolean(debugFlags[name] || readBoolean(process.env.DEBUG));
 
 export const env = {
+  nodeEnv: readNodeEnv(process.env.NODE_ENV),
   port: readNumber(process.env.PORT, 10000),
   clientOrigins: readClientOrigins(process.env.CLIENT_URL, process.env.CORS_ORIGIN),
   allowVercelPreviewOrigins: process.env.ALLOW_VERCEL_PREVIEW_ORIGINS === "true",
@@ -103,9 +109,10 @@ export const env = {
   openaiApiKey: readSecret(process.env.OPENAI_API_KEY),
   hasJwtSecret: Boolean(readSecret(process.env.JWT_SECRET)),
   jwtSecret: readSecret(process.env.JWT_SECRET),
+  adminWebhookUrl: readSecret(process.env.ADMIN_WEBHOOK_URL),
   paths: projectPaths,
   runtimePathStatus,
-  maxSessionSeconds: clampNumber(readNumber(process.env.MAX_SESSION_SECONDS, 14400), 600, 28800),
+  maxSessionSeconds: clampNumber(readNumber(process.env.MAX_SESSION_SECONDS, 86400), 600, 86400),
   audioChunkMs: clampNumber(readNumber(process.env.AUDIO_CHUNK_MS, 700), 500, 800),
   debugFlags
 };
@@ -133,6 +140,7 @@ export const getPublicConfig = () => ({
 export const getConfigDiagnostics = () => {
   const errors = [];
   const warnings = [];
+  const isProduction = env.nodeEnv === "production";
 
   if (!env.clientOrigins.length) {
     errors.push("CLIENT_URL or CORS_ORIGIN must be configured.");
@@ -148,21 +156,36 @@ export const getConfigDiagnostics = () => {
     errors.push("PORT must be a positive number.");
   }
 
+  if (!process.env.NODE_ENV) warnings.push("NODE_ENV is not set; defaulting to development.");
+  if (process.env.NODE_ENV && env.nodeEnv !== String(process.env.NODE_ENV).trim().toLowerCase()) {
+    errors.push("NODE_ENV must be one of development, test, or production.");
+  }
+
   if (!env.jwtSecret) errors.push("JWT_SECRET is required.");
   if (!env.deepgramApiKey) errors.push("DEEPGRAM_API_KEY is required.");
   if (!env.geminiApiKey) errors.push("GEMINI_API_KEY is required.");
-  if (!env.openaiApiKey) warnings.push("OPENAI_API_KEY is missing. OpenAI fallback translation is disabled.");
-  if (!env.mongoUri) warnings.push("MONGO_URI is missing. Auth and saved history require MongoDB.");
-  if (!env.googleClientId) warnings.push("GOOGLE_CLIENT_ID is not configured on the backend; frontend Google ID token verification still works without audience locking.");
+  if (!env.openaiApiKey) {
+    const message = "OPENAI_API_KEY is required for production provider failover.";
+    if (isProduction) errors.push(message);
+    else warnings.push(`${message} OpenAI fallback translation is disabled locally.`);
+  }
+  if (!env.mongoUri) errors.push("MONGO_URI is required for auth and saved history.");
+  if (!env.googleClientId) errors.push("GOOGLE_CLIENT_ID is required so Google ID tokens are audience-checked.");
   if (!env.googleClientSecret) warnings.push("GOOGLE_CLIENT_SECRET is not used by the current backend Google ID-token flow.");
+  if (env.maxSessionSeconds < 86400) warnings.push(`MAX_SESSION_SECONDS is ${env.maxSessionSeconds}; production meetings should use 86400 for 24-hour sessions.`);
 
   return {
     ok: errors.length === 0,
     errors,
     warnings,
+    nodeEnv: env.nodeEnv,
+    port: env.port,
+    maxSessionSeconds: env.maxSessionSeconds,
+    audioChunkMs: env.audioChunkMs,
     clientOrigins: env.clientOrigins,
     allowVercelPreviewOrigins: env.allowVercelPreviewOrigins,
     allowLocalOrigins: env.clientOrigins.some((origin) => /localhost|127\.0\.0\.1/.test(origin)),
+    paths: env.runtimePathStatus,
     debugFlags: env.debugFlags
   };
 };

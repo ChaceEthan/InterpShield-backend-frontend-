@@ -10,10 +10,24 @@ import {
 } from "../../shared/languages.mjs";
 
 const GEMINI_TIMEOUT_MS = 25000;
+const GEMINI_MAX_ATTEMPTS = 3;
+const GEMINI_RETRY_BASE_MS = 600;
+const GEMINI_RETRY_MAX_MS = 5000;
 const SUPPORTED_LANGUAGE_LIST = supportedLanguageList();
 
 let client = null;
 let activeKey = null;
+const geminiHealth = {
+  status: "idle",
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  retryCount: 0,
+  lastSuccessAt: 0,
+  lastFailureAt: 0,
+  lastLatencyMs: 0,
+  lastError: ""
+};
 
 const normalizeForComparison = (value = "") =>
   value
@@ -23,6 +37,40 @@ const normalizeForComparison = (value = "") =>
     .replace(/[.!?]+$/g, "");
 
 const stripWrappedText = (value = "") => value.trim().replace(/^["'`]+|["'`]+$/g, "").trim();
+
+const delay = (ms) => new Promise((resolve) => {
+  const timer = setTimeout(resolve, ms);
+  timer.unref?.();
+});
+
+const retryDelay = (attempt) => Math.min(GEMINI_RETRY_MAX_MS, GEMINI_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
+
+const providerErrorMessage = (error = {}) => String(error?.message || error || "");
+
+const isNonRetryableGeminiError = (error = {}) =>
+  /\b(400|401|403|429)\b|rate[_ -]?limit|quota|billing|unauthori[sz]ed|forbidden|invalid api key|permission|resource_exhausted/i.test(
+    providerErrorMessage(error)
+  );
+
+const noteGeminiSuccess = (latencyMs) => {
+  geminiHealth.status = "healthy";
+  geminiHealth.successes += 1;
+  geminiHealth.lastSuccessAt = Date.now();
+  geminiHealth.lastLatencyMs = latencyMs;
+  geminiHealth.lastError = "";
+};
+
+const noteGeminiFailure = (error) => {
+  geminiHealth.status = "degraded";
+  geminiHealth.failures += 1;
+  geminiHealth.lastFailureAt = Date.now();
+  geminiHealth.lastError = providerErrorMessage(error);
+};
+
+export const getGeminiHealth = () => ({
+  ...geminiHealth,
+  healthy: geminiHealth.status === "healthy" || (geminiHealth.successes > 0 && geminiHealth.lastFailureAt < geminiHealth.lastSuccessAt)
+});
 
 const normalizedLanguageCode = (code = "") => String(code || "").trim().toLowerCase();
 const sanitizeTargetLanguageCode = (code = "") => {
@@ -212,32 +260,51 @@ export const translateWithGemini = async ({ apiKey, text, sourceLang, targetLang
     throw new Error("Gemini translation aborted");
   }
 
-  try {
-    const translatedText = await translateOnce({ 
-      apiKey, 
-      text: cleanText, 
-      sourceLang, 
-      targetLang, 
-      translationContext,
-      timeoutMs: GEMINI_TIMEOUT_MS,
-      signal
-    });
-    
-    if (signal?.aborted) {
-      throw new Error("Gemini translation aborted");
-    }
+  let lastError = null;
 
-    const echoedSource = normalizeForComparison(translatedText) === normalizeForComparison(cleanText);
+  for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt += 1) {
+    const startedAt = Date.now();
+    geminiHealth.status = attempt === 1 ? "requesting" : "retrying";
+    geminiHealth.attempts += 1;
 
-    if (translatedText && !echoedSource) {
+    try {
+      const translatedText = await translateOnce({
+        apiKey,
+        text: cleanText,
+        sourceLang,
+        targetLang,
+        translationContext,
+        timeoutMs: GEMINI_TIMEOUT_MS,
+        signal
+      });
+
+      if (signal?.aborted) {
+        throw new Error("Gemini translation aborted");
+      }
+
+      const echoedSource = normalizeForComparison(translatedText) === normalizeForComparison(cleanText);
+      if (!translatedText || echoedSource) {
+        throw new Error(echoedSource ? "Gemini echoed the source text" : "Gemini returned an empty translation");
+      }
+
+      noteGeminiSuccess(Date.now() - startedAt);
       return translatedText;
-    }
+    } catch (error) {
+      if (signal?.aborted || /aborted/i.test(error?.message || "")) {
+        throw new Error("Gemini translation aborted");
+      }
 
-    return "";
-  } catch (error) {
-    if (signal?.aborted || /aborted/i.test(error?.message || "")) {
-      throw new Error("Gemini translation aborted");
+      lastError = error;
+      noteGeminiFailure(error);
+
+      if (attempt >= GEMINI_MAX_ATTEMPTS || isNonRetryableGeminiError(error)) {
+        break;
+      }
+
+      geminiHealth.retryCount += 1;
+      await delay(retryDelay(attempt));
     }
-    throw error;
   }
+
+  throw lastError || new Error("Gemini translation failed");
 };

@@ -11,7 +11,22 @@ import {
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_TRANSLATION_MODEL = "gpt-4o-mini";
 const OPENAI_TIMEOUT_MS = 22000;
+const OPENAI_MAX_ATTEMPTS = 3;
+const OPENAI_RETRY_BASE_MS = 650;
+const OPENAI_RETRY_MAX_MS = 5000;
 const SUPPORTED_LANGUAGE_LIST = supportedLanguageList();
+
+const openAIHealth = {
+  status: "idle",
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  retryCount: 0,
+  lastSuccessAt: 0,
+  lastFailureAt: 0,
+  lastLatencyMs: 0,
+  lastError: ""
+};
 
 const mergeAbortSignals = (...signals) => {
   const activeSignals = signals.filter(Boolean);
@@ -40,6 +55,40 @@ const normalizeForComparison = (value = "") =>
     .replace(/[.!?]+$/g, "");
 
 const stripWrappedText = (value = "") => value.trim().replace(/^["'`]+|["'`]+$/g, "").trim();
+
+const delay = (ms) => new Promise((resolve) => {
+  const timer = setTimeout(resolve, ms);
+  timer.unref?.();
+});
+
+const retryDelay = (attempt) => Math.min(OPENAI_RETRY_MAX_MS, OPENAI_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
+
+const providerErrorMessage = (error = {}) => String(error?.message || error || "");
+
+const isNonRetryableOpenAIError = (error = {}) =>
+  /\b(400|401|403|429)\b|rate[_ -]?limit|quota|billing|unauthori[sz]ed|forbidden|invalid api key|permission|insufficient/i.test(
+    providerErrorMessage(error)
+  );
+
+const noteOpenAISuccess = (latencyMs) => {
+  openAIHealth.status = "healthy";
+  openAIHealth.successes += 1;
+  openAIHealth.lastSuccessAt = Date.now();
+  openAIHealth.lastLatencyMs = latencyMs;
+  openAIHealth.lastError = "";
+};
+
+const noteOpenAIFailure = (error) => {
+  openAIHealth.status = "degraded";
+  openAIHealth.failures += 1;
+  openAIHealth.lastFailureAt = Date.now();
+  openAIHealth.lastError = providerErrorMessage(error);
+};
+
+export const getOpenAIHealth = () => ({
+  ...openAIHealth,
+  healthy: openAIHealth.status === "healthy" || (openAIHealth.successes > 0 && openAIHealth.lastFailureAt < openAIHealth.lastSuccessAt)
+});
 
 const normalizedLanguageCode = (code = "") => String(code || "").trim().toLowerCase();
 const sanitizeTargetLanguageCode = (code = "") => {
@@ -159,67 +208,90 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
   const targetLanguage = describeLanguage(targetLang);
 
   const systemPrompt = buildSystemPrompt({ sourceLang, targetLang, translationContext });
+  let lastError = null;
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
-    
-    const mergedSignal = mergeAbortSignals(signal, controller.signal);
+  for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt += 1) {
+    const startedAt = Date.now();
+    openAIHealth.status = attempt === 1 ? "requesting" : "retrying";
+    openAIHealth.attempts += 1;
 
-    const response = await fetch(OPENAI_API_URL, {
-      method: "POST",
-      signal: mergedSignal,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: OPENAI_TRANSLATION_MODEL,
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt
-          },
-          {
-            role: "user",
-            content: `Text:\n${cleanText}`
-          }
-        ],
-        temperature: 0,
-        max_tokens: 512
-      })
-    }).finally(() => clearTimeout(timeout));
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      const message = errorData?.error?.message || errorData?.error || response.statusText || "OpenAI translation request failed";
-      throw new Error(`OpenAI ${response.status}: ${message}`);
+      const mergedSignal = mergeAbortSignals(signal, controller.signal);
+
+      const response = await fetch(OPENAI_API_URL, {
+        method: "POST",
+        signal: mergedSignal,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: OPENAI_TRANSLATION_MODEL,
+          messages: [
+            {
+              role: "system",
+              content: systemPrompt
+            },
+            {
+              role: "user",
+              content: `Text:\n${cleanText}`
+            }
+          ],
+          temperature: 0,
+          max_tokens: 512
+        })
+      }).finally(() => clearTimeout(timeout));
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        const message = errorData?.error?.message || errorData?.error || response.statusText || "OpenAI translation request failed";
+        throw new Error(`OpenAI ${response.status}: ${message}`);
+      }
+
+      const data = await response.json();
+
+      if (!data?.choices?.length) {
+        throw new Error(`OpenAI returned no translation choices for ${targetLanguage}`);
+      }
+
+      const messageContent = data.choices[0]?.message?.content || "";
+      const translatedText = normalizeTranslatedText({ text: messageContent, targetLang });
+
+      if (!translatedText) {
+        throw new Error(`OpenAI returned an empty translation for ${targetLanguage}`);
+      }
+
+      const echoedSource = normalizeForComparison(translatedText) === normalizeForComparison(cleanText);
+
+      if (signal?.aborted) {
+        throw new Error("OpenAI translation aborted");
+      }
+
+      if (echoedSource) {
+        throw new Error("OpenAI echoed the source text");
+      }
+
+      noteOpenAISuccess(Date.now() - startedAt);
+      return translatedText;
+    } catch (error) {
+      if (signal?.aborted || error?.name === "AbortError") {
+        throw new Error("OpenAI translation aborted");
+      }
+
+      lastError = error;
+      noteOpenAIFailure(error);
+
+      if (attempt >= OPENAI_MAX_ATTEMPTS || isNonRetryableOpenAIError(error)) {
+        break;
+      }
+
+      openAIHealth.retryCount += 1;
+      await delay(retryDelay(attempt));
     }
-
-    const data = await response.json();
-
-    if (!data?.choices?.length) {
-      throw new Error(`OpenAI returned no translation choices for ${targetLanguage}`);
-    }
-
-    const messageContent = data.choices[0]?.message?.content || "";
-    const translatedText = normalizeTranslatedText({ text: messageContent, targetLang });
-
-    if (!translatedText) {
-      throw new Error(`OpenAI returned an empty translation for ${targetLanguage}`);
-    }
-
-    const echoedSource = normalizeForComparison(translatedText) === normalizeForComparison(cleanText);
-    
-    if (signal?.aborted) {
-      throw new Error("OpenAI translation aborted");
-    }
-
-    return translatedText && !echoedSource ? translatedText : "";
-  } catch (error) {
-    if (signal?.aborted || error?.name === "AbortError") {
-      throw new Error("OpenAI translation aborted");
-    }
-    throw error;
   }
+
+  throw lastError || new Error("OpenAI translation failed");
 };
