@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import { io, type Socket } from "socket.io-client";
+import { API, CLIENT_URL, FRONTEND_CONFIG_DIAGNOSTICS, GOOGLE_CLIENT_ID, SOCKET_TRANSPORTS, SOCKET_URL } from "./config/socket";
 import { HeroSection } from "./components/HeroSection";
 import { LanguageSelector } from "./components/LanguageSelector";
 import { ModeTabs, type PrivacyMode } from "./components/ModeTabs";
@@ -230,10 +231,6 @@ declare global {
   }
 }
 
-const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
-const SOCKET_URL = (import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_WS_URL || import.meta.env.VITE_API_URL)?.replace(/\/$/, "");
-const CLIENT_URL = import.meta.env.VITE_CLIENT_URL?.replace(/\/$/, "") || window.location.origin;
-const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const TRANSCRIPT_HISTORY_STORAGE_KEY = "interp_history";
 const MAX_TRANSCRIPT_HISTORY_ENTRIES = 40;
 const MAX_TARGET_LANGUAGES = 3;
@@ -277,42 +274,7 @@ const logFrontendDebug = (flag: "audio" | "socket" | "translation" | "env", even
   console.info(`[${event}]`, payload);
 };
 
-const validateFrontendConfig = () => {
-  const errors: string[] = [];
-  const warnings: string[] = [];
-  const endpointEntries = [
-    ["VITE_API_URL", API],
-    ["VITE_SOCKET_URL/VITE_WS_URL", SOCKET_URL],
-    ["VITE_CLIENT_URL", CLIENT_URL]
-  ] as const;
-
-  for (const [name, value] of endpointEntries) {
-    if (!value) {
-      errors.push(`${name} is required.`);
-      continue;
-    }
-
-    try {
-      const parsed = new URL(value);
-      const local = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
-      const allowedProtocol = name.includes("SOCKET")
-        ? ["https:", "wss:", "http:", "ws:"].includes(parsed.protocol)
-        : ["https:", "http:"].includes(parsed.protocol);
-      if (!allowedProtocol) errors.push(`${name} has an unsupported protocol.`);
-      if (!local && ["http:", "ws:"].includes(parsed.protocol)) errors.push(`${name} must use HTTPS/WSS in production.`);
-    } catch {
-      errors.push(`${name} is malformed.`);
-    }
-  }
-
-  if (!GOOGLE_CLIENT_ID) warnings.push("VITE_GOOGLE_CLIENT_ID is missing; Google sign-in is disabled.");
-
-  const diagnostics = { ok: errors.length === 0, errors, warnings, apiUrl: API, socketUrl: SOCKET_URL, clientUrl: CLIENT_URL };
-  logFrontendDebug("env", "FRONTEND_ENV_DIAGNOSTICS", diagnostics);
-  return diagnostics;
-};
-
-const FRONTEND_CONFIG_DIAGNOSTICS = validateFrontendConfig();
+logFrontendDebug("env", "FRONTEND_ENV_DIAGNOSTICS", FRONTEND_CONFIG_DIAGNOSTICS);
 
 let googleIdentityScriptPromise: Promise<void> | null = null;
 let googleIdentityInitializedClientId = "";
@@ -2057,7 +2019,7 @@ export default function App() {
     }
 
     if (!SOCKET_URL) {
-      setAlert("Backend socket URL is missing. Set VITE_API_URL and restart the frontend.");
+      setAlert("Backend socket URL is missing. Set VITE_SOCKET_URL and restart the frontend.");
       return undefined;
     }
 
@@ -2094,7 +2056,7 @@ export default function App() {
 
     const socket = io(SOCKET_URL, {
       auth: { token },
-      transports: ["websocket", "polling"],
+      transports: [...SOCKET_TRANSPORTS],
       withCredentials: true,
       reconnection: true,
       reconnectionAttempts: Infinity,

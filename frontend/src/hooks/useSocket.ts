@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
+import { SOCKET_TRANSPORTS, SOCKET_URL } from '../config/socket';
 
 interface UseSocketOptions {
   url?: string;
@@ -24,7 +25,7 @@ interface SocketStatus {
  */
 export const useSocket = (options: UseSocketOptions = {}) => {
   const {
-    url = (import.meta.env.VITE_SOCKET_URL || import.meta.env.VITE_WS_URL || import.meta.env.VITE_API_URL)?.replace(/\/$/, ''),
+    url = SOCKET_URL,
     enabled = true,
     token,
     onConnect,
@@ -62,7 +63,7 @@ export const useSocket = (options: UseSocketOptions = {}) => {
 
     try {
       socketRef.current = io(url, {
-        transports: ['websocket', 'polling'],
+        transports: [...SOCKET_TRANSPORTS],
         reconnection: true,
         reconnectionAttempts: Infinity,
         reconnectionDelay: 1000,

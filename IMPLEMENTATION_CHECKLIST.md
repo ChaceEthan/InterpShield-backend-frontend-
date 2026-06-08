@@ -469,7 +469,9 @@
 ✅ TASK 5.1: Environment Variables
    
    Frontend (.env):
-   VITE_API_URL=https://your-backend-url.com
+   VITE_API_URL=https://interpshield-backend.onrender.com
+   VITE_SOCKET_URL=https://interpshield-backend.onrender.com
+   VITE_WS_URL=wss://interpshield-backend.onrender.com
    VITE_GOOGLE_CLIENT_ID=your-client-id (optional)
    
    Backend (.env):

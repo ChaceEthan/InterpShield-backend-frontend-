@@ -264,7 +264,7 @@ import { useAudioStream } from './hooks/useAudioStream';
 export default function Dashboard() {
   const auth = useAuth();
   const { socket, status, emit } = useSocket({
-    url: import.meta.env.VITE_API_URL,
+    url: import.meta.env.VITE_SOCKET_URL,
     token: auth.token,
   });
 

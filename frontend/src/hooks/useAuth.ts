@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
+import { API_URL } from '../config/socket';
 
 interface User {
   id: string;
@@ -22,7 +23,6 @@ interface AuthStatus {
 
 const TOKEN_STORAGE_KEY = 'interp_shield_token';
 const USER_STORAGE_KEY = 'interp_shield_user';
-const API_URL = import.meta.env.VITE_API_URL?.replace(/\/$/, '');
 
 /**
  * Auth hook with persistent token management and lazy loading

@@ -248,7 +248,9 @@ git push              # Auto-deploys on Vercel
 ### Environment Variables
 ```
 # Frontend
-VITE_API_URL=https://your-backend-url.com
+VITE_API_URL=https://interpshield-backend.onrender.com
+VITE_SOCKET_URL=https://interpshield-backend.onrender.com
+VITE_WS_URL=wss://interpshield-backend.onrender.com
 
 # Backend
 NODE_ENV=production

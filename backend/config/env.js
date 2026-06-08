@@ -49,7 +49,13 @@ const readNodeEnv = (value) => {
   return ["development", "test", "production"].includes(normalized) ? normalized : "development";
 };
 
+const nodeEnv = readNodeEnv(process.env.NODE_ENV);
+
 const localClientOrigins = ["http://localhost:5173", "http://127.0.0.1:5173"];
+const productionClientOrigins = [
+  "https://interp-shield-backend-frontend-fron.vercel.app",
+  "https://interpshield.vercel.app"
+];
 
 const normalizeOrigin = (origin = "") => {
   const trimmed = origin.trim();
@@ -73,7 +79,7 @@ const readClientOrigins = (...originValues) => {
   const allowLocalOrigins =
     process.env.ALLOW_LOCAL_ORIGINS === "true" ||
     (process.env.ALLOW_LOCAL_ORIGINS !== "false" && process.env.NODE_ENV !== "production");
-  const origins = [...(allowLocalOrigins ? localClientOrigins : []), ...configuredOrigins];
+  const origins = [...(allowLocalOrigins ? localClientOrigins : []), ...productionClientOrigins, ...configuredOrigins];
   return [...new Set(origins)];
 };
 
@@ -84,6 +90,11 @@ const requireHttpsOrigin = (origin = "") => {
   } catch {
     return false;
   }
+};
+
+const readMaxSessionSeconds = () => {
+  const configured = clampNumber(readNumber(process.env.MAX_SESSION_SECONDS, 86400), 600, 86400);
+  return nodeEnv === "production" ? 86400 : configured;
 };
 
 const debugFlags = {
@@ -97,7 +108,7 @@ const debugFlags = {
 export const debugEnabled = (name) => Boolean(debugFlags[name] || readBoolean(process.env.DEBUG));
 
 export const env = {
-  nodeEnv: readNodeEnv(process.env.NODE_ENV),
+  nodeEnv,
   port: readNumber(process.env.PORT, 10000),
   clientOrigins: readClientOrigins(process.env.CLIENT_URL, process.env.CORS_ORIGIN),
   allowVercelPreviewOrigins: process.env.ALLOW_VERCEL_PREVIEW_ORIGINS === "true",
@@ -112,7 +123,7 @@ export const env = {
   adminWebhookUrl: readSecret(process.env.ADMIN_WEBHOOK_URL),
   paths: projectPaths,
   runtimePathStatus,
-  maxSessionSeconds: clampNumber(readNumber(process.env.MAX_SESSION_SECONDS, 86400), 600, 86400),
+  maxSessionSeconds: readMaxSessionSeconds(),
   audioChunkMs: clampNumber(readNumber(process.env.AUDIO_CHUNK_MS, 700), 500, 800),
   debugFlags
 };
