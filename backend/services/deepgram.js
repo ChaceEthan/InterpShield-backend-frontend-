@@ -50,6 +50,7 @@ export const createDeepgramSession = ({
   let healthTimer = null;
   let reconnecting = false;
   let reconnectAttempt = 0;
+  let connectionGeneration = 0;
   const queuedAudio = [];
   const recentAudio = [];
   const maxQueuedChunks = MAX_QUEUED_CHUNKS;
@@ -226,6 +227,7 @@ export const createDeepgramSession = ({
     const deepgram = createClient(apiKey);
     stopped = false;
     clearKeepAlive();
+    clearHealthTimer();
     const options = {
       model: "nova-3",
       Authorization: `Token ${apiKey}`,
@@ -247,11 +249,17 @@ export const createDeepgramSession = ({
       // Ignore stale connection close errors during reconnect.
     }
 
+    const generation = connectionGeneration + 1;
+    connectionGeneration = generation;
     health.state = reconnect ? "reconnecting" : "connecting";
     updateQueueHealth();
     connection = await deepgram.listen.v1.connect(options);
+    const activeConnection = connection;
+    const isCurrentConnectionEvent = () => !stopped && generation === connectionGeneration && connection === activeConnection;
 
     connection.on("open", () => {
+      if (!isCurrentConnectionEvent()) return;
+      clearReconnect();
       isOpen = true;
       reconnectAttempt = 0;
       reconnecting = false;
@@ -271,6 +279,7 @@ export const createDeepgramSession = ({
     });
 
     connection.on("message", (message) => {
+      if (!isCurrentConnectionEvent()) return;
       health.lastMessageAt = Date.now();
       if (message?.type !== "Results") {
         return;
@@ -293,6 +302,7 @@ export const createDeepgramSession = ({
     });
 
     connection.on("error", (error) => {
+      if (!isCurrentConnectionEvent()) return;
       console.error("Deepgram error:", error);
       health.state = "error";
       health.lastError = error?.message || String(error);
@@ -302,6 +312,7 @@ export const createDeepgramSession = ({
     });
 
     connection.on("close", () => {
+      if (generation !== connectionGeneration || connection !== activeConnection) return;
       isOpen = false;
       health.state = stopped ? "closed" : "closed_unexpectedly";
       health.lastCloseAt = Date.now();
@@ -318,6 +329,7 @@ export const createDeepgramSession = ({
     try {
       await connection.waitForOpen();
     } catch (error) {
+      if (!isCurrentConnectionEvent()) return;
       console.warn("[DEEPGRAM_WAIT_FOR_OPEN_FAILED]", {
         reconnect,
         error: error?.message || String(error)
@@ -352,6 +364,7 @@ export const createDeepgramSession = ({
   const stop = () => {
     const wasOpen = isOpen;
     stopped = true;
+    connectionGeneration += 1;
     isOpen = false;
     health.state = "stopped";
     clearKeepAlive();

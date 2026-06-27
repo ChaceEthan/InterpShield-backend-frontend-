@@ -26,9 +26,7 @@ const isExpectedDrivePath = (value = "") => {
 
 export const getProjectPaths = () => {
   const root = resolveProjectRoot();
-  const driveRoot = resolveDriveRoot(root);
   const fromRoot = (...segments) => path.resolve(root, ...segments);
-  const fromDriveRoot = (...segments) => path.resolve(driveRoot, ...segments);
 
   return {
     root,
@@ -36,15 +34,15 @@ export const getProjectPaths = () => {
     frontendRoot: fromRoot("frontend"),
     nodeModules: fromRoot("node_modules"),
     cacheRoot: fromRoot(".cache"),
-    npmCache: fromDriveRoot("npm-cache"),
-    npmPrefix: fromDriveRoot("npm-prefix"),
-    npmTemp: fromDriveRoot("npm-temp"),
-    nodeGypCache: fromDriveRoot("node-gyp-cache"),
+    npmCache: fromRoot(".cache", "npm"),
+    npmPrefix: fromRoot(".cache", "npm-prefix"),
+    npmTemp: fromRoot(".cache", "npm-temp"),
+    nodeGypCache: fromRoot(".cache", "node-gyp"),
     nodeCache: fromRoot(".cache", "node"),
     viteCache: fromRoot(".cache", "vite"),
     browserProfile: fromRoot(".browser-profile"),
     logs: fromRoot("logs"),
-    npmLogs: fromDriveRoot("npm-cache", "_logs"),
+    npmLogs: fromRoot(".cache", "npm", "_logs"),
     uploads: fromRoot("uploads"),
     temp: fromRoot("temp"),
     npmTmp: fromRoot("temp", "npm"),

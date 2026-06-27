@@ -245,9 +245,10 @@ const MAX_SPOKEN_DUBBING_KEYS = 180;
 const DUBBING_UTTERANCE_TTL_MS = 45000;
 const MIN_MEDIA_CHUNK_BYTES = 96;
 const MIN_AUDIO_CHUNK_INTERVAL_MS = 45;
-const MAX_QUEUED_AUDIO_CHUNKS = 12;
+const MAX_QUEUED_AUDIO_CHUNKS = 240;
 const MAX_PENDING_FINAL_TRANSCRIPTS = 16;
 const CLIENT_HEARTBEAT_MS = 25000;
+const AUTH_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DUBBING_QUEUE_SETTLE_MS = 180;
 const STALE_TRANSLATION_STATE_MS = 45000;
 const SOCKET_HEARTBEAT_STALE_MS = 75000;
@@ -259,6 +260,25 @@ const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "hi
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
 
 const readViteBoolean = (value?: string) => ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
+const CLIENT_SESSION_STORAGE_KEY = "interp_shield_client_session_id";
+
+const createClientSessionId = () =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+
+const readOrCreateClientSessionId = () => {
+  try {
+    const existing = localStorage.getItem(CLIENT_SESSION_STORAGE_KEY);
+    if (existing) return existing;
+    const next = createClientSessionId();
+    localStorage.setItem(CLIENT_SESSION_STORAGE_KEY, next);
+    return next;
+  } catch {
+    return createClientSessionId();
+  }
+};
+
 const frontendDebugEnabled = (flag: "audio" | "socket" | "translation" | "env") => {
   const flags = {
     audio: import.meta.env.VITE_AUDIO_DEBUG,
@@ -1356,6 +1376,7 @@ export default function App() {
   const targetLang = targetLanguages[0] || DEFAULT_TARGET_LANGUAGES[0];
 
   const socketRef = useRef<Socket | null>(null);
+  const clientSessionIdRef = useRef(readOrCreateClientSessionId());
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const processedStreamRef = useRef<MediaStream | null>(null);
@@ -1366,6 +1387,7 @@ export default function App() {
   const targetLangRef = useRef(targetLang);
   const targetLanguagesRef = useRef(targetLanguages);
   const activeSessionPayloadRef = useRef<{
+    clientSessionId?: string;
     sourceLang: string;
     targetLang: string;
     targetLanguages: string[];
@@ -1387,6 +1409,7 @@ export default function App() {
   const sequenceRef = useRef(0);
   const lastAudioChunkSentAtRef = useRef(0);
   const queuedAudioChunksRef = useRef<AudioChunkPayload[]>([]);
+  const queuedAudioDroppedRef = useRef(0);
   const clientHeartbeatTimerRef = useRef<number | null>(null);
   const audioRecoveryTimerRef = useRef<number | null>(null);
   const audioRestartAttemptsRef = useRef(0);
@@ -1427,6 +1450,7 @@ export default function App() {
   const sessionSecondsRef = useRef(sessionSeconds);
   const sessionActionInFlightRef = useRef(false);
   const authRequestRef = useRef<AuthProvider | null>(null);
+  const socketAuthRefreshInFlightRef = useRef(false);
   const startSessionRef = useRef<(() => Promise<void>) | null>(null);
 
   const isAuthed = Boolean(user && token);
@@ -1483,6 +1507,18 @@ export default function App() {
   useEffect(() => {
     if (FRONTEND_CONFIG_DIAGNOSTICS.ok) return;
     setAlert(FRONTEND_CONFIG_DIAGNOSTICS.errors[0] || "Frontend environment configuration is invalid.");
+  }, []);
+
+  const updateSocketAuth = useCallback((nextToken = tokenRef.current) => {
+    const activeSocket = socketRef.current;
+    if (!activeSocket || !nextToken) return;
+
+    const existingAuth = typeof activeSocket.auth === "object" && activeSocket.auth !== null ? activeSocket.auth : {};
+    activeSocket.auth = {
+      ...existingAuth,
+      token: nextToken,
+      clientSessionId: clientSessionIdRef.current
+    };
   }, []);
 
   const stopDubbingPlayback = useCallback((clearQueue = true) => {
@@ -1630,9 +1666,17 @@ export default function App() {
       if (!activeToken) return;
 
       try {
-        const data = await requestApi<{ user: AppUser }>("/api/auth/me", {}, activeToken);
+        const data = await requestApi<{ user: AppUser; token?: string }>("/api/auth/me", {}, activeToken);
+        if (data.token) {
+          tokenRef.current = data.token;
+          setToken(data.token);
+          localStorage.setItem("interp_shield_token", data.token);
+          sessionStorage.removeItem("interp_shield_token");
+          updateSocketAuth(data.token);
+        }
         setUser(data.user);
         localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
+        sessionStorage.removeItem("interp_shield_user");
         applyUserSettings(data.user.settings);
       } catch {
         clearSessionStorage();
@@ -1641,7 +1685,7 @@ export default function App() {
         if (PROTECTED_VIEWS.has(view)) navigate("login");
       }
     },
-    [navigate, token, view]
+    [navigate, token, updateSocketAuth, view]
   );
 
   const updateSettings = async (settings: UserSettings) => {
@@ -1668,6 +1712,47 @@ export default function App() {
   useEffect(() => {
     if (token) void refreshMe(token);
   }, []);
+
+  useEffect(() => {
+    if (!isAuthed) return undefined;
+
+    const refreshAuthToken = async () => {
+      const activeToken = tokenRef.current;
+      if (!activeToken) return;
+
+      try {
+        const data = await requestApi<{ token: string; user: AppUser }>("/api/auth/refresh", { method: "POST" }, activeToken);
+        tokenRef.current = data.token;
+        setToken(data.token);
+        setUser(data.user);
+        localStorage.setItem("interp_shield_token", data.token);
+        localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
+        sessionStorage.removeItem("interp_shield_token");
+        sessionStorage.removeItem("interp_shield_user");
+        updateSocketAuth(data.token);
+      } catch {
+        if (recordingRef.current) {
+          setAlert("Your login session needs attention, but the live interpreter is still running.");
+          return;
+        }
+
+        clearSessionStorage();
+        setToken(null);
+        setUser(null);
+        if (PROTECTED_VIEWS.has(view)) navigate("login");
+      }
+    };
+
+    const timer = window.setInterval(() => {
+      void refreshAuthToken();
+    }, AUTH_REFRESH_INTERVAL_MS);
+    window.addEventListener("focus", refreshAuthToken);
+
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshAuthToken);
+    };
+  }, [isAuthed, navigate, updateSocketAuth, view]);
 
   useEffect(() => {
     if (PROTECTED_VIEWS.has(view) && !isAuthed) navigate("login");
@@ -1914,6 +1999,7 @@ export default function App() {
     pendingFinalTranscriptRef.current = null;
     pendingFinalTranscriptsRef.current.clear();
     queuedAudioChunksRef.current = [];
+    queuedAudioDroppedRef.current = 0;
     if (subtitleThrottleTimerRef.current) {
       window.clearTimeout(subtitleThrottleTimerRef.current);
       subtitleThrottleTimerRef.current = null;
@@ -1980,10 +2066,15 @@ export default function App() {
       return true;
     }
 
-    queuedAudioChunksRef.current = [...queuedAudioChunksRef.current, payload].slice(-MAX_QUEUED_AUDIO_CHUNKS);
+    const nextQueue = [...queuedAudioChunksRef.current, payload];
+    if (nextQueue.length > MAX_QUEUED_AUDIO_CHUNKS) {
+      queuedAudioDroppedRef.current += nextQueue.length - MAX_QUEUED_AUDIO_CHUNKS;
+    }
+    queuedAudioChunksRef.current = nextQueue.slice(-MAX_QUEUED_AUDIO_CHUNKS);
     logFrontendDebug("audio", "AUDIO_CHUNK_QUEUED", {
       sequence: payload.sequence,
-      queued: queuedAudioChunksRef.current.length
+      queued: queuedAudioChunksRef.current.length,
+      dropped: queuedAudioDroppedRef.current
     });
     return false;
   }, []);
@@ -2011,7 +2102,7 @@ export default function App() {
   }, [cleanupMedia, status]);
 
   useEffect(() => {
-    if (!token || !user) return undefined;
+    if (!isAuthed || !tokenRef.current) return undefined;
 
     if (!API) {
       setAlert("Backend API URL is missing. Set VITE_API_URL and restart the frontend.");
@@ -2048,14 +2139,24 @@ export default function App() {
           });
           setSocketReconnecting(true);
           shouldRestartSessionOnReconnectRef.current = true;
-          socketRef.current.disconnect();
-          socketRef.current.connect();
+          const activeSocket = socketRef.current;
+          updateSocketAuth();
+          const engine = activeSocket?.io.engine as { close?: () => void } | undefined;
+          if (engine?.close) {
+            engine.close();
+          } else {
+            activeSocket?.disconnect();
+            activeSocket?.connect();
+          }
         }
       }, CLIENT_HEARTBEAT_MS);
     };
 
     const socket = io(SOCKET_URL, {
-      auth: { token },
+      auth: {
+        token: tokenRef.current,
+        clientSessionId: clientSessionIdRef.current
+      },
       transports: [...SOCKET_TRANSPORTS],
       withCredentials: true,
       reconnection: true,
@@ -2116,9 +2217,30 @@ export default function App() {
       setSocketConnected(false);
       setSocketReconnecting(recordingRef.current);
       if (recordingRef.current) setAlert("Unable to reach the live interpreter.");
+      const authFailed = /auth|token|session|required|expired|unauthori[sz]ed/i.test(error?.message || "");
+      if (authFailed && tokenRef.current && !socketAuthRefreshInFlightRef.current) {
+        socketAuthRefreshInFlightRef.current = true;
+        void requestApi<{ token: string; user: AppUser }>("/api/auth/refresh", { method: "POST" }, tokenRef.current)
+          .then((data) => {
+            tokenRef.current = data.token;
+            setToken(data.token);
+            setUser(data.user);
+            localStorage.setItem("interp_shield_token", data.token);
+            localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
+            sessionStorage.removeItem("interp_shield_token");
+            sessionStorage.removeItem("interp_shield_user");
+            updateSocketAuth(data.token);
+            if (!socket.connected) socket.connect();
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            socketAuthRefreshInFlightRef.current = false;
+          });
+      }
     });
 
     const handleReconnectAttempt = () => {
+      updateSocketAuth();
       logFrontendDebug("socket", "SOCKET_RECONNECT_ATTEMPT", {});
       if (recordingRef.current) setSocketReconnecting(true);
     };
@@ -2470,11 +2592,11 @@ export default function App() {
       socket.io.off("reconnect_attempt", handleReconnectAttempt);
       socket.io.off("reconnect", handleReconnect);
       socket.io.off("reconnect_error", handleReconnectError);
-      socketRef.current = null;
+      if (socketRef.current === socket) socketRef.current = null;
       setSocketConnected(false);
       setSocketReconnecting(false);
     };
-  }, [token, user, stopDubbingPlayback, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript]);
+  }, [isAuthed, stopDubbingPlayback, updateSocketAuth, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript]);
 
   useEffect(() => {
     const reconnectSocket = () => {
@@ -2552,9 +2674,11 @@ export default function App() {
   }, [mode, finalTranslations, targetLanguages, playNextDubbingUtterance, stopDubbingPlayback]);
 
   const applyAuthSession = (session: { token: string; user: AppUser }) => {
+    tokenRef.current = session.token;
     setToken(session.token);
     setUser(session.user);
     saveSession(session.token, session.user);
+    updateSocketAuth(session.token);
     applyUserSettings(session.user.settings);
     setAuthError(null);
     navigate("dashboard");
@@ -2844,6 +2968,7 @@ export default function App() {
       const activeSourceLang = normalizeLanguageCode(sourceLang) || "en";
       const activeTargetLanguages = normalizeTargetLanguages(targetLanguages, targetLang);
       const sessionPayload = {
+        clientSessionId: clientSessionIdRef.current,
         sourceLang: activeSourceLang,
         targetLang: activeTargetLanguages[0],
         targetLanguages: activeTargetLanguages,

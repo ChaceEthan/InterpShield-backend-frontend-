@@ -1,6 +1,6 @@
 // @ts-nocheck
 import express from "express";
-import { getUserByToken, loginUser, loginWithGoogle, registerUser } from "../services/authService.js";
+import { getUserByToken, loginUser, loginWithGoogle, registerUser, signToken } from "../services/authService.js";
 
 const readBearerToken = (req) => {
   const header = req.get("authorization") || "";
@@ -70,7 +70,11 @@ export const createAuthRouter = (env) => {
   });
 
   router.get("/me", requireAuth(env), (req, res) => {
-    res.json({ user: req.user });
+    res.json({ user: req.user, token: signToken(req.user, env) });
+  });
+
+  router.post("/refresh", requireAuth(env), (req, res) => {
+    res.json({ user: req.user, token: signToken(req.user, env) });
   });
 
   router.post("/logout", (_req, res) => {

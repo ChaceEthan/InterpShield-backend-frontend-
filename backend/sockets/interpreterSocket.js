@@ -13,12 +13,16 @@ import {
 
 const MAX_TARGET_LANGUAGES = 3;
 const LOG_TEXT_PREVIEW_CHARS = 96;
+const DISCONNECTED_SESSION_GRACE_MS = 2 * 60 * 1000;
 const callRooms = new Map();
+const reconnectableSessions = new Map();
 const socketRuntime = {
   startedAt: Date.now(),
   connectedSockets: 0,
   totalConnections: 0,
   totalDisconnects: 0,
+  totalReconnects: 0,
+  totalReconnectFailures: 0,
   totalSessionsStarted: 0,
   totalSessionErrors: 0,
   totalAudioChunks: 0,
@@ -77,7 +81,10 @@ export const getInterpreterSocketHealth = () => {
       connectedSockets: socketRuntime.connectedSockets,
       totalConnections: socketRuntime.totalConnections,
       totalDisconnects: socketRuntime.totalDisconnects,
+      totalReconnects: socketRuntime.totalReconnects,
+      totalReconnectFailures: socketRuntime.totalReconnectFailures,
       activeSessions: sessions.length,
+      recoveringSessions: [...reconnectableSessions.values()].filter((record) => record.recovering).length,
       totalSessionsStarted: socketRuntime.totalSessionsStarted,
       totalSessionErrors: socketRuntime.totalSessionErrors,
       lastConnectionAt: socketRuntime.lastConnectionAt,
@@ -152,6 +159,12 @@ const normalizeTargetLanguages = (targetLanguages, fallbackTargetLang = "es") =>
   return fallback && fallback !== "auto" && SUPPORTED_LANGUAGE_CODES.has(fallback) ? [fallback] : ["en"];
 };
 
+const normalizeClientSessionId = (value = "") =>
+  String(value || "")
+    .trim()
+    .replace(/[^\w:.-]/g, "")
+    .slice(0, 160);
+
 const sanitizeTranslationResult = (result = {}) => {
   const targetLanguages = normalizeTargetLanguages(result.targetLanguages, result.targetLang || "es");
   const rawTranslations = result.translations && typeof result.translations === "object"
@@ -207,16 +220,22 @@ const sanitizeTranslationResult = (result = {}) => {
 
 export const registerInterpreterSocket = (io, env, getPublicConfig) => {
   io.on("connection", (socket) => {
+    const outputTarget = { socket };
     let session = null;
     let sessionTimer = null;
     let lastSequence = -1;
     let audioPipeline = null;
     let roomMetadata = null;
     let heartbeatTimer = null;
+    let disconnectCleanupTimer = null;
+    let clientSessionId = normalizeClientSessionId(socket.handshake.auth?.clientSessionId || socket.handshake.auth?.sessionId) || socket.id;
+    let authenticatedUserId = "";
 
     try {
       const token = socket.handshake.auth?.token;
-      verifyToken(token, env);
+      const authPayload = verifyToken(token, env);
+      authenticatedUserId = String(authPayload?.userId || "");
+      socket.data.userId = authenticatedUserId;
     } catch {
       socket.emit("session_error", { message: "Authentication required." });
       socket.emit("app-error", { message: "Authentication required." });
@@ -229,24 +248,50 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       heartbeatTimer = null;
     };
 
-    const stopSession = () => {
+    const clearDisconnectCleanupTimer = () => {
+      if (disconnectCleanupTimer) clearTimeout(disconnectCleanupTimer);
+      disconnectCleanupTimer = null;
+    };
+
+    const getActiveSocket = () => outputTarget.socket || socket;
+
+    const stopSession = (reason = "manual") => {
+      clearDisconnectCleanupTimer();
+      const activeSocket = getActiveSocket();
       const activeSession = socket.data.interpreterSession || session;
       activeSession?.stop?.();
       audioPipeline?.stop?.();
 
       if (roomMetadata?.roomId && roomMetadata?.participantId) {
         removeCallRoomParticipant(callRooms, roomMetadata.roomId, roomMetadata.participantId);
-        socket.leave(roomMetadata.roomId);
+        activeSocket.leave(roomMetadata.roomId);
       }
 
       session = null;
       audioPipeline = null;
       roomMetadata = null;
+      activeSocket.data.interpreterSession = null;
+      activeSocket.data.deepgramStream = null;
+      activeSocket.data.audioPipeline = null;
+      activeSocket.data.callRoom = null;
       socket.data.interpreterSession = null;
       socket.data.deepgramStream = null;
       socket.data.audioPipeline = null;
       socket.data.callRoom = null;
       socketRuntime.activeSessions.delete(socket.id);
+      socketRuntime.activeSessions.delete(activeSocket.id);
+      const reconnectRecord = reconnectableSessions.get(clientSessionId);
+      if (reconnectRecord?.socketId === socket.id || reconnectRecord?.socketId === activeSocket.id) {
+        if (reconnectRecord.sessionTimer && reconnectRecord.sessionTimer !== sessionTimer) {
+          clearTimeout(reconnectRecord.sessionTimer);
+        }
+        if (reconnectRecord.disconnectTimer && reconnectRecord.disconnectTimer !== disconnectCleanupTimer) {
+          clearTimeout(reconnectRecord.disconnectTimer);
+        }
+        reconnectableSessions.delete(clientSessionId);
+      }
+      activeSocket.data.sessionClosedReason = reason;
+      socket.data.sessionClosedReason = reason;
 
       if (sessionTimer) {
         clearTimeout(sessionTimer);
@@ -273,6 +318,38 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       return "Unable to start interpreter session.";
     };
 
+    const sessionConfigSignature = ({
+      sourceLang = "en",
+      targetLanguages = [],
+      shouldTranslate = true,
+      twoWay = false,
+      roomId = "",
+      participantId = ""
+    } = {}) =>
+      JSON.stringify({
+        sourceLang,
+        targetLanguages,
+        shouldTranslate,
+        twoWay,
+        roomId,
+        participantId
+      });
+
+    const startSessionLimitTimer = (startedAt = Date.now()) => {
+      if (sessionTimer) clearTimeout(sessionTimer);
+      const elapsedMs = Date.now() - startedAt;
+      const remainingMs = Math.max(1000, env.maxSessionSeconds * 1000 - elapsedMs);
+
+      sessionTimer = setTimeout(() => {
+        stopSession();
+        const activeSocket = getActiveSocket();
+        activeSocket.emit("warning", { message: "Session safety limit reached." });
+        activeSocket.emit("session:closed");
+      }, remainingMs);
+      sessionTimer.unref?.();
+      return sessionTimer;
+    };
+
     logSocketTranslationEvent("SOCKET_CONNECTED", { socketId: socket.id });
     socketRuntime.connectedSockets += 1;
     socketRuntime.totalConnections += 1;
@@ -282,8 +359,9 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
     const emitInterpreterResult = (result) => {
       const emitTranslationPayload = (payload) => {
+        const activeSocket = getActiveSocket();
         logSocketTranslationEvent("SOCKET_TRANSLATION_EMIT", {
-          socketId: socket.id,
+          socketId: activeSocket.id,
           sourceLang: payload.sourceLang,
           targetLanguages: payload.targetLanguages,
           provider: payload.provider,
@@ -298,13 +376,13 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         });
         socketRuntime.totalTranslationEvents += 1;
         socketRuntime.lastTranslationAt = new Date().toISOString();
-        const activeHealth = socketRuntime.activeSessions.get(socket.id);
+        const activeHealth = socketRuntime.activeSessions.get(activeSocket.id);
         if (activeHealth) {
           activeHealth.translationHealth = session?.getTranslationHealth?.() || activeHealth.translationHealth;
         }
-        socket.emit("translation_update", payload);
-        socket.emit("translation_result", payload);
-        socket.emit("translated_text", payload);
+        activeSocket.emit("translation_update", payload);
+        activeSocket.emit("translation_result", payload);
+        activeSocket.emit("translated_text", payload);
         const speechRoutes = audioPipeline?.queueTranslatedSpeech?.({
           original: payload.original,
           translations: payload.translations,
@@ -312,24 +390,25 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           targetLanguages: payload.targetLanguages
         });
         if (speechRoutes?.length) {
-          socket.data.translatedSpeechRoutes = speechRoutes;
+          activeSocket.data.translatedSpeechRoutes = speechRoutes;
         }
       };
 
       if (result?.type === "admin_stats") {
-        socket.emit("result", result);
+        getActiveSocket().emit("result", result);
         return;
       }
 
       if (!result?.isFinal) {
-        socket.emit("transcript_partial", {
+        const activeSocket = getActiveSocket();
+        activeSocket.emit("transcript_partial", {
           text: result.originalText,
           sourceLang: result.sourceLang,
           targetLang: result.targetLang,
           targetLanguages: result.targetLanguages || [result.targetLang],
           detectedLanguage: result.detectedLanguage
         });
-        socket.emit("result", result);
+        activeSocket.emit("result", result);
         return;
       }
 
@@ -363,11 +442,12 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           });
         }
 
-        socket.emit("result", safe.result);
+        getActiveSocket().emit("result", safe.result);
         return;
       }
 
-      socket.emit("transcript_final", {
+      const activeSocket = getActiveSocket();
+      activeSocket.emit("transcript_final", {
         text: result.originalText,
         sessionId: result.sessionId,
         jobId: result.jobId,
@@ -381,7 +461,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       });
 
       if (result.isTranscriptOnly) {
-        socket.emit("result", result);
+        activeSocket.emit("result", result);
         return;
       }
 
@@ -412,11 +492,16 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         });
       }
 
-      socket.emit("result", safe.result);
+      activeSocket.emit("result", safe.result);
     };
 
     const handleStartSession = async (payload = {}, ack) => {
-      stopSession();
+      const requestedClientSessionId =
+        normalizeClientSessionId(payload.clientSessionId || socket.handshake.auth?.clientSessionId || socket.handshake.auth?.sessionId) ||
+        clientSessionId ||
+        socket.id;
+      clientSessionId = requestedClientSessionId;
+      socket.data.clientSessionId = clientSessionId;
 
       const sourceLang = normalizeSocketLanguageCode(payload.sourceLang || "en") || "en";
       const targetLanguages = normalizeTargetLanguages(payload.targetLanguages, payload.targetLang || "es");
@@ -425,6 +510,114 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       const twoWay = Boolean(payload.twoWay);
       const roomId = String(payload.roomId || payload.callRoomId || "").trim();
       const participantId = String(payload.participantId || socket.id).trim();
+      const configSignature = sessionConfigSignature({
+        sourceLang,
+        targetLanguages,
+        shouldTranslate,
+        twoWay,
+        roomId,
+        participantId
+      });
+      const existingSessionRecord = reconnectableSessions.get(clientSessionId);
+      const canResumeExistingSession =
+        existingSessionRecord &&
+        existingSessionRecord.socketId !== socket.id &&
+        existingSessionRecord.userId === authenticatedUserId &&
+        existingSessionRecord.recovering &&
+        existingSessionRecord.session &&
+        existingSessionRecord.audioPipeline &&
+        existingSessionRecord.configSignature === configSignature;
+
+      if (canResumeExistingSession) {
+        const oldSocketId = existingSessionRecord.socketId;
+        clearTimeout(existingSessionRecord.disconnectTimer);
+        if (existingSessionRecord.sessionTimer) clearTimeout(existingSessionRecord.sessionTimer);
+        existingSessionRecord.outputTarget.socket = socket;
+        outputTarget.socket = socket;
+        session = existingSessionRecord.session;
+        audioPipeline = existingSessionRecord.audioPipeline;
+        roomMetadata = existingSessionRecord.roomMetadata || (roomId
+          ? {
+              roomId,
+              participantId,
+              sourceLang,
+              targetLanguages
+            }
+          : null);
+        lastSequence = Number.isFinite(existingSessionRecord.lastSequence) ? existingSessionRecord.lastSequence : -1;
+        socket.data.interpreterSession = session;
+        socket.data.deepgramStream = session;
+        socket.data.audioPipeline = audioPipeline.getSnapshot?.() || null;
+        socket.data.clientSessionId = clientSessionId;
+
+        let callRoomInfo = null;
+        if (roomMetadata?.roomId) {
+          socket.join(roomMetadata.roomId);
+          const callRoom = upsertCallRoomParticipant(callRooms, {
+            roomId: roomMetadata.roomId,
+            participantId: roomMetadata.participantId,
+            socketId: socket.id,
+            sourceLang,
+            targetLanguages
+          });
+          socket.data.callRoom = {
+            id: callRoom?.id,
+            participantCount: callRoom?.participants?.size || 1
+          };
+          callRoomInfo = {
+            id: callRoom?.id,
+            participantId: roomMetadata.participantId,
+            participantCount: callRoom?.participants?.size || 1
+          };
+        }
+
+        const resumedSessionTimer = startSessionLimitTimer(existingSessionRecord.startedAt);
+        existingSessionRecord.socketId = socket.id;
+        existingSessionRecord.recovering = false;
+        existingSessionRecord.disconnectTimer = null;
+        existingSessionRecord.stopSession = stopSession;
+        existingSessionRecord.sessionTimer = resumedSessionTimer;
+        existingSessionRecord.roomMetadata = roomMetadata;
+        existingSessionRecord.lastSequence = lastSequence;
+
+        socketRuntime.activeSessions.delete(oldSocketId);
+        socketRuntime.activeSessions.set(socket.id, {
+          socketId: socket.id,
+          clientSessionId,
+          userId: authenticatedUserId,
+          connected: socket.connected,
+          recovering: false,
+          sessionId: session.sessionId,
+          roomId,
+          participantId,
+          sourceLang,
+          targetLanguages,
+          startedAt: new Date(existingSessionRecord.startedAt).toISOString(),
+          audio: socket.data.audioPipeline,
+          translationHealth: session.getTranslationHealth?.() || null,
+          getTranslationHealth: session.getTranslationHealth
+        });
+        socketRuntime.totalReconnects += 1;
+        socket.emit("session_ready");
+        socket.emit("session:ready");
+        ack?.({ ok: true, mode: "production", sessionId: session.sessionId, targetLanguages, room: callRoomInfo, recovered: true });
+        logSocketTranslationEvent("SOCKET_SESSION_RESUMED", {
+          socketId: socket.id,
+          oldSocketId,
+          sessionId: session.sessionId,
+          sourceLang,
+          targetLanguages
+        });
+        return;
+      }
+
+      stopSession("session_restart");
+      const replacedSessionRecord = reconnectableSessions.get(clientSessionId);
+      if (replacedSessionRecord && replacedSessionRecord.socketId !== socket.id) {
+        clearTimeout(replacedSessionRecord.disconnectTimer);
+        if (replacedSessionRecord.sessionTimer) clearTimeout(replacedSessionRecord.sessionTimer);
+        replacedSessionRecord.stopSession?.("replaced_by_new_session");
+      }
       lastSequence = -1;
 
       try {
@@ -443,19 +636,21 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           shouldTranslate,
           twoWay,
           onReady: () => {
-            socket.emit("session_ready");
-            socket.emit("session:ready");
+            const activeSocket = getActiveSocket();
+            activeSocket.emit("session_ready");
+            activeSocket.emit("session:ready");
           },
-          onWarning: (message) => socket.emit("warning", { message }),
+          onWarning: (message) => getActiveSocket().emit("warning", { message }),
           onError: (message) => {
-            logSocketTranslationEvent("SOCKET_PROVIDER_WARNING", { socketId: socket.id, message }, "warn");
-            socket.emit("warning", { message });
+            const activeSocket = getActiveSocket();
+            logSocketTranslationEvent("SOCKET_PROVIDER_WARNING", { socketId: activeSocket.id, message }, "warn");
+            activeSocket.emit("warning", { message });
           },
           onProviderHealth: (health) => {
             socketRuntime.providers = health || {};
-            socket.emit("provider_health", health);
+            getActiveSocket().emit("provider_health", health);
           },
-          onClosed: () => socket.emit("warning", { message: "Provider stream closed; reconnecting if session is active." }),
+          onClosed: () => getActiveSocket().emit("warning", { message: "Provider stream closed; reconnecting if session is active." }),
           onResult: emitInterpreterResult
         });
         socket.data.interpreterSession = session;
@@ -500,25 +695,41 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         });
         socket.data.audioPipeline = audioPipeline.getSnapshot();
         socketRuntime.totalSessionsStarted += 1;
+        const startedAt = Date.now();
+        const activeSessionTimer = startSessionLimitTimer(startedAt);
+        reconnectableSessions.set(clientSessionId, {
+          clientSessionId,
+          userId: authenticatedUserId,
+          socketId: socket.id,
+          session,
+          sessionId: session.sessionId,
+          audioPipeline,
+          roomMetadata,
+          outputTarget,
+          configSignature,
+          lastSequence,
+          startedAt,
+          recovering: false,
+          disconnectTimer: null,
+          sessionTimer: activeSessionTimer,
+          stopSession
+        });
         socketRuntime.activeSessions.set(socket.id, {
           socketId: socket.id,
+          clientSessionId,
+          userId: authenticatedUserId,
+          connected: socket.connected,
+          recovering: false,
           sessionId: session.sessionId,
           roomId,
           participantId,
           sourceLang,
           targetLanguages,
-          startedAt: new Date().toISOString(),
+          startedAt: new Date(startedAt).toISOString(),
           audio: socket.data.audioPipeline,
           translationHealth: session.getTranslationHealth?.() || null,
           getTranslationHealth: session.getTranslationHealth
         });
-
-        sessionTimer = setTimeout(() => {
-          stopSession();
-          socket.emit("warning", { message: "Session safety limit reached." });
-          socket.emit("session:closed");
-        }, env.maxSessionSeconds * 1000);
-        sessionTimer.unref?.();
 
         ack?.({ ok: true, mode: "production", sessionId: session.sessionId, targetLanguages, room: callRoomInfo });
         logSocketTranslationEvent("SOCKET_SESSION_STARTED", {
@@ -595,6 +806,38 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       socket.emit("session:closed");
     };
 
+    const scheduleDisconnectedSessionCleanup = (reason) => {
+      if (!session) return;
+
+      const activeHealth = socketRuntime.activeSessions.get(socket.id);
+      if (activeHealth) {
+        activeHealth.connected = false;
+        activeHealth.recovering = true;
+        activeHealth.disconnectedAt = new Date().toISOString();
+        activeHealth.disconnectReason = reason;
+        activeHealth.audio = socket.data.audioPipeline;
+        activeHealth.translationHealth = session.getTranslationHealth?.() || activeHealth.translationHealth;
+      }
+
+      const reconnectRecord = reconnectableSessions.get(clientSessionId);
+      if (!reconnectRecord || reconnectRecord.socketId !== socket.id) {
+        stopSession("stale_disconnect");
+        return;
+      }
+
+      reconnectRecord.recovering = true;
+      reconnectRecord.disconnectedAt = Date.now();
+      reconnectRecord.disconnectReason = reason;
+      reconnectRecord.disconnectTimer = setTimeout(() => {
+        const currentRecord = reconnectableSessions.get(clientSessionId);
+        if (currentRecord?.socketId !== socket.id) return;
+        socketRuntime.totalReconnectFailures += 1;
+        stopSession("disconnect_grace_elapsed");
+      }, DISCONNECTED_SESSION_GRACE_MS);
+      disconnectCleanupTimer = reconnectRecord.disconnectTimer;
+      disconnectCleanupTimer.unref?.();
+    };
+
     socket.on("start_session", handleStartSession);
     socket.on("session:start", handleStartSession);
     socket.on("session:pong", () => {
@@ -621,9 +864,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       socketRuntime.connectedSockets = Math.max(0, socketRuntime.connectedSockets - 1);
       socketRuntime.totalDisconnects += 1;
       socketRuntime.lastDisconnectAt = new Date().toISOString();
-      socketRuntime.activeSessions.delete(socket.id);
       stopHeartbeat();
-      stopSession();
+      scheduleDisconnectedSessionCleanup(reason);
     });
   });
 };

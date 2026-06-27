@@ -55,7 +55,7 @@ export const safeUser = (user) => ({
 export const signToken = (user, env) => {
   requireJwtSecret(env);
 
-  return jwt.sign({ userId: toId(user) }, env.jwtSecret, { expiresIn: "7d" });
+  return jwt.sign({ userId: toId(user) }, env.jwtSecret, { expiresIn: "30d" });
 };
 
 export const verifyToken = (token, env) => {
@@ -200,4 +200,9 @@ export const getUserByToken = async (token, env) => {
   }
 
   return safeUser(user);
+};
+
+export const refreshSessionByToken = async (token, env) => {
+  const user = await getUserByToken(token, env);
+  return createSession(user, env);
 };

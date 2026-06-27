@@ -30,21 +30,29 @@ const openAIHealth = {
 
 const mergeAbortSignals = (...signals) => {
   const activeSignals = signals.filter(Boolean);
-  if (activeSignals.length === 0) return undefined;
-  if (activeSignals.length === 1) return activeSignals[0];
+  if (activeSignals.length === 0) return { signal: undefined, cleanup: () => undefined };
+  if (activeSignals.length === 1) return { signal: activeSignals[0], cleanup: () => undefined };
 
   const controller = new AbortController();
   const abort = () => controller.abort();
+  const cleanupCallbacks = [];
 
   for (const signal of activeSignals) {
     if (signal.aborted) {
       controller.abort();
-      return controller.signal;
+      for (const cleanup of cleanupCallbacks) cleanup();
+      return { signal: controller.signal, cleanup: () => undefined };
     }
     signal.addEventListener?.("abort", abort, { once: true });
+    cleanupCallbacks.push(() => signal.removeEventListener?.("abort", abort));
   }
 
-  return controller.signal;
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      for (const cleanup of cleanupCallbacks) cleanup();
+    }
+  };
 };
 
 const normalizeForComparison = (value = "") =>
@@ -223,7 +231,7 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
 
       const response = await fetch(OPENAI_API_URL, {
         method: "POST",
-        signal: mergedSignal,
+        signal: mergedSignal.signal,
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json"
@@ -243,7 +251,10 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
           temperature: 0,
           max_tokens: 512
         })
-      }).finally(() => clearTimeout(timeout));
+      }).finally(() => {
+        clearTimeout(timeout);
+        mergedSignal.cleanup();
+      });
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));

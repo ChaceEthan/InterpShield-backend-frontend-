@@ -1,4 +1,5 @@
 const trimTrailingSlash = (value = "") => String(value || "").trim().replace(/\/+$/, "");
+const socketIoPathPattern = /\/socket\.io\/?$/i;
 
 const rawFrontendEnv = {
   API_URL: trimTrailingSlash(import.meta.env.VITE_API_URL),
@@ -23,6 +24,13 @@ const isDisallowedPlaceholder = (value: string, parsed?: URL) =>
   (parsed ? disallowedHostPatterns.some((pattern) => pattern.test(parsed.hostname)) : false);
 
 const isLocalHost = (parsed: URL) => localHostPatterns.some((pattern) => pattern.test(parsed.hostname));
+
+const stripSocketIoPath = (parsed: URL) => {
+  parsed.pathname = parsed.pathname.replace(socketIoPathPattern, "") || "/";
+  parsed.search = "";
+  parsed.hash = "";
+  return parsed;
+};
 
 const validateUrl = ({
   name,
@@ -64,10 +72,23 @@ const validateUrl = ({
 };
 
 export const toWebSocketUrl = (socketUrl: string) => {
-  const parsed = new URL(socketUrl);
+  const parsed = stripSocketIoPath(new URL(socketUrl));
   if (parsed.protocol === "https:") parsed.protocol = "wss:";
   else if (parsed.protocol === "http:") parsed.protocol = "ws:";
+  else if (parsed.protocol === "wss:" || parsed.protocol === "ws:") {
+    // Already a websocket URL; keep it after normalizing any Socket.IO path suffix.
+  }
   else if (!["ws:", "wss:"].includes(parsed.protocol)) {
+    throw new Error(`Unsupported socket protocol: ${parsed.protocol}`);
+  }
+  return trimTrailingSlash(parsed.toString());
+};
+
+export const toSocketHttpUrl = (socketUrl: string) => {
+  const parsed = stripSocketIoPath(new URL(socketUrl));
+  if (parsed.protocol === "wss:") parsed.protocol = "https:";
+  else if (parsed.protocol === "ws:") parsed.protocol = "http:";
+  else if (!["https:", "http:"].includes(parsed.protocol)) {
     throw new Error(`Unsupported socket protocol: ${parsed.protocol}`);
   }
   return trimTrailingSlash(parsed.toString());
@@ -88,7 +109,7 @@ const validateFrontendEnvironment = () => {
   const socketUrl = validateUrl({
     name: "VITE_SOCKET_URL",
     value: rawFrontendEnv.SOCKET_URL,
-    protocols: ["https:", "http:"],
+    protocols: ["https:", "http:", "wss:", "ws:"],
     errors,
     warnings
   });
@@ -109,11 +130,14 @@ const validateFrontendEnvironment = () => {
     warnings
   });
 
+  let normalizedSocketUrl = "";
   let derivedWsUrl = "";
   if (socketUrl) {
     try {
+      normalizedSocketUrl = toSocketHttpUrl(rawFrontendEnv.SOCKET_URL);
       derivedWsUrl = toWebSocketUrl(rawFrontendEnv.SOCKET_URL);
-      if (wsUrl && trimTrailingSlash(wsUrl.toString()) !== derivedWsUrl) {
+      const normalizedWsUrl = wsUrl ? toWebSocketUrl(rawFrontendEnv.WS_URL) : "";
+      if (normalizedWsUrl && normalizedWsUrl !== derivedWsUrl) {
         errors.push("VITE_WS_URL must match VITE_SOCKET_URL after HTTPS-to-WSS conversion.");
       }
     } catch (error) {
@@ -130,7 +154,7 @@ const validateFrontendEnvironment = () => {
     errors,
     warnings,
     apiUrl: rawFrontendEnv.API_URL,
-    socketUrl: rawFrontendEnv.SOCKET_URL,
+    socketUrl: normalizedSocketUrl || rawFrontendEnv.SOCKET_URL,
     wsUrl: rawFrontendEnv.WS_URL,
     derivedWsUrl,
     clientUrl: rawFrontendEnv.CLIENT_URL,
@@ -157,7 +181,7 @@ const validateFrontendEnvironment = () => {
 export const FRONTEND_CONFIG_DIAGNOSTICS = validateFrontendEnvironment();
 export const API = rawFrontendEnv.API_URL;
 export const API_URL = rawFrontendEnv.API_URL;
-export const SOCKET_URL = rawFrontendEnv.SOCKET_URL;
+export const SOCKET_URL = FRONTEND_CONFIG_DIAGNOSTICS.socketUrl;
 export const SOCKET_WEBSOCKET_URL = FRONTEND_CONFIG_DIAGNOSTICS.derivedWsUrl;
 export const WS_URL = rawFrontendEnv.WS_URL;
 export const CLIENT_URL = rawFrontendEnv.CLIENT_URL;

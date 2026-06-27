@@ -16,19 +16,27 @@ const placeholderValues = new Set([
   "",
   "null",
   "undefined",
+  "your-secret",
+  "your_secret",
+  "your-client-id",
+  "your_client_id",
   "your_deepgram_api_key",
+  "your_deepgram_key",
   "your_gemini_api_key",
+  "your_gemini_key",
   "your_openai_key",
+  "your_openai_api_key",
   "your_mongo_uri",
   "YOUR_DEEPGRAM_API_KEY_HERE",
   "YOUR_GEMINI_API_KEY_HERE",
   "YOUR_OPENAI_API_KEY_HERE"
 ]);
+const placeholderPattern = /\b(your[-_ ]?|replace[-_ ]?me|example|placeholder)\b/i;
 
 const readSecret = (value) => {
   const trimmed = value?.trim() || "";
   const unquoted = trimmed.match(/^(['"])(.*)\1$/)?.[2] || trimmed;
-  return placeholderValues.has(unquoted) ? "" : unquoted;
+  return placeholderValues.has(unquoted) || placeholderPattern.test(unquoted) ? "" : unquoted;
 };
 
 const readNumber = (value, fallback) => {
@@ -52,10 +60,6 @@ const readNodeEnv = (value) => {
 const nodeEnv = readNodeEnv(process.env.NODE_ENV);
 
 const localClientOrigins = ["http://localhost:5173", "http://127.0.0.1:5173"];
-const productionClientOrigins = [
-  "https://interp-shield-backend-frontend-fron.vercel.app",
-  "https://interpshield.vercel.app"
-];
 
 const normalizeOrigin = (origin = "") => {
   const trimmed = origin.trim();
@@ -79,7 +83,7 @@ const readClientOrigins = (...originValues) => {
   const allowLocalOrigins =
     process.env.ALLOW_LOCAL_ORIGINS === "true" ||
     (process.env.ALLOW_LOCAL_ORIGINS !== "false" && process.env.NODE_ENV !== "production");
-  const origins = [...(allowLocalOrigins ? localClientOrigins : []), ...productionClientOrigins, ...configuredOrigins];
+  const origins = [...(allowLocalOrigins ? localClientOrigins : []), ...configuredOrigins];
   return [...new Set(origins)];
 };
 

@@ -256,7 +256,7 @@ VITE_WS_URL=wss://interpshield-backend.onrender.com
 NODE_ENV=production
 MONGO_URI=your-mongodb-url
 DEEPGRAM_API_KEY=your-api-key
-JWT_SECRET=your-secret
+JWT_SECRET=
 CLIENT_ORIGINS=https://your-frontend-url.com
 ```
 
