@@ -7,13 +7,22 @@ import {
   providerLanguageCode,
   supportedLanguageList
 } from "../../shared/languages.mjs";
+import {
+  delay,
+  getRetryDelay,
+  isNonRetryableProviderError,
+  mergeAbortSignals,
+  normalizeForComparison,
+  normalizeProviderText,
+  providerErrorMessage
+} from "./providerUtils.js";
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_TRANSLATION_MODEL = "gpt-4o-mini";
 const OPENAI_TIMEOUT_MS = 22000;
 const OPENAI_MAX_ATTEMPTS = 3;
-const OPENAI_RETRY_BASE_MS = 650;
-const OPENAI_RETRY_MAX_MS = 5000;
+const OPENAI_RETRY_BASE_MS = 1000;
+const OPENAI_RETRY_MAX_MS = 4000;
 const SUPPORTED_LANGUAGE_LIST = supportedLanguageList();
 
 const openAIHealth = {
@@ -28,55 +37,8 @@ const openAIHealth = {
   lastError: ""
 };
 
-const mergeAbortSignals = (...signals) => {
-  const activeSignals = signals.filter(Boolean);
-  if (activeSignals.length === 0) return { signal: undefined, cleanup: () => undefined };
-  if (activeSignals.length === 1) return { signal: activeSignals[0], cleanup: () => undefined };
 
-  const controller = new AbortController();
-  const abort = () => controller.abort();
-  const cleanupCallbacks = [];
-
-  for (const signal of activeSignals) {
-    if (signal.aborted) {
-      controller.abort();
-      for (const cleanup of cleanupCallbacks) cleanup();
-      return { signal: controller.signal, cleanup: () => undefined };
-    }
-    signal.addEventListener?.("abort", abort, { once: true });
-    cleanupCallbacks.push(() => signal.removeEventListener?.("abort", abort));
-  }
-
-  return {
-    signal: controller.signal,
-    cleanup: () => {
-      for (const cleanup of cleanupCallbacks) cleanup();
-    }
-  };
-};
-
-const normalizeForComparison = (value = "") =>
-  value
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[.!?]+$/g, "");
-
-const stripWrappedText = (value = "") => value.trim().replace(/^["'`]+|["'`]+$/g, "").trim();
-
-const delay = (ms) => new Promise((resolve) => {
-  const timer = setTimeout(resolve, ms);
-  timer.unref?.();
-});
-
-const retryDelay = (attempt) => Math.min(OPENAI_RETRY_MAX_MS, OPENAI_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
-
-const providerErrorMessage = (error = {}) => String(error?.message || error || "");
-
-const isNonRetryableOpenAIError = (error = {}) =>
-  /\b(400|401|403|429)\b|rate[_ -]?limit|quota|billing|unauthori[sz]ed|forbidden|invalid api key|permission|insufficient/i.test(
-    providerErrorMessage(error)
-  );
+const stripWrappedText = (value = "") => normalizeProviderText(value);
 
 const noteOpenAISuccess = (latencyMs) => {
   openAIHealth.status = "healthy";
@@ -295,12 +257,12 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
       lastError = error;
       noteOpenAIFailure(error);
 
-      if (attempt >= OPENAI_MAX_ATTEMPTS || isNonRetryableOpenAIError(error)) {
+      if (attempt >= OPENAI_MAX_ATTEMPTS || isNonRetryableProviderError(error, [400, 401, 403, 404], ["quota", "billing", "unauthori[sz]ed", "forbidden", "invalid api key", "permission", "insufficient"])) {
         break;
       }
 
       openAIHealth.retryCount += 1;
-      await delay(retryDelay(attempt));
+      await delay(getRetryDelay({ attempt, baseMs: OPENAI_RETRY_BASE_MS, maxMs: OPENAI_RETRY_MAX_MS }));
     }
   }
 

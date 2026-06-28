@@ -10,6 +10,7 @@ import {
   SUPPORTED_LANGUAGE_CODES,
   normalizeLanguageCode
 } from "../../shared/languages.mjs";
+import { isNonRetryableProviderError, mergeAbortSignals, normalizeProviderText } from "../services/providerUtils.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const interpreterSource = readFileSync(resolve(__dirname, "../services/interpreter.js"), "utf8");
@@ -60,6 +61,13 @@ for (const requiredLanguage of ["en", "es", "fr", "de", "it", "pt", "nl", "ar", 
 }
 assert.equal(catalogCodes.length, new Set(catalogCodes).size, "language catalog codes should be unique");
 assert.equal(normalizeLanguageCode("luganda"), "lg");
+assert.equal(normalizeProviderText('  "Hola mundo"  '), "Hola mundo");
+assert.equal(isNonRetryableProviderError({ status: 401, message: "unauthorized" }), true);
+assert.equal(isNonRetryableProviderError({ message: "temporary network issue" }), false);
+const controller = new AbortController();
+const mergedSignal = mergeAbortSignals(controller.signal);
+controller.abort();
+assert.equal(mergedSignal.signal.aborted, true);
 assert.match(interpreterSource, /shared\/languages\.mjs/);
 assert.match(socketSource, /shared\/languages\.mjs/);
 assert.match(frontendSource, /LANGUAGE_CATALOG/);

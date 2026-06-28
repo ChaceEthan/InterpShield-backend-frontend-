@@ -1413,6 +1413,7 @@ export default function App() {
   const clientHeartbeatTimerRef = useRef<number | null>(null);
   const audioRecoveryTimerRef = useRef<number | null>(null);
   const audioRestartAttemptsRef = useRef(0);
+  const silenceTimerRef = useRef<number | null>(null);
   const lastServerHeartbeatAtRef = useRef(0);
   const sessionStartedAtRef = useRef<number | null>(null);
   const lastInterimRef = useRef("");
@@ -1966,6 +1967,29 @@ export default function App() {
     [flushPendingPartialTranscript]
   );
 
+  const stopSilenceMonitor = useCallback(() => {
+    if (silenceTimerRef.current) {
+      window.clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+  }, []);
+
+  const resetSilenceMonitor = useCallback(() => {
+    if (!autoStopOnSilence || !recordingRef.current) {
+      stopSilenceMonitor();
+      return;
+    }
+
+    const silenceWindowMs = Math.max(4000, Number(silenceDuration || 30) * 1000);
+    if (silenceTimerRef.current) window.clearTimeout(silenceTimerRef.current);
+    silenceTimerRef.current = window.setTimeout(() => {
+      silenceTimerRef.current = null;
+      if (!recordingRef.current || sessionActionInFlightRef.current || !autoStopOnSilence) return;
+      setAlert(`No speech detected for ${silenceDuration}s. Session stopped automatically.`);
+      stopSession();
+    }, silenceWindowMs);
+  }, [autoStopOnSilence, silenceDuration, stopSilenceMonitor]);
+
   const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean } = {}) => {
     if (!options.preserveRecoveryTimer && audioRecoveryTimerRef.current) {
       window.clearTimeout(audioRecoveryTimerRef.current);
@@ -2000,6 +2024,7 @@ export default function App() {
     pendingFinalTranscriptsRef.current.clear();
     queuedAudioChunksRef.current = [];
     queuedAudioDroppedRef.current = 0;
+    stopSilenceMonitor();
     if (subtitleThrottleTimerRef.current) {
       window.clearTimeout(subtitleThrottleTimerRef.current);
       subtitleThrottleTimerRef.current = null;
@@ -2009,7 +2034,7 @@ export default function App() {
       interimTimerRef.current = null;
     }
     pendingPartialTranscriptRef.current = null;
-  }, [stopDubbingPlayback]);
+  }, [stopDubbingPlayback, stopSilenceMonitor]);
 
   const scheduleAudioRecovery = useCallback((reason: string) => {
     if (!recordingRef.current || status === "stopping") return;
@@ -2275,6 +2300,7 @@ export default function App() {
       }
       flushQueuedAudioChunks();
       audioRestartAttemptsRef.current = 0;
+      resetSilenceMonitor();
       setAudioDiagnostic((current) => ({
         ...current,
         state: "recording",
@@ -2935,6 +2961,7 @@ export default function App() {
         const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
 
         if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.002) return;
+        if (audioLevel > 0.004) resetSilenceMonitor();
 
         lastAudioChunkSentAtRef.current = capturedAt;
         emitAudioChunkPayload({
@@ -3032,7 +3059,7 @@ export default function App() {
 
       setAlert(message);
     }
-  }, [autoGainControl, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, scheduleAudioRecovery, shareableMode, sourceLang, stopDubbingPlayback, targetLang, targetLanguages, user?.id, user?.plan, status]);
+  }, [autoGainControl, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, resetSilenceMonitor, scheduleAudioRecovery, shareableMode, sourceLang, stopDubbingPlayback, targetLang, targetLanguages, user?.id, user?.plan, status]);
 
   useEffect(() => {
     startSessionRef.current = startSession;

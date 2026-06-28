@@ -14,6 +14,7 @@ import {
   SUPPORTED_LANGUAGE_CODES,
   normalizeLanguageCode as normalizeSharedLanguageCode
 } from "../../shared/languages.mjs";
+import { delay as waitForMs, getRetryDelay, providerErrorMessage as getProviderErrorMessage } from "./providerUtils.js";
 
 const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
 const MAX_TRANSCRIPT_HISTORY = 500;
@@ -38,9 +39,9 @@ const TRANSLATION_RATE_LIMIT_DELAY_MS = 80;
 const CIRCUIT_BREAKER_LATENCY_THRESHOLD_MS = 3000;
 const LATENCY_WINDOW_SIZE = 5;
 const MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3;
-const MAX_PROVIDER_RETRY_ATTEMPTS = 1;
-const PROVIDER_RETRY_DELAY_MS = 900;
-const PROVIDER_RETRY_MAX_DELAY_MS = 8000;
+const MAX_PROVIDER_RETRY_ATTEMPTS = 3;
+const PROVIDER_RETRY_DELAY_MS = 1000;
+const PROVIDER_RETRY_MAX_DELAY_MS = 4000;
 
 // Admin Dashboard Tracking (Simulated Persistent Store)
 const globalUsageStats = {
@@ -250,9 +251,6 @@ const prepareTextForTranslation = (text = "") => {
 
 const normalizeTranscript = (text = "") => cleanTranscriptText(text).toLowerCase();
 const sentenceEnds = (text = "") => /[.!?]$/.test(text.trim());
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const providerRetryDelay = (attempt) =>
-  Math.min(PROVIDER_RETRY_MAX_DELAY_MS, PROVIDER_RETRY_DELAY_MS * 2 ** Math.max(0, attempt - 1));
 const wordCount = (text = "") => text.split(/\s+/).filter(Boolean).length;
 
 const normalizeInterpreterLanguageCode = (language = "") => {
@@ -365,17 +363,21 @@ const translationCacheTtlMs = ({ source, target } = {}) =>
 const isProviderFailureText = (text = "") =>
   /\b(temporar(?:il)y unavailable|temporar(?:il)y failed|translation unavailable|provider failed|timed out|timeout)\b/i.test(String(text || ""));
 
-const providerErrorMessage = (error = {}) => String(error?.message || error || "");
+const isProviderNonRetryableFailure = (error = {}) => {
+  const message = getProviderErrorMessage(error);
+  const statusCode = Number(error?.status || error?.statusCode || error?.response?.status || error?.code);
 
-const isProviderNonRetryableFailure = (error = {}) =>
-  /\b(401|403|429)\b|rate[_ -]?limit|quota|insufficient|credit|billing|unauthori[sz]ed|forbidden|invalid api key|permission|resource_exhausted/i.test(
-    providerErrorMessage(error)
-  );
+  if ([400, 401, 403, 404].includes(statusCode)) return true;
+  return /\b(400|401|403|404)\b|quota|insufficient|credit|billing|unauthori[sz]ed|forbidden|invalid api key|permission|resource_exhausted/i.test(message);
+};
 
 const isRetryableProviderError = (error = {}) => {
-  const message = providerErrorMessage(error);
+  const message = getProviderErrorMessage(error);
   if (!message) return false;
-  return !isProviderNonRetryableFailure(error);
+
+  const statusCode = Number(error?.status || error?.statusCode || error?.response?.status || error?.code);
+  if ([408, 409, 429, 500, 502, 503, 504].includes(statusCode)) return true;
+  return !isProviderNonRetryableFailure(error) && /timed out|timeout|temporar|network|socket hang up|econnreset|fetch failed|reset|retry|overload|unavailable|busy/i.test(message);
 };
 
 const isSourceTaggedFallbackText = (text = "") => /^\[[a-z]{2,12}(?:-[a-z0-9]{2,12})?\]\s+/i.test(cleanTranscriptText(text));
@@ -1210,7 +1212,7 @@ export const createInterpreterSession = async ({
       sessionId,
       provider,
       reason: nonRetryable ? "non_retryable_failure" : "failure_threshold",
-      error: providerErrorMessage(error)
+      error: getProviderErrorMessage(error)
     }, "warn");
     emitProviderHealth();
   };
@@ -1417,7 +1419,7 @@ export const createInterpreterSession = async ({
       };
     }
 
-    await delay(TRANSLATION_RATE_LIMIT_DELAY_MS);
+    await waitForMs(TRANSLATION_RATE_LIMIT_DELAY_MS);
     if (staleTranslationJobs.has(jobId)) {
       return {
         provider,
@@ -1624,7 +1626,7 @@ export const createInterpreterSession = async ({
             targetLang: language,
             attempt: attempt + 1
           }, "warn");
-          await delay(providerRetryDelay(attempt));
+          await waitForMs(getRetryDelay({ attempt, baseMs: PROVIDER_RETRY_DELAY_MS, maxMs: PROVIDER_RETRY_MAX_DELAY_MS }));
           if (staleTranslationJobs.has(jobId)) break;
         }
 
@@ -2353,7 +2355,7 @@ export const createInterpreterSession = async ({
 
       pruneTranslationLaneQueue(lane);
       scheduleTranslationDrain(lane.id);
-    }, providerRetryDelay(attempt + 1));
+    }, getRetryDelay({ attempt: attempt + 1, baseMs: PROVIDER_RETRY_DELAY_MS, maxMs: PROVIDER_RETRY_MAX_DELAY_MS }));
     retryTimer.unref?.();
     backgroundRetryTimers.add(retryTimer);
 

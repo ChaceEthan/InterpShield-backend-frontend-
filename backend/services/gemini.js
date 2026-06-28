@@ -8,11 +8,20 @@ import {
   providerLanguageCode,
   supportedLanguageList
 } from "../../shared/languages.mjs";
+import {
+  createAbortPromise,
+  delay,
+  getRetryDelay,
+  isNonRetryableProviderError,
+  normalizeForComparison,
+  normalizeProviderText,
+  providerErrorMessage
+} from "./providerUtils.js";
 
 const GEMINI_TIMEOUT_MS = 25000;
 const GEMINI_MAX_ATTEMPTS = 3;
-const GEMINI_RETRY_BASE_MS = 600;
-const GEMINI_RETRY_MAX_MS = 5000;
+const GEMINI_RETRY_BASE_MS = 1000;
+const GEMINI_RETRY_MAX_MS = 4000;
 const SUPPORTED_LANGUAGE_LIST = supportedLanguageList();
 
 let client = null;
@@ -29,28 +38,9 @@ const geminiHealth = {
   lastError: ""
 };
 
-const normalizeForComparison = (value = "") =>
-  value
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[.!?]+$/g, "");
+const stripWrappedText = (value = "") => normalizeProviderText(value);
 
-const stripWrappedText = (value = "") => value.trim().replace(/^["'`]+|["'`]+$/g, "").trim();
 
-const delay = (ms) => new Promise((resolve) => {
-  const timer = setTimeout(resolve, ms);
-  timer.unref?.();
-});
-
-const retryDelay = (attempt) => Math.min(GEMINI_RETRY_MAX_MS, GEMINI_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
-
-const providerErrorMessage = (error = {}) => String(error?.message || error || "");
-
-const isNonRetryableGeminiError = (error = {}) =>
-  /\b(400|401|403|429)\b|rate[_ -]?limit|quota|billing|unauthori[sz]ed|forbidden|invalid api key|permission|resource_exhausted/i.test(
-    providerErrorMessage(error)
-  );
 
 const noteGeminiSuccess = (latencyMs) => {
   geminiHealth.status = "healthy";
@@ -117,22 +107,6 @@ const extractGeminiText = (response = {}) => {
 
 const abortError = () => new Error("Gemini translation aborted");
 
-const createAbortPromise = (signal) => {
-  if (!signal) return { promise: null, cleanup: () => undefined };
-  if (signal.aborted) return { promise: Promise.reject(abortError()), cleanup: () => undefined };
-
-  let handleAbort = () => undefined;
-  const promise = new Promise((_, reject) => {
-    handleAbort = () => reject(abortError());
-    signal.addEventListener?.("abort", handleAbort, { once: true });
-  });
-
-  return {
-    promise,
-    cleanup: () => signal.removeEventListener?.("abort", handleAbort)
-  };
-};
-
 const contextInstructions = (translationContext = {}) => {
   const instructions = [];
   const accentProfile = translationContext.accentProfile;
@@ -185,7 +159,7 @@ const translateOnce = async ({ apiKey, text, sourceLang, targetLang, translation
     }, timeoutMs);
     timeout.unref?.();
   });
-  const abortPromise = createAbortPromise(signal);
+  const abortPromise = createAbortPromise(signal, abortError);
   const pendingPromises = [
     client.models.generateContent({
       model: "gemini-2.5-flash",
@@ -297,12 +271,12 @@ export const translateWithGemini = async ({ apiKey, text, sourceLang, targetLang
       lastError = error;
       noteGeminiFailure(error);
 
-      if (attempt >= GEMINI_MAX_ATTEMPTS || isNonRetryableGeminiError(error)) {
+      if (attempt >= GEMINI_MAX_ATTEMPTS || isNonRetryableProviderError(error, [400, 401, 403, 404], ["quota", "billing", "unauthori[sz]ed", "forbidden", "invalid api key", "permission", "resource_exhausted"])) {
         break;
       }
 
       geminiHealth.retryCount += 1;
-      await delay(retryDelay(attempt));
+      await delay(getRetryDelay({ attempt, baseMs: GEMINI_RETRY_BASE_MS, maxMs: GEMINI_RETRY_MAX_MS }));
     }
   }
 
