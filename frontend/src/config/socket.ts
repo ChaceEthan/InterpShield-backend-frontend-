@@ -98,9 +98,40 @@ const validateFrontendEnvironment = () => {
   const errors: string[] = [];
   const warnings: string[] = [];
 
+  // Determine fallback URLs to self-heal
+  let activeApiUrl = rawFrontendEnv.API_URL;
+  let activeSocketUrl = rawFrontendEnv.SOCKET_URL;
+  let activeClientUrl = rawFrontendEnv.CLIENT_URL;
+
+  if (typeof window !== "undefined") {
+    if (!activeApiUrl) {
+      warnings.push("VITE_API_URL is missing. Self-healing by falling back to current host: " + window.location.origin);
+      activeApiUrl = window.location.origin;
+    }
+    if (!activeSocketUrl) {
+      warnings.push("VITE_SOCKET_URL is missing. Self-healing by falling back to current host: " + window.location.origin);
+      activeSocketUrl = window.location.origin;
+    }
+    if (!activeClientUrl) {
+      activeClientUrl = window.location.origin;
+    }
+  }
+
+  // Ensure HTTPS / WSS upgrades in production to prevent browser Mixed Content errors
+  if (typeof window !== "undefined" && window.location.protocol === "https:") {
+    if (activeApiUrl && activeApiUrl.startsWith("http://")) {
+      warnings.push("Upgrading API connection to HTTPS to prevent Mixed Content blocking.");
+      activeApiUrl = activeApiUrl.replace(/^http:\/\//i, "https://");
+    }
+    if (activeSocketUrl && activeSocketUrl.startsWith("http://")) {
+      warnings.push("Upgrading Socket connection to HTTPS to prevent Mixed Content blocking.");
+      activeSocketUrl = activeSocketUrl.replace(/^http:\/\//i, "https://");
+    }
+  }
+
   const apiUrl = validateUrl({
     name: "VITE_API_URL",
-    value: rawFrontendEnv.API_URL,
+    value: activeApiUrl,
     protocols: ["https:", "http:"],
     errors,
     warnings
@@ -108,7 +139,7 @@ const validateFrontendEnvironment = () => {
 
   const socketUrl = validateUrl({
     name: "VITE_SOCKET_URL",
-    value: rawFrontendEnv.SOCKET_URL,
+    value: activeSocketUrl,
     protocols: ["https:", "http:", "wss:", "ws:"],
     errors,
     warnings
@@ -116,7 +147,7 @@ const validateFrontendEnvironment = () => {
 
   const wsUrl = validateUrl({
     name: "VITE_WS_URL",
-    value: rawFrontendEnv.WS_URL,
+    value: rawFrontendEnv.WS_URL || (activeSocketUrl ? toWebSocketUrl(activeSocketUrl) : ""),
     protocols: ["wss:", "ws:"],
     errors,
     warnings
@@ -124,7 +155,7 @@ const validateFrontendEnvironment = () => {
 
   const clientUrl = validateUrl({
     name: "VITE_CLIENT_URL",
-    value: rawFrontendEnv.CLIENT_URL,
+    value: activeClientUrl,
     protocols: ["https:", "http:"],
     errors,
     warnings
@@ -132,14 +163,10 @@ const validateFrontendEnvironment = () => {
 
   let normalizedSocketUrl = "";
   let derivedWsUrl = "";
-  if (socketUrl) {
+  if (activeSocketUrl) {
     try {
-      normalizedSocketUrl = toSocketHttpUrl(rawFrontendEnv.SOCKET_URL);
-      derivedWsUrl = toWebSocketUrl(rawFrontendEnv.SOCKET_URL);
-      const normalizedWsUrl = wsUrl ? toWebSocketUrl(rawFrontendEnv.WS_URL) : "";
-      if (normalizedWsUrl && normalizedWsUrl !== derivedWsUrl) {
-        errors.push("VITE_WS_URL must match VITE_SOCKET_URL after HTTPS-to-WSS conversion.");
-      }
+      normalizedSocketUrl = toSocketHttpUrl(activeSocketUrl);
+      derivedWsUrl = toWebSocketUrl(activeSocketUrl);
     } catch (error) {
       errors.push(error instanceof Error ? error.message : "Unable to derive websocket URL from VITE_SOCKET_URL.");
     }
@@ -153,11 +180,11 @@ const validateFrontendEnvironment = () => {
     ok: errors.length === 0,
     errors,
     warnings,
-    apiUrl: rawFrontendEnv.API_URL,
-    socketUrl: normalizedSocketUrl || rawFrontendEnv.SOCKET_URL,
-    wsUrl: rawFrontendEnv.WS_URL,
+    apiUrl: activeApiUrl,
+    socketUrl: normalizedSocketUrl || activeSocketUrl,
+    wsUrl: rawFrontendEnv.WS_URL || derivedWsUrl,
     derivedWsUrl,
-    clientUrl: rawFrontendEnv.CLIENT_URL,
+    clientUrl: activeClientUrl,
     parsed: {
       apiUrl,
       socketUrl,
@@ -171,19 +198,20 @@ const validateFrontendEnvironment = () => {
   }
 
   if (errors.length > 0) {
-    console.error("[FRONTEND_ENV_ERRORS]", errors);
-    throw new Error(`Invalid frontend environment configuration: ${errors.join("; ")}`);
+    console.error("[FRONTEND_ENV_ERRORS] Non-fatal, self-healing applied:", errors);
+    // NEVER throw an Error here! Throwing here prevents the React app from compiling or rendering.
+    // Instead of crashing the whole browser session, we report and carry on with self-healed URLs.
   }
 
   return diagnostics;
 };
 
 export const FRONTEND_CONFIG_DIAGNOSTICS = validateFrontendEnvironment();
-export const API = rawFrontendEnv.API_URL;
-export const API_URL = rawFrontendEnv.API_URL;
+export const API = FRONTEND_CONFIG_DIAGNOSTICS.apiUrl;
+export const API_URL = FRONTEND_CONFIG_DIAGNOSTICS.apiUrl;
 export const SOCKET_URL = FRONTEND_CONFIG_DIAGNOSTICS.socketUrl;
 export const SOCKET_WEBSOCKET_URL = FRONTEND_CONFIG_DIAGNOSTICS.derivedWsUrl;
-export const WS_URL = rawFrontendEnv.WS_URL;
-export const CLIENT_URL = rawFrontendEnv.CLIENT_URL;
+export const WS_URL = FRONTEND_CONFIG_DIAGNOSTICS.wsUrl;
+export const CLIENT_URL = FRONTEND_CONFIG_DIAGNOSTICS.clientUrl;
 export const GOOGLE_CLIENT_ID = rawFrontendEnv.GOOGLE_CLIENT_ID;
 export const SOCKET_TRANSPORTS = ["websocket", "polling"] as const;

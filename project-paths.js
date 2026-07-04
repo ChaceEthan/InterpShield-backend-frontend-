@@ -77,7 +77,11 @@ export const runtimeDirectoryKeys = [
 
 export const ensureProjectDirectories = (paths = projectPaths) => {
   for (const key of runtimeDirectoryKeys) {
-    fs.mkdirSync(paths[key], { recursive: true });
+    try {
+      fs.mkdirSync(paths[key], { recursive: true });
+    } catch (err) {
+      console.warn(`[PATH_WARNING] Failed to ensure directory ${paths[key]}:`, err.message);
+    }
   }
 
   return paths;
