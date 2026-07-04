@@ -1436,7 +1436,7 @@ export const createInterpreterSession = async ({
 
     const providerName = provider === "gemini" ? "Gemini" : "OpenAI";
     const attemptStartedAt = Date.now();
-    const timeoutMs = Math.min(2200, PROVIDER_TIMEOUT_MS[provider] || 3000);
+    const timeoutMs = PROVIDER_TIMEOUT_MS[provider] || 22000;
     const abortController = typeof AbortController !== "undefined" ? new AbortController() : null;
     const unregisterAbortController = trackProviderAbortController(jobId, abortController);
     sessionTranslationQueue.currentAbortController = abortController;
