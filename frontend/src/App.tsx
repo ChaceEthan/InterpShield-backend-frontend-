@@ -941,8 +941,8 @@ const GoogleIcon = ({ className = "h-5 w-5" }: { className?: string }) => (
   </svg>
 );
 
-const GlassPanel = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
-  <section className={`rounded-2xl border border-gray-200 bg-white shadow-sm shadow-gray-200/70 backdrop-blur-xl ${className}`}>{children}</section>
+const GlassPanel = ({ children, className = "", ...props }: { children: React.ReactNode; className?: string; [key: string]: any }) => (
+  <section {...props} className={`rounded-2xl border border-gray-200 bg-white shadow-sm shadow-gray-200/70 backdrop-blur-xl ${className}`}>{children}</section>
 );
 
 const ToggleRow = ({
@@ -1460,7 +1460,7 @@ export default function App() {
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
   const isTranslationActive = mode !== "transcribe" && Object.values(translationStatuses).some((translationState) =>
-    ["queued", "processing", "translating", "retrying"].includes(translationState)
+    ["queued", "processing", "translating", "retrying"].includes(translationState as string)
   );
   const connectionState: SocketConnectionState =
     socketReconnecting || (!socketConnected && status === "listening")
@@ -2205,7 +2205,8 @@ export default function App() {
       setTranslationStatuses((current) => {
         const recovered: Record<string, TranslationLifecycleState> = {};
         for (const [language, state] of Object.entries(current)) {
-          recovered[language] = state === "failed" || state === "stale" || state === "cancelled" ? "retrying" : state;
+          const stateTyped = state as any;
+          recovered[language] = stateTyped === "failed" || stateTyped === "stale" || stateTyped === "cancelled" ? "retrying" : stateTyped;
           translationStatusUpdatedAtRef.current[language] = Date.now();
         }
         return recovered;
@@ -2652,7 +2653,7 @@ export default function App() {
       const staleUpdates: Record<string, TranslationLifecycleState> = {};
 
       for (const [language, state] of Object.entries(translationStatuses)) {
-        if (!["queued", "translating", "processing", "retrying"].includes(state)) continue;
+        if (!["queued", "translating", "processing", "retrying"].includes(state as string)) continue;
         const updatedAt = translationStatusUpdatedAtRef.current[language] || 0;
         if (updatedAt && now - updatedAt > STALE_TRANSLATION_STATE_MS) staleUpdates[language] = "stale";
       }

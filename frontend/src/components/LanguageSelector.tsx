@@ -142,9 +142,9 @@ export function LanguageSelector({
   );
 }
 
-function SelectShell({ label, children }: { label: string; children: ReactNode }) {
+function SelectShell({ label, children, ...props }: { label: string; children: ReactNode; [key: string]: any }) {
   return (
-    <label className="relative block">
+    <label {...props} className="relative block">
       <span className="mb-2 block text-xs font-semibold uppercase tracking-wide text-gray-400">{label}</span>
       {children}
       <ChevronDown className="pointer-events-none absolute bottom-3.5 right-3 h-4 w-4 text-gray-400" />

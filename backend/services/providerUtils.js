@@ -18,8 +18,30 @@ export const delay = (ms) => new Promise((resolve) => {
   timer.unref?.();
 });
 
-export const getRetryDelay = ({ attempt = 1, baseMs = 1000, maxMs = 4000 }) =>
-  Math.min(maxMs, baseMs * 2 ** Math.max(0, attempt - 1));
+export const getRetryDelay = ({ attempt = 1, baseMs = 1000, maxMs = 4000, error = null }) => {
+  if (error) {
+    const headers = error.headers || error.response?.headers;
+    if (headers) {
+      const retryAfterHeader = typeof headers.get === "function" ? headers.get("retry-after") : headers["retry-after"];
+      if (retryAfterHeader) {
+        const seconds = parseInt(retryAfterHeader, 10);
+        if (!isNaN(seconds) && seconds > 0) {
+          return seconds * 1000;
+        }
+      }
+    }
+    const match = /retry after (\d+) second/i.exec(error.message || "");
+    if (match) {
+      const seconds = parseInt(match[1], 10);
+      if (!isNaN(seconds) && seconds > 0) {
+        return seconds * 1000;
+      }
+    }
+  }
+  const backoff = Math.min(maxMs, baseMs * 2 ** Math.max(0, attempt - 1));
+  const jitter = Math.random() * 200;
+  return backoff + jitter;
+};
 
 export const createAbortPromise = (signal, abortErrorFactory = () => new Error("Translation aborted")) => {
   if (!signal) return { promise: null, cleanup: () => undefined };
