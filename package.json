@@ -13,7 +13,8 @@
     "lint": "node --check project-paths.js && npm run lint --workspace backend && npm run lint --workspace frontend",
     "start": "npm run start --workspace backend",
     "sync:frontend-dist": "node scripts/sync-frontend-dist.mjs",
-    "clean": "npm run clean --workspace backend && npm run clean --workspace frontend"
+    "clean": "npm run clean --workspace backend && npm run clean --workspace frontend",
+    "test:translation": "npm run test:translation --workspace backend"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"

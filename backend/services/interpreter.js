@@ -20,6 +20,7 @@ const FILLER_PATTERN = /\b(um+|uh+|er+|ah+|hmm+|you know|i mean)\b[,\s]*/gi;
 const MAX_TRANSCRIPT_HISTORY = 500;
 const MAX_STORED_SESSIONS = 100;
 const MAX_TARGET_LANGUAGES = 3;
+const MAX_CONCURRENT_TRANSLATION_LANGUAGES = 3;
 const SENTENCE_DEBOUNCE_MS = 380;
 const SHORT_PAUSE_DEBOUNCE_MS = 220;
 const SILENCE_DEBOUNCE_MS = 650;
@@ -309,6 +310,23 @@ const withTimeout = (promise, timeoutMs, message) => {
   return Promise.race([promise, timeoutPromise]).finally(() => {
     if (timeout) clearTimeout(timeout);
   });
+};
+
+export const runSequentialTasks = async (items = [], worker = async () => undefined, concurrency = 1) => {
+  const safeConcurrency = Math.max(1, Number.isFinite(concurrency) ? concurrency : 1);
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  const runNext = async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(items[currentIndex]);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(safeConcurrency, items.length || 1) }, runNext));
+  return results;
 };
 
 const translationMutex = (() => {
@@ -972,6 +990,56 @@ export const createInterpreterSession = async ({
     }
   };
 
+  const getOrCreateLanguageState = (job, language) => {
+    if (!job || !language) return null;
+
+    if (!job.languageStates) {
+      job.languageStates = new Map();
+    }
+
+    let state = job.languageStates.get(language);
+    if (!state) {
+      state = {
+        language,
+        requestId: `${job.id}:${language}`,
+        socketId: session?.socketId || "",
+        retryCount: 0,
+        provider: null,
+        providerSelected: null,
+        fallbackProvider: null,
+        httpStatus: null,
+        lastError: null,
+        abortController: null,
+        timeoutTimer: null,
+        promise: null,
+        status: "queued"
+      };
+      job.languageStates.set(language, state);
+    }
+
+    return state;
+  };
+
+  const abortLanguageState = (job, language) => {
+    const state = job?.languageStates?.get?.(language);
+    if (!state) return;
+
+    state.abortController?.abort?.();
+    if (state.timeoutTimer) {
+      clearTimeout(state.timeoutTimer);
+      state.timeoutTimer = null;
+    }
+    state.promise = null;
+    state.status = "cancelled";
+  };
+
+  const abortJobLanguageStates = (job) => {
+    if (!job?.languageStates) return;
+    for (const language of job.languageStates.keys()) {
+      abortLanguageState(job, language);
+    }
+  };
+
   let lastHealthState = "";
 
   const activeTranslationTaskCount = () =>
@@ -1033,6 +1101,20 @@ export const createInterpreterSession = async ({
       completedCount: translationMetrics.completedCount,
       failedCount: translationMetrics.failedCount
     }
+  });
+
+  const createTranslationDiagnostics = ({ language, provider, reason, retryCount = 0, latencyMs, requestId, socketId, status = "unknown", fallbackProvider, httpStatus }) => ({
+    language,
+    provider,
+    retryCount,
+    latencyMs,
+    httpStatus,
+    reason,
+    requestId,
+    socketId,
+    status,
+    fallbackProvider,
+    providerSelected: provider || "unknown"
   });
 
   const createTranslationPayloadMetadata = (jobOrId = null) => {
@@ -1115,6 +1197,7 @@ export const createInterpreterSession = async ({
       job.cancelled = true;
       job.pendingLanguages?.clear?.();
       job.runningLanguages?.clear?.();
+      abortJobLanguageStates(job);
     }
     for (const controllers of providerAbortControllersByJob.values()) {
       for (const controller of controllers) controller?.abort?.();
@@ -1416,7 +1499,7 @@ export const createInterpreterSession = async ({
 
   const providerRunner = (provider) => (provider === "gemini" ? translateWithGemini : translateWithOpenAI);
 
-  const runProviderTranslationAttempt = async ({ provider, language, translationInput, direction, languageTranslationContext, jobId }) => {
+  const runProviderTranslationAttempt = async ({ provider, language, translationInput, direction, languageTranslationContext, jobId, languageState, job }) => {
     if (staleTranslationJobs.has(jobId)) {
       return {
         provider,
@@ -1439,8 +1522,26 @@ export const createInterpreterSession = async ({
     const timeoutMs = PROVIDER_TIMEOUT_MS[provider] || 22000;
     const abortController = typeof AbortController !== "undefined" ? new AbortController() : null;
     const unregisterAbortController = trackProviderAbortController(jobId, abortController);
-    sessionTranslationQueue.currentAbortController = abortController;
-    try {
+    const state = languageState || getOrCreateLanguageState(job, language);
+    state?.abortController?.abort?.();
+    state?.promise && (state.promise = null);
+    if (state) {
+      state.abortController = abortController;
+      state.timeoutTimer = null;
+      state.provider = provider;
+      state.providerSelected = provider;
+      state.requestId = `${jobId}:${language}:${Date.now().toString(36)}`;
+      state.socketId = session?.socketId || "";
+      state.status = "processing";
+      state.lastError = null;
+      state.httpStatus = null;
+    }
+    const timeoutTimer = abortController ? setTimeout(() => abortController.abort(), timeoutMs) : null;
+    if (state) {
+      state.timeoutTimer = timeoutTimer;
+    }
+    const attemptPromise = (async () => {
+      try {
       logTranslationEvent("TRANSLATION_REQUEST", {
         sessionId,
         jobId,
@@ -1449,25 +1550,19 @@ export const createInterpreterSession = async ({
         targetLang: language,
         chars: translationInput.length
       });
-      const translatedText = await withTimeout(
-        providerRunner(provider)({
-          apiKey: provider === "gemini" ? env.geminiApiKey : env.openaiApiKey,
-          text: translationInput,
-          sourceLang: sourceLanguageForProvider(direction.source),
-          targetLang: language,
-          translationContext: languageTranslationContext,
-          signal: abortController?.signal
-        }),
-        timeoutMs,
-        `${providerName} translation timed out for ${language}`
-      ).finally(() => {
-        abortController?.abort();
-        unregisterAbortController();
-        if (sessionTranslationQueue.currentAbortController === abortController) {
-          sessionTranslationQueue.currentAbortController = null;
-        }
-      });
-      const responseTimeMs = Date.now() - attemptStartedAt;
+        const translatedText = await withTimeout(
+          providerRunner(provider)({
+            apiKey: provider === "gemini" ? env.geminiApiKey : env.openaiApiKey,
+            text: translationInput,
+            sourceLang: sourceLanguageForProvider(direction.source),
+            targetLang: language,
+            translationContext: languageTranslationContext,
+            signal: abortController?.signal
+          }),
+          timeoutMs,
+          `${providerName} translation timed out for ${language}`
+        );
+        const responseTimeMs = Date.now() - attemptStartedAt;
       rememberProviderLatency(provider, responseTimeMs);
       const safeTranslatedText = String(translatedText || "").trim();
 
@@ -1480,76 +1575,89 @@ export const createInterpreterSession = async ({
         };
       }
 
-      if (
-        safeTranslatedText &&
-        isTranslationDisplayable({
-          text: safeTranslatedText,
-          sourceText: translationInput,
-          sourceLang: direction.source,
-          targetLang: language,
-          provider
-        })
-      ) {
-        trackUsage(provider, 150);
-        logTranslationEvent("TRANSLATION_COMPLETE", {
+        if (
+          safeTranslatedText &&
+          isTranslationDisplayable({
+            text: safeTranslatedText,
+            sourceText: translationInput,
+            sourceLang: direction.source,
+            targetLang: language,
+            provider
+          })
+        ) {
+          trackUsage(provider, 150);
+          logTranslationEvent("TRANSLATION_COMPLETE", {
+            sessionId,
+            jobId,
+            provider,
+            targetLang: language,
+            latencyMs: responseTimeMs,
+            chars: safeTranslatedText.length
+          });
+          return {
+            provider,
+            translatedText: safeTranslatedText,
+            responseTimeMs
+          };
+        }
+
+        logTranslationEvent("TRANSLATION_FAILED", {
           sessionId,
           jobId,
           provider,
           targetLang: language,
-          latencyMs: responseTimeMs,
-          chars: safeTranslatedText.length
-        });
+          error: `Invalid ${providerName} translation response`
+        }, "warn");
+        rememberProviderLatency(provider, responseTimeMs);
+
         return {
           provider,
-          translatedText: safeTranslatedText,
+          responseTimeMs,
+          error: new Error(`Invalid ${providerName} translation response for ${language}`)
+        };
+      } catch (error) {
+        const responseTimeMs = Date.now() - attemptStartedAt;
+        const timedOut = /timed out|timeout/i.test(error?.message || "");
+        if (timedOut) translationMetrics.timeoutCount += 1;
+        rememberProviderLatency(provider, responseTimeMs);
+        logTranslationEvent("TRANSLATION_FAILED", {
+          sessionId,
+          jobId,
+          provider,
+          targetLang: language,
+          timeoutMs,
+          error: error?.message || String(error)
+        }, "warn");
+        return {
+          provider,
+          error,
+          timedOut,
           responseTimeMs
         };
+      } finally {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        abortController?.abort();
+        unregisterAbortController();
+        if (state && state.abortController === abortController) {
+          state.abortController = null;
+        }
+        if (state && state.timeoutTimer === timeoutTimer) {
+          state.timeoutTimer = null;
+        }
+        if (state && state.promise === attemptPromise) {
+          state.promise = null;
+        }
       }
+    })();
 
-      logTranslationEvent("TRANSLATION_FAILED", {
-        sessionId,
-        jobId,
-        provider,
-        targetLang: language,
-        error: `Invalid ${providerName} translation response`
-      }, "warn");
-      rememberProviderLatency(provider, responseTimeMs);
-
-      return {
-        provider,
-        responseTimeMs,
-        error: new Error(`Invalid ${providerName} translation response for ${language}`)
-      };
-    } catch (error) {
-      abortController?.abort();
-      unregisterAbortController();
-      if (sessionTranslationQueue.currentAbortController === abortController) {
-        sessionTranslationQueue.currentAbortController = null;
-      }
-      const responseTimeMs = Date.now() - attemptStartedAt;
-      const timedOut = /timed out|timeout/i.test(error?.message || "");
-      if (timedOut) translationMetrics.timeoutCount += 1;
-      rememberProviderLatency(provider, responseTimeMs);
-      logTranslationEvent("TRANSLATION_FAILED", {
-        sessionId,
-        jobId,
-        provider,
-        targetLang: language,
-        timeoutMs,
-        error: error?.message || String(error)
-      }, "warn");
-      return {
-        provider,
-        error,
-        timedOut,
-        responseTimeMs
-      };
-    }
+    state && (state.promise = attemptPromise);
+    return attemptPromise;
   };
 
-  const translateProviderLanguageWithRecovery = async ({ language, translationInput, direction, translationContext, jobId }) => {
+  const translateProviderLanguageWithRecovery = async ({ language, translationInput, direction, translationContext, jobId, job = null }) => {
     let lastError = null;
     const languageTranslationContext = languageTranslationContextFor(language, translationContext);
+    const languageState = getOrCreateLanguageState(job, language);
     const cacheKey = translationCacheKey({ source: direction.source, target: language, text: translationInput });
     const cachedTranslation = readCachedTranslation(translationCache, cacheKey, {
       source: direction.source,
@@ -1602,6 +1710,14 @@ export const createInterpreterSession = async ({
           provider: result.provider
         })
       ) {
+        if (languageState) {
+          languageState.providerSelected = result.provider;
+          languageState.provider = result.provider;
+          languageState.fallbackProvider = null;
+          languageState.httpStatus = null;
+          languageState.lastError = null;
+          languageState.status = "translated";
+        }
         noteProviderSuccess(result.provider);
         noteTranslationSuccess(language, result.translatedText, languageTranslationContext);
         rememberCachedTranslation(translationCache, cacheKey, result.translatedText, {
@@ -1614,6 +1730,11 @@ export const createInterpreterSession = async ({
       }
 
       lastError = result.error || new Error(`${result.provider || "Provider"} did not return a valid ${language} translation`);
+      if (languageState) {
+        languageState.lastError = lastError;
+        languageState.httpStatus = getErrorStatusCode(lastError);
+        languageState.fallbackProvider = providerOrder[providerOrder.indexOf(result.provider) + 1] || null;
+      }
       if (result.provider) noteProviderFailure(result.provider, lastError);
       return { text: "", provider: result.provider };
     };
@@ -1624,6 +1745,10 @@ export const createInterpreterSession = async ({
 
         if (attempt > 0) {
           translationMetrics.retryCount += 1;
+          if (languageState) {
+            languageState.retryCount = attempt + 1;
+            languageState.status = "retrying";
+          }
           setTranslationLanguageStatus(translationJobs.get(jobId), language, "retrying");
           logTranslationEvent("PROVIDER_RETRY", {
             sessionId,
@@ -1642,7 +1767,9 @@ export const createInterpreterSession = async ({
           translationInput,
           direction,
           languageTranslationContext,
-          jobId
+          jobId,
+          job,
+          languageState
         });
         if (result?.stale) {
           lastError = result.error;
@@ -1656,6 +1783,9 @@ export const createInterpreterSession = async ({
         if (!retryable) break;
       }
 
+      if (languageState) {
+        languageState.fallbackProvider = providerOrder[providerOrder.indexOf(provider) + 1] || null;
+      }
       logTranslationEvent("PROVIDER_FALLBACK", {
         sessionId,
         jobId,
@@ -1693,6 +1823,7 @@ export const createInterpreterSession = async ({
     job.stale = true;
     job.cancelled = true;
     job.activeLanguage = null;
+    abortJobLanguageStates(job);
     job.activeLanguageStartedAt = 0;
     staleTranslationJobs.add(job.id);
     job.pendingLanguages.clear();
@@ -1811,6 +1942,7 @@ export const createInterpreterSession = async ({
   const emitTranslationStatusUpdate = (job, language, status, provider = "queue") => {
     if (!job || job.stale || staleTranslationJobs.has(job.id)) return;
     setTranslationLanguageStatus(job, language, status);
+    const languageState = getOrCreateLanguageState(job, language);
 
     const errorPayload = status === "failed" ? (job.languageErrors?.[language] || {
       language,
@@ -1826,6 +1958,18 @@ export const createInterpreterSession = async ({
       originalText: job.sentence,
       ...createTranslationPayloadMetadata(job),
       translatedText: job.translations[language] || "",
+      diagnostics: createTranslationDiagnostics({
+        language,
+        provider,
+        reason: status,
+        retryCount: languageState?.retryCount || job.providerRetryAttempts?.get?.(language) || 0,
+        latencyMs: Date.now() - job.startedAt,
+        requestId: languageState?.requestId || `${job.id}:${language}`,
+        socketId: languageState?.socketId || session?.socketId || "",
+        status,
+        fallbackProvider: languageState?.fallbackProvider || (job.providerFallbackLanguages?.has?.(language) ? "provider-fallback" : undefined),
+        httpStatus: languageState?.httpStatus || null
+      }),
       translations: { ...job.translations },
       translationOutputs: translationOutputsForJob(job),
       translationStatus: translationStatusForJob(job),
@@ -2170,6 +2314,7 @@ export const createInterpreterSession = async ({
   const emitTranslationUpdate = (job, language, translatedText, provider) => {
     if (!translatedText || job.stale || staleTranslationJobs.has(job.id)) return false;
     const safeTranslatedText = cleanTranscriptText(translatedText);
+    const languageState = getOrCreateLanguageState(job, language);
     if (
       !isTranslationDisplayable({
         text: safeTranslatedText,
@@ -2202,6 +2347,18 @@ export const createInterpreterSession = async ({
       originalText: job.sentence,
       ...createTranslationPayloadMetadata(job),
       translatedText: safeTranslatedText,
+      diagnostics: createTranslationDiagnostics({
+        language,
+        provider,
+        reason: "translated",
+        retryCount: languageState?.retryCount || job.providerRetryAttempts?.get?.(language) || 0,
+        latencyMs: Date.now() - job.startedAt,
+        requestId: languageState?.requestId || `${job.id}:${language}`,
+        socketId: languageState?.socketId || session?.socketId || "",
+        status: "translated",
+        fallbackProvider: languageState?.fallbackProvider || (job.providerFallbackLanguages?.has?.(language) ? "provider-fallback" : undefined),
+        httpStatus: languageState?.httpStatus || null
+      }),
       translations: { ...job.translations },
       translationOutputs,
       translationStatus: translationStatusForJob(job),
@@ -2713,7 +2870,8 @@ export const createInterpreterSession = async ({
             translationInput: effectiveTranslationInput,
             direction: effectiveDirection,
             translationContext: job.translationContext,
-            jobId: job.id
+            jobId: job.id,
+            job
           });
         }
 
@@ -2783,7 +2941,7 @@ export const createInterpreterSession = async ({
       }
     };
 
-    await Promise.allSettled(targetLanguages.map((language) => processLanguage(language)));
+    await runSequentialTasks(targetLanguages, processLanguage, MAX_CONCURRENT_TRANSLATION_LANGUAGES);
 
     finalizeTranslationJobIfReady(job);
   };
@@ -2967,6 +3125,7 @@ export const createInterpreterSession = async ({
       languageStatuses: Object.fromEntries(direction.targets.slice(0, MAX_TARGET_LANGUAGES).map((language) => [language, "queued"])),
       providerFallbackLanguages: new Set(),
       providerRetryAttempts: new Map(),
+      languageStates: new Map(),
       activeLanguage: null,
       activeLanguageStartedAt: 0,
       createdAt: startedAt,

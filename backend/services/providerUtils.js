@@ -86,11 +86,31 @@ export const mergeAbortSignals = (...signals) => {
   };
 };
 
+export const getErrorStatusCode = (error = {}) => {
+  const statusCandidates = [
+    error?.status,
+    error?.statusCode,
+    error?.httpStatus,
+    error?.response?.status,
+    error?.details?.status,
+    error?.code
+  ];
+
+  for (const candidate of statusCandidates) {
+    const numericStatus = Number(candidate);
+    if (Number.isFinite(numericStatus) && numericStatus > 0) {
+      return numericStatus;
+    }
+  }
+
+  return null;
+};
+
 export const isNonRetryableProviderError = (error = {}, statusCodes = [400, 401, 403, 404], extraPatterns = []) => {
   const message = providerErrorMessage(error);
-  const statusCode = Number(error?.status || error?.statusCode || error?.response?.status || error?.code);
+  const statusCode = getErrorStatusCode(error);
 
-  if (statusCodes.includes(statusCode)) return true;
+  if (statusCode && statusCodes.includes(statusCode)) return true;
 
   const patternSource = [
     ...extraPatterns,

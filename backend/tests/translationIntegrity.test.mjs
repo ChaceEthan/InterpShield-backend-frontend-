@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { isTranslationDisplayable } from "../services/interpreter.js";
+import { isTranslationDisplayable, runSequentialTasks } from "../services/interpreter.js";
 import { resolveLocalTranslation } from "../utils/translationEnhancer.js";
 import { createAudioPipelineSession, upsertCallRoomParticipant, removeCallRoomParticipant } from "../services/audioPipeline.js";
 import {
@@ -64,6 +64,19 @@ assert.equal(normalizeLanguageCode("luganda"), "lg");
 assert.equal(normalizeProviderText('  "Hola mundo"  '), "Hola mundo");
 assert.equal(isNonRetryableProviderError({ status: 401, message: "unauthorized" }), true);
 assert.equal(isNonRetryableProviderError({ message: "temporary network issue" }), false);
+
+let concurrentRuns = 0;
+let maxConcurrentRuns = 0;
+const sequentialResults = await runSequentialTasks(["es", "fr", "de"], async (language) => {
+  concurrentRuns += 1;
+  maxConcurrentRuns = Math.max(maxConcurrentRuns, concurrentRuns);
+  await Promise.resolve();
+  concurrentRuns -= 1;
+  return language.toUpperCase();
+}, 3);
+assert.deepEqual(sequentialResults, ["ES", "FR", "DE"]);
+assert.equal(maxConcurrentRuns, 3, "target languages should be processed concurrently up to the configured limit");
+
 const controller = new AbortController();
 const mergedSignal = mergeAbortSignals(controller.signal);
 controller.abort();
@@ -74,7 +87,7 @@ assert.match(frontendSource, /LANGUAGE_CATALOG/);
 assert.match(interpreterSource, /FAST_LOCAL_LANGUAGE_CODES\s*=\s*new Set\(\["sw",\s*"rw",\s*"rn",\s*"lg"\]\)/);
 assert.doesNotMatch(interpreterSource, /FORBIDDEN_LANGUAGE_CODES/);
 assert.match(interpreterSource, /sessionTranslationQueue\s*=\s*{\s*queue:\s*\[\],\s*processing:\s*false,\s*activeJob:\s*null,\s*currentAbortController:\s*null,\s*sequence:\s*0\s*}/s);
-assert.match(interpreterSource, /Promise\.allSettled\(targetLanguages\.map\(\(language\) => processLanguage\(language\)\)\)/);
+assert.match(interpreterSource, /runSequentialTasks\(targetLanguages, processLanguage, MAX_CONCURRENT_TRANSLATION_LANGUAGES\)/);
 assert.match(interpreterSource, /QUEUE_ADD/);
 assert.match(interpreterSource, /QUEUE_CLEAR/);
 assert.match(interpreterSource, /JOB_CANCEL/);

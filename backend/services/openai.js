@@ -221,10 +221,12 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         const message = errorData?.error?.message || errorData?.error || response.statusText || "OpenAI translation request failed";
-        const err = new Error(`OpenAI ${response.status}: ${message}`);
-        err.status = response.status;
-        err.headers = response.headers;
-        throw err;
+        const error = new Error(`OpenAI ${response.status}: ${message}`);
+        error.status = response.status;
+        error.httpStatus = response.status;
+        error.provider = "openai";
+        error.headers = response.headers;
+        throw error;
       }
 
       const data = await response.json();
