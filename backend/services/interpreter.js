@@ -82,6 +82,7 @@ const PROVIDER_TIMEOUT_MS = {
   openai: 22000
 };
 const PROVIDER_FAILURE_THRESHOLD = 6;
+const PROVIDER_NON_RETRYABLE_FAILURE_THRESHOLD = 2;
 const PROVIDER_COOLDOWN_MS = 45000;
 const PROVIDER_HARD_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const SESSION_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
@@ -949,7 +950,8 @@ export const createInterpreterSession = async ({
   onError,
   onProviderHealth,
   onResult,
-  onClosed
+  onClosed,
+  deepgramClientFactory
 }) => {
   let lastFinalTranscript = "";
   let lastFinalTranscriptAt = 0;
@@ -1358,8 +1360,12 @@ export const createInterpreterSession = async ({
     if (!health) return;
     const nonRetryable = isProviderNonRetryableFailure(error);
 
-    health.failures = nonRetryable ? PROVIDER_FAILURE_THRESHOLD : health.failures + 1;
-    if (health.failures < PROVIDER_FAILURE_THRESHOLD) return;
+    health.failures += 1;
+    const failureThreshold = nonRetryable ? PROVIDER_NON_RETRYABLE_FAILURE_THRESHOLD : PROVIDER_FAILURE_THRESHOLD;
+    if (health.failures < failureThreshold) {
+      emitProviderHealth();
+      return;
+    }
 
     health.cooldownUntil = Date.now() + (nonRetryable ? PROVIDER_HARD_FAILURE_COOLDOWN_MS : PROVIDER_COOLDOWN_MS);
     logTranslationEvent("PROVIDER_COOLDOWN", {
@@ -3291,6 +3297,7 @@ export const createInterpreterSession = async ({
   const session = createDeepgramSession({
     apiKey: env.deepgramApiKey,
     sourceLang,
+    clientFactory: deepgramClientFactory,
     onOpen: onReady,
     onError: (message) => {
       if (/closed unexpectedly/i.test(message || "")) {

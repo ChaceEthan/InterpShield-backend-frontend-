@@ -30,9 +30,23 @@ const isConnectionOpen = (connection) => {
   return readyState === 1 || readyState === "OPEN";
 };
 
+const audioFingerprint = (buffer) => {
+  if (!buffer?.length) return "";
+  let hash = 2166136261;
+  const step = Math.max(1, Math.floor(buffer.length / 64));
+
+  for (let index = 0; index < buffer.length; index += step) {
+    hash ^= buffer[index];
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return `${buffer.length}:${(hash >>> 0).toString(36)}`;
+};
+
 export const createDeepgramSession = ({
   apiKey,
   sourceLang,
+  clientFactory = createClient,
   onOpen,
   onTranscript,
   onError,
@@ -49,9 +63,11 @@ export const createDeepgramSession = ({
   let reconnectTimer = null;
   let healthTimer = null;
   let reconnecting = false;
+  let connecting = false;
   let reconnectAttempt = 0;
   let connectionGeneration = 0;
   const queuedAudio = [];
+  const queuedAudioFingerprints = new Set();
   const recentAudio = [];
   const maxQueuedChunks = MAX_QUEUED_CHUNKS;
   const health = {
@@ -83,7 +99,7 @@ export const createDeepgramSession = ({
     health.queuedChunks = queuedAudio.length;
     health.recentChunks = recentAudio.length;
     health.isOpen = isOpen && isConnectionOpen(connection);
-    health.reconnecting = reconnecting;
+    health.reconnecting = reconnecting || connecting;
     health.reconnectAttempt = reconnectAttempt;
   };
 
@@ -112,7 +128,10 @@ export const createDeepgramSession = ({
 
     if (connection?.socket?.send) {
       connection.socket.send(buffer);
+      return;
     }
+
+    throw new Error("Deepgram connection cannot accept media.");
   };
 
   const rememberRecentAudio = (buffer) => {
@@ -125,14 +144,23 @@ export const createDeepgramSession = ({
   const enqueueAudio = (buffer, { front = false, resend = false } = {}) => {
     if (!buffer?.length) return;
     const copy = Buffer.from(buffer);
+    const fingerprint = audioFingerprint(copy);
+    if (fingerprint && queuedAudioFingerprints.has(fingerprint)) {
+      updateQueueHealth();
+      return;
+    }
+
     if (front) queuedAudio.unshift(copy);
     else queuedAudio.push(copy);
+    if (fingerprint) queuedAudioFingerprints.add(fingerprint);
 
     if (resend) health.resentChunks += 1;
     health.lastAudioQueuedAt = Date.now();
 
     while (queuedAudio.length > maxQueuedChunks) {
-      queuedAudio.shift();
+      const dropped = queuedAudio.shift();
+      const droppedFingerprint = audioFingerprint(dropped);
+      if (droppedFingerprint) queuedAudioFingerprints.delete(droppedFingerprint);
       health.droppedChunks += 1;
       health.lastError = "Deepgram audio backlog exceeded protection limit.";
       onError?.("Deepgram audio backlog exceeded protection limit; preserving newest audio.");
@@ -151,16 +179,27 @@ export const createDeepgramSession = ({
   const flushQueuedAudio = () => {
     while (isOpen && isConnectionOpen(connection) && queuedAudio.length > 0) {
       const buffer = queuedAudio.shift();
-      sendToDeepgram(buffer);
-      rememberRecentAudio(buffer);
-      health.sentChunks += 1;
-      health.lastAudioSentAt = Date.now();
-      updateQueueHealth();
+      const fingerprint = audioFingerprint(buffer);
+      if (fingerprint) queuedAudioFingerprints.delete(fingerprint);
+
+      try {
+        sendToDeepgram(buffer);
+        rememberRecentAudio(buffer);
+        health.sentChunks += 1;
+        health.lastAudioSentAt = Date.now();
+        updateQueueHealth();
+      } catch (error) {
+        enqueueAudio(buffer, { front: true });
+        health.lastError = error?.message || String(error);
+        onError?.(error?.message || "Unable to flush queued audio to Deepgram.");
+        restartStream("flush_failed");
+        break;
+      }
     }
   };
 
   const scheduleReconnect = (reason = "stream_closed") => {
-    if (stopped || reconnecting) return;
+    if (stopped || reconnecting || connecting) return;
 
     reconnecting = true;
     reconnectAttempt += 1;
@@ -189,18 +228,26 @@ export const createDeepgramSession = ({
     reconnectTimer.unref?.();
   };
 
+  const invalidateAndCloseConnection = () => {
+    const staleConnection = connection;
+    connectionGeneration += 1;
+    connection = null;
+    isOpen = false;
+
+    try {
+      staleConnection?.close?.();
+    } catch {
+      // Ignore stale connection close errors during reconnect.
+    }
+  };
+
   const restartStream = (reason = "stream_restart") => {
-    if (stopped) return;
+    if (stopped || connecting) return;
     health.restarts += 1;
     health.state = "restarting";
     health.lastError = reason;
     enqueueRecentAudioForResend();
-    try {
-      connection?.close?.();
-    } catch {
-      // Ignore stale connection close errors during health restart.
-    }
-    isOpen = false;
+    invalidateAndCloseConnection();
     clearKeepAlive();
     scheduleReconnect(reason);
   };
@@ -209,7 +256,7 @@ export const createDeepgramSession = ({
     clearHealthTimer();
     healthTimer = setInterval(() => {
       updateQueueHealth();
-      if (stopped || reconnecting || !isOpen || !isConnectionOpen(connection)) return;
+      if (stopped || reconnecting || connecting || !isOpen || !isConnectionOpen(connection)) return;
 
       const now = Date.now();
       const lastActivityAt = Math.max(health.lastMessageAt || 0, health.lastTranscriptAt || 0, health.lastOpenAt || 0);
@@ -224,10 +271,12 @@ export const createDeepgramSession = ({
   };
 
   const start = async ({ reconnect = false } = {}) => {
-    const deepgram = createClient(apiKey);
+    const deepgram = clientFactory(apiKey);
     stopped = false;
+    connecting = true;
     clearKeepAlive();
     clearHealthTimer();
+    clearReconnect();
     const options = {
       model: "nova-3",
       Authorization: `Token ${apiKey}`,
@@ -237,20 +286,24 @@ export const createDeepgramSession = ({
       endpointing: 300,
       utterance_end_ms: 1000,
       vad_events: true,
-      reconnectAttempts: 3,
+      reconnectAttempts: 0,
       connectionTimeoutInSeconds: 10
     };
 
     Object.assign(options, normalizeDeepgramLanguage(sourceLang));
 
+    const generation = connectionGeneration + 1;
+    connectionGeneration = generation;
+    const staleConnection = connection;
+    connection = null;
+    isOpen = false;
+
     try {
-      connection?.close?.();
+      staleConnection?.close?.();
     } catch {
       // Ignore stale connection close errors during reconnect.
     }
 
-    const generation = connectionGeneration + 1;
-    connectionGeneration = generation;
     health.state = reconnect ? "reconnecting" : "connecting";
     updateQueueHealth();
     connection = await deepgram.listen.v1.connect(options);
@@ -261,6 +314,7 @@ export const createDeepgramSession = ({
       if (!isCurrentConnectionEvent()) return;
       clearReconnect();
       isOpen = true;
+      connecting = false;
       reconnectAttempt = 0;
       reconnecting = false;
       health.state = "open";
@@ -269,7 +323,7 @@ export const createDeepgramSession = ({
       console.info("[DEEPGRAM_OPEN]", { reconnect, queuedAudio: queuedAudio.length });
       keepAliveTimer = setInterval(() => {
         if (isOpen && isConnectionOpen(connection) && connection?.sendKeepAlive) {
-          connection.sendKeepAlive();
+          connection.sendKeepAlive({ type: "KeepAlive" });
           health.lastKeepAliveAt = Date.now();
         }
       }, DEEPGRAM_KEEPALIVE_MS);
@@ -303,6 +357,7 @@ export const createDeepgramSession = ({
 
     connection.on("error", (error) => {
       if (!isCurrentConnectionEvent()) return;
+      connecting = false;
       console.error("Deepgram error:", error);
       health.state = "error";
       health.lastError = error?.message || String(error);
@@ -314,6 +369,7 @@ export const createDeepgramSession = ({
     connection.on("close", () => {
       if (generation !== connectionGeneration || connection !== activeConnection) return;
       isOpen = false;
+      connecting = false;
       health.state = stopped ? "closed" : "closed_unexpectedly";
       health.lastCloseAt = Date.now();
       clearKeepAlive();
@@ -330,6 +386,7 @@ export const createDeepgramSession = ({
       await connection.waitForOpen();
     } catch (error) {
       if (!isCurrentConnectionEvent()) return;
+      connecting = false;
       console.warn("[DEEPGRAM_WAIT_FOR_OPEN_FAILED]", {
         reconnect,
         error: error?.message || String(error)
@@ -366,11 +423,13 @@ export const createDeepgramSession = ({
     stopped = true;
     connectionGeneration += 1;
     isOpen = false;
+    connecting = false;
     health.state = "stopped";
     clearKeepAlive();
     clearHealthTimer();
     clearReconnect();
     queuedAudio.length = 0;
+    queuedAudioFingerprints.clear();
     recentAudio.length = 0;
     updateQueueHealth();
 
@@ -396,7 +455,7 @@ export const createDeepgramSession = ({
       queuedChunks: queuedAudio.length,
       recentChunks: recentAudio.length,
       isOpen: isOpen && isConnectionOpen(connection),
-      reconnecting
+      reconnecting: reconnecting || connecting
     })
   };
 };
