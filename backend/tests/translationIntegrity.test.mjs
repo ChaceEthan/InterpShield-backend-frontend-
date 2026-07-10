@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { isTranslationDisplayable, runSequentialTasks } from "../services/interpreter.js";
+import { isTranslationDisplayable, runSequentialTasks, shouldDegradeProviderHealth } from "../services/interpreter.js";
 import { resolveLocalTranslation } from "../utils/translationEnhancer.js";
 import { createAudioPipelineSession, upsertCallRoomParticipant, removeCallRoomParticipant } from "../services/audioPipeline.js";
 import {
@@ -64,6 +64,9 @@ assert.equal(normalizeLanguageCode("luganda"), "lg");
 assert.equal(normalizeProviderText('  "Hola mundo"  '), "Hola mundo");
 assert.equal(isNonRetryableProviderError({ status: 401, message: "unauthorized" }), true);
 assert.equal(isNonRetryableProviderError({ message: "temporary network issue" }), false);
+assert.equal(shouldDegradeProviderHealth({ result: { provider: "gemini", translatedText: "Please give me your book." }, sourceText: source, sourceLang: "en", targetLang: "es", provider: "gemini" }), false);
+assert.equal(shouldDegradeProviderHealth({ result: { provider: "gemini", error: new Error("temporary network issue") }, sourceText: source, sourceLang: "en", targetLang: "es", provider: "gemini" }), true);
+assert.equal(shouldDegradeProviderHealth({ result: { provider: "openai", error: new Error("OpenAI 401 unauthorized") }, sourceText: source, sourceLang: "en", targetLang: "es", provider: "openai" }), true);
 
 let concurrentRuns = 0;
 let maxConcurrentRuns = 0;

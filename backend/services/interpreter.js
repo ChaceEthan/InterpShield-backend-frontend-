@@ -679,6 +679,35 @@ export const isTranslationDisplayable = ({ text = "", sourceText = "", sourceLan
   return true;
 };
 
+export const shouldDegradeProviderHealth = ({ result = null, error = null, sourceText = "", sourceLang = "", targetLang = "", provider = "" } = {}) => {
+  if (result?.stale) return false;
+
+  const candidateError = error || result?.error;
+  const providerName = result?.provider || provider;
+  const translatedText = result?.translatedText || "";
+  const displayable = Boolean(
+    translatedText && isTranslationDisplayable({
+      text: translatedText,
+      sourceText,
+      sourceLang,
+      targetLang,
+      provider: providerName
+    })
+  );
+
+  if (translatedText && !displayable) return false;
+  if (translatedText && displayable) return false;
+
+  if (result?.timedOut || candidateError?.name === "AbortError") return true;
+
+  return Boolean(
+    candidateError && (
+      isProviderNonRetryableFailure(candidateError) ||
+      isRetryableProviderError(candidateError)
+    )
+  );
+};
+
 const isCacheableTranslation = ({ text = "", sourceText = "", provider = "", sourceLang = "", targetLang = "" } = {}) =>
   isTranslationDisplayable({ text, sourceText, provider, sourceLang, targetLang });
 
@@ -1672,14 +1701,26 @@ export const createInterpreterSession = async ({
     }
 
     refreshProviderCooldowns();
-    const providerOrder = [
-      ...getHealthyProviders()
-    ];
+    const providerOrder = [...getHealthyProviders()];
+    const providerSelectionDiagnostics = Object.entries(providerHealth).map(([name, health]) => {
+      const hasKey = name === "gemini" ? Boolean(env.geminiApiKey) : Boolean(env.openaiApiKey);
+      const cooldownRemainingMs = Math.max(0, (health.cooldownUntil || 0) - Date.now());
+      return {
+        name,
+        configured: hasKey,
+        available: hasKey && Date.now() >= (health.cooldownUntil || 0),
+        cooldownRemainingMs,
+        failures: health.failures,
+        lastSuccessAt: health.lastSuccessAt
+      };
+    });
     logTranslationEvent("PROVIDER_SELECTION", {
       sessionId,
       jobId,
       targetLang: language,
       provider: providerOrder.join(",") || "none",
+      selectedProviderCount: providerOrder.length,
+      providers: providerSelectionDiagnostics,
       preferredProvider,
       userPlan
     });
@@ -1689,7 +1730,7 @@ export const createInterpreterSession = async ({
         sessionId,
         jobId,
         targetLang: language,
-        error: "No healthy translation providers available"
+        error: `No healthy translation providers available. Diagnostics: ${providerSelectionDiagnostics.map(({ name, configured, available, cooldownRemainingMs, failures }) => `${name} configured=${configured} available=${available} cooldownMs=${cooldownRemainingMs} failures=${failures}`).join(" | ")}`
       }, "warn");
     }
 
@@ -1735,7 +1776,18 @@ export const createInterpreterSession = async ({
         languageState.httpStatus = getErrorStatusCode(lastError);
         languageState.fallbackProvider = providerOrder[providerOrder.indexOf(result.provider) + 1] || null;
       }
-      if (result.provider) noteProviderFailure(result.provider, lastError);
+      if (
+        result.provider && shouldDegradeProviderHealth({
+          result,
+          error: result.error,
+          sourceText: translationInput,
+          sourceLang: direction.source,
+          targetLang: language,
+          provider: result.provider
+        })
+      ) {
+        noteProviderFailure(result.provider, lastError);
+      }
       return { text: "", provider: result.provider };
     };
 
