@@ -708,6 +708,42 @@ export const shouldDegradeProviderHealth = ({ result = null, error = null, sourc
   );
 };
 
+export const buildProviderExecutionOrder = ({ providerHealth = {}, env = {}, preferredProvider = "auto", userPlan = "free", rotationOffset = 0 } = {}) => {
+  const providers = ["gemini", "openai"].filter((name) => {
+    const hasKey = name === "gemini" ? Boolean(env.geminiApiKey) : Boolean(env.openaiApiKey);
+    return hasKey;
+  });
+
+  if (providers.length === 0) return [];
+
+  const now = Date.now();
+  const ranked = providers
+    .map((name) => {
+      const health = providerHealth[name] || {};
+      const cooldownRemainingMs = Math.max(0, (health.cooldownUntil || 0) - now);
+      const isHealthy = cooldownRemainingMs === 0;
+      const failures = Number.isFinite(health.failures) ? health.failures : 0;
+      const lastSuccessAt = Number.isFinite(health.lastSuccessAt) ? health.lastSuccessAt : 0;
+      return { name, failures, cooldownRemainingMs, isHealthy, lastSuccessAt };
+    })
+    .sort((a, b) => {
+      if (a.isHealthy !== b.isHealthy) return a.isHealthy ? -1 : 1;
+      if (a.failures !== b.failures) return a.failures - b.failures;
+      if (a.cooldownRemainingMs !== b.cooldownRemainingMs) return a.cooldownRemainingMs - b.cooldownRemainingMs;
+      if (a.name === preferredProvider && b.name !== preferredProvider) return -1;
+      if (b.name === preferredProvider && a.name !== preferredProvider) return 1;
+      return (a.lastSuccessAt || 0) - (b.lastSuccessAt || 0);
+    });
+
+  const rotated = [...ranked];
+  const offset = Math.abs(rotationOffset % rotated.length);
+  for (let index = 0; index < offset; index += 1) {
+    rotated.push(rotated.shift());
+  }
+
+  return rotated.map(({ name }) => name);
+};
+
 const isCacheableTranslation = ({ text = "", sourceText = "", provider = "", sourceLang = "", targetLang = "" } = {}) =>
   isTranslationDisplayable({ text, sourceText, provider, sourceLang, targetLang });
 
@@ -1356,24 +1392,19 @@ export const createInterpreterSession = async ({
 
   const getHealthyProviders = () => {
     refreshProviderCooldowns();
-    let primaryChoice = userPlan === "pro" ? "openai" : "gemini";
-    if (preferredProvider && preferredProvider !== "auto") {
-      primaryChoice = preferredProvider;
-    }
-    const providers = Object.entries(providerHealth)
-      .filter(([name, health]) => {
-        const hasKey = name === "gemini" ? env.geminiApiKey : env.openaiApiKey;
-        return hasKey && Date.now() >= health.cooldownUntil;
-      });
-
-    return providers.sort((a, b) => {
-      if (a[1].failures !== b[1].failures) return a[1].failures - b[1].failures;
-
-      if (a[0] === primaryChoice && b[0] !== primaryChoice) return -1;
-      if (b[0] === primaryChoice && a[0] !== primaryChoice) return 1;
-
-      return b[1].lastSuccessAt - a[1].lastSuccessAt;
-    }).map(([name]) => name);
+    const primaryChoice = preferredProvider && preferredProvider !== "auto"
+      ? preferredProvider
+      : userPlan === "pro"
+        ? "openai"
+        : "gemini";
+    const order = buildProviderExecutionOrder({
+      providerHealth,
+      env,
+      preferredProvider: primaryChoice,
+      userPlan,
+      rotationOffset: translationMetrics.completedCount + translationMetrics.failedCount
+    });
+    return order;
   };
 
   const rememberLocalSourceLanguage = ({ text = "", language, confidence = 0 } = {}) => {

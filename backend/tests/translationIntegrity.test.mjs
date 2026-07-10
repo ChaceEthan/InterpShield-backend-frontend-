@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { isTranslationDisplayable, runSequentialTasks, shouldDegradeProviderHealth } from "../services/interpreter.js";
+import { buildProviderExecutionOrder, isTranslationDisplayable, runSequentialTasks, shouldDegradeProviderHealth } from "../services/interpreter.js";
 import { resolveLocalTranslation } from "../utils/translationEnhancer.js";
 import { createAudioPipelineSession, upsertCallRoomParticipant, removeCallRoomParticipant } from "../services/audioPipeline.js";
 import {
@@ -67,6 +67,46 @@ assert.equal(isNonRetryableProviderError({ message: "temporary network issue" })
 assert.equal(shouldDegradeProviderHealth({ result: { provider: "gemini", translatedText: "Please give me your book." }, sourceText: source, sourceLang: "en", targetLang: "es", provider: "gemini" }), false);
 assert.equal(shouldDegradeProviderHealth({ result: { provider: "gemini", error: new Error("temporary network issue") }, sourceText: source, sourceLang: "en", targetLang: "es", provider: "gemini" }), true);
 assert.equal(shouldDegradeProviderHealth({ result: { provider: "openai", error: new Error("OpenAI 401 unauthorized") }, sourceText: source, sourceLang: "en", targetLang: "es", provider: "openai" }), true);
+const now = Date.now();
+assert.deepEqual(
+  buildProviderExecutionOrder({
+    providerHealth: {
+      gemini: { failures: 0, cooldownUntil: 0, lastSuccessAt: now - 1000 },
+      openai: { failures: 0, cooldownUntil: 0, lastSuccessAt: now - 500 }
+    },
+    env: { geminiApiKey: "key", openaiApiKey: "key" },
+    preferredProvider: "gemini",
+    userPlan: "free",
+    rotationOffset: 0
+  }),
+  ["gemini", "openai"]
+);
+assert.deepEqual(
+  buildProviderExecutionOrder({
+    providerHealth: {
+      gemini: { failures: 5, cooldownUntil: now + 30000, lastSuccessAt: now - 5000 },
+      openai: { failures: 0, cooldownUntil: 0, lastSuccessAt: now - 1000 }
+    },
+    env: { geminiApiKey: "key", openaiApiKey: "key" },
+    preferredProvider: "gemini",
+    userPlan: "free",
+    rotationOffset: 0
+  }),
+  ["openai", "gemini"]
+);
+assert.deepEqual(
+  buildProviderExecutionOrder({
+    providerHealth: {
+      gemini: { failures: 0, cooldownUntil: 0, lastSuccessAt: now - 1000 },
+      openai: { failures: 0, cooldownUntil: 0, lastSuccessAt: now - 500 }
+    },
+    env: { geminiApiKey: "key", openaiApiKey: "key" },
+    preferredProvider: "gemini",
+    userPlan: "free",
+    rotationOffset: 1
+  }),
+  ["openai", "gemini"]
+);
 
 let concurrentRuns = 0;
 let maxConcurrentRuns = 0;
