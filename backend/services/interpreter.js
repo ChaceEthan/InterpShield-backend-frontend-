@@ -470,17 +470,18 @@ const isProviderFailureText = (text = "") =>
 
 const isProviderNonRetryableFailure = (error = {}) => {
   const message = getProviderErrorMessage(error);
-  const statusCode = Number(error?.status || error?.statusCode || error?.response?.status || error?.code);
+  const statusCode = getErrorStatusCode(error);
 
   if ([400, 401, 403, 404].includes(statusCode)) return true;
   return /\b(400|401|403|404)\b|quota|insufficient|credit|billing|unauthori[sz]ed|forbidden|invalid api key|permission|resource_exhausted/i.test(message);
 };
 
-const isRetryableProviderError = (error = {}) => {
+export const isRetryableProviderError = (error = {}) => {
   const message = getProviderErrorMessage(error);
   if (!message) return false;
+  if (error?.providerRetryExhausted) return false;
 
-  const statusCode = Number(error?.status || error?.statusCode || error?.response?.status || error?.code);
+  const statusCode = getErrorStatusCode(error);
   if ([408, 409, 429, 500, 502, 503, 504].includes(statusCode)) return true;
   return !isProviderNonRetryableFailure(error) && /timed out|timeout|temporar|network|socket hang up|econnreset|fetch failed|reset|retry|overload|unavailable|busy/i.test(message);
 };
@@ -1152,6 +1153,7 @@ export const createInterpreterSession = async ({
         socketId: session?.socketId || "",
         retryCount: 0,
         provider: null,
+        providerModel: null,
         providerSelected: null,
         fallbackProvider: null,
         httpStatus: null,
@@ -1250,9 +1252,10 @@ export const createInterpreterSession = async ({
     }
   });
 
-  const createTranslationDiagnostics = ({ language, provider, reason, retryCount = 0, latencyMs, requestId, socketId, status = "unknown", fallbackProvider, httpStatus, providerResponse, queueLength = null, activeWorkers = null }) => ({
+  const createTranslationDiagnostics = ({ language, provider, providerModel = null, reason, retryCount = 0, latencyMs, requestId, socketId, status = "unknown", fallbackProvider, httpStatus, providerResponse, queueLength = null, activeWorkers = null }) => ({
     language,
     provider,
+    providerModel,
     retryCount,
     latencyMs,
     httpStatus,
@@ -1267,7 +1270,7 @@ export const createInterpreterSession = async ({
     activeWorkers
   });
 
-  const buildTranslationFailureDiagnostic = ({ provider = "unknown", statusCode = null, reason = "failed", retryAfterMs = null, requestId = null, latencyMs = 0, fallbackProvider = null, providerResponse = null, attempt = 0, queueLength = null, activeWorkers = null }) => {
+  const buildTranslationFailureDiagnostic = ({ provider = "unknown", providerModel = null, statusCode = null, reason = "failed", retryAfterMs = null, requestId = null, latencyMs = 0, fallbackProvider = null, providerResponse = null, attempt = 0, queueLength = null, activeWorkers = null }) => {
     const providerName = typeof provider === "string" && provider.trim()
       ? provider.charAt(0).toUpperCase() + provider.slice(1)
       : "Provider";
@@ -1276,6 +1279,7 @@ export const createInterpreterSession = async ({
     const lines = [
       "FAILED",
       `Provider: ${providerName}`,
+      `Provider Model: ${providerModel || "unknown"}`,
       `HTTP Status: ${statusCode || "unknown"}`,
       `Failure Reason: ${summaryReason}`,
       `Latency: ${Number.isFinite(latencyMs) ? latencyMs : 0}ms`,
@@ -1292,6 +1296,7 @@ export const createInterpreterSession = async ({
     return {
       message: lines.join("\n"),
       provider: providerName,
+      providerModel,
       httpStatus: statusCode,
       reason: summaryReason,
       retryAfterMs,
@@ -1481,8 +1486,22 @@ export const createInterpreterSession = async ({
     const health = providerHealth[provider];
     if (!health) return;
     const nonRetryable = isProviderNonRetryableFailure(error);
+    const statusCode = getErrorStatusCode(error);
+    const retryAfterMs = Number(error?.retryAfterMs);
 
     health.failures += 1;
+    if (statusCode === 429 && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+      health.cooldownUntil = Math.max(health.cooldownUntil || 0, Date.now() + retryAfterMs);
+      logTranslationEvent("PROVIDER_COOLDOWN", {
+        sessionId,
+        provider,
+        reason: "retry_after",
+        retryAfterMs,
+        error: error?.reason || getProviderErrorMessage(error)
+      }, "warn");
+      emitProviderHealth();
+      return;
+    }
     const failureThreshold = nonRetryable ? PROVIDER_NON_RETRYABLE_FAILURE_THRESHOLD : PROVIDER_FAILURE_THRESHOLD;
     if (health.failures < failureThreshold) {
       emitProviderHealth();
@@ -1718,9 +1737,10 @@ export const createInterpreterSession = async ({
       state.timeoutTimer = null;
       state.provider = provider;
       state.providerSelected = provider;
+      state.providerModel = provider === "gemini" ? env.geminiModel || null : state.providerModel;
       state.requestId = requestId || `${jobId}:${language}:${Date.now().toString(36)}`;
       state.socketId = session?.socketId || "";
-            state.queueLength = queueLength;
+      state.queueLength = queueLength;
       state.activeWorkers = activeWorkers;
       state.status = "processing";
       state.lastError = null;
@@ -1732,32 +1752,54 @@ export const createInterpreterSession = async ({
     }
     const attemptPromise = (async () => {
       try {
-      logTranslationEvent("TRANSLATION_REQUEST", {
-        sessionId,
-        requestId: requestId || `${jobId}:${language}:${provider}:${Date.now().toString(36)}`,
-        provider,
-        targetLang: language,
-        queueLength,
-        activeWorkers,
-        retries: attempt,
-        sourceLang: direction.source,
-        chars: translationInput.length
-      });
-        const translatedText = await withTimeout(
+        logTranslationEvent("TRANSLATION_REQUEST", {
+          sessionId,
+          requestId: requestId || `${jobId}:${language}:${provider}:${Date.now().toString(36)}`,
+          provider,
+          targetLang: language,
+          queueLength,
+          activeWorkers,
+          retries: attempt,
+          sourceLang: direction.source,
+          chars: translationInput.length
+        });
+        const providerResult = await withTimeout(
           providerRunner(provider)({
             apiKey: provider === "gemini" ? env.geminiApiKey : env.openaiApiKey,
+            ...(provider === "gemini" ? { model: env.geminiModel } : {}),
             text: translationInput,
             sourceLang: sourceLanguageForProvider(direction.source),
             targetLang: language,
             translationContext: languageTranslationContext,
-            signal: abortController?.signal
+            signal: abortController?.signal,
+            includeMetadata: true
           }),
           timeoutMs,
           `${providerName} translation timed out for ${language}`
         );
         const responseTimeMs = Date.now() - attemptStartedAt;
-      rememberProviderLatency(provider, responseTimeMs);
-      const safeTranslatedText = String(translatedText || "").trim();
+        rememberProviderLatency(provider, responseTimeMs);
+        const providerModel = providerResult && typeof providerResult === "object"
+          ? providerResult.providerModel || providerResult.model || null
+          : null;
+        const providerRetryCount = providerResult && typeof providerResult === "object"
+          ? Number(providerResult.retryCount) || 0
+          : 0;
+        const providerHttpStatus = providerResult && typeof providerResult === "object"
+          ? Number(providerResult.httpStatus) || 200
+          : 200;
+        const providerLatencyMs = providerResult && typeof providerResult === "object" && Number.isFinite(providerResult.latencyMs)
+          ? providerResult.latencyMs
+          : responseTimeMs;
+        const translatedText = providerResult && typeof providerResult === "object"
+          ? providerResult.text
+          : providerResult;
+        const safeTranslatedText = String(translatedText || "").trim();
+        if (state) {
+          state.providerModel = providerModel;
+          state.retryCount = Math.max(state.retryCount || 0, attempt + providerRetryCount);
+          state.httpStatus = providerHttpStatus;
+        }
 
       if (staleTranslationJobs.has(jobId)) {
         return {
@@ -1784,6 +1826,7 @@ export const createInterpreterSession = async ({
             requestId: requestId || `${jobId}:${language}:${provider}:${Date.now().toString(36)}`,
             jobId,
             provider,
+            providerModel,
             targetLang: language,
             latencyMs: responseTimeMs,
             queueLength,
@@ -1795,7 +1838,11 @@ export const createInterpreterSession = async ({
           });
           return {
             provider,
+            providerModel,
             translatedText: safeTranslatedText,
+            httpStatus: providerHttpStatus,
+            retryCount: attempt + providerRetryCount,
+            latencyMs: providerLatencyMs,
             responseTimeMs
           };
         }
@@ -1811,6 +1858,10 @@ export const createInterpreterSession = async ({
 
         return {
           provider,
+          providerModel,
+          httpStatus: providerHttpStatus,
+          retryCount: attempt + providerRetryCount,
+          latencyMs: providerLatencyMs,
           responseTimeMs,
           error: new Error(`Invalid ${providerName} translation response for ${language}`)
         };
@@ -1819,23 +1870,33 @@ export const createInterpreterSession = async ({
         const timedOut = /timed out|timeout/i.test(error?.message || "");
         if (timedOut) translationMetrics.timeoutCount += 1;
         rememberProviderLatency(provider, responseTimeMs);
+        if (state) {
+          state.providerModel = error?.providerModel || error?.model || state.providerModel || null;
+          state.retryCount = Math.max(state.retryCount || 0, attempt + (Number(error?.retryCount) || 0));
+          state.httpStatus = getErrorStatusCode(error);
+        }
         logTranslationEvent("TRANSLATION_FAILED", {
           sessionId,
           requestId: requestId || `${jobId}:${language}:${provider}:${Date.now().toString(36)}`,
           jobId,
           provider,
+          providerModel: error?.providerModel || error?.model || state?.providerModel || null,
           targetLang: language,
           queueLength,
           activeWorkers,
           retries: attempt,
           latencyMs: responseTimeMs,
           httpStatus: getErrorStatusCode(error),
-          reason: error?.message || String(error),
-          providerResponse: error?.message || String(error),
+          reason: error?.reason || error?.message || String(error),
+          providerResponse: error?.reason || error?.message || String(error),
           timeoutMs
         }, "warn");
         return {
           provider,
+          providerModel: error?.providerModel || error?.model || state?.providerModel || null,
+          httpStatus: getErrorStatusCode(error),
+          retryCount: attempt + (Number(error?.retryCount) || 0),
+          latencyMs: responseTimeMs,
           error,
           timedOut,
           responseTimeMs
@@ -1862,6 +1923,7 @@ export const createInterpreterSession = async ({
 
   const translateProviderLanguageWithRecovery = async ({ language, translationInput, direction, translationContext, jobId, job = null, queueLength = 0, activeWorkers = 0, requestId = null }) => {
     let lastError = null;
+    let lastAttemptedProvider = null;
     const languageTranslationContext = languageTranslationContextFor(language, translationContext);
     const languageState = getOrCreateLanguageState(job, language);
     const cacheKey = translationCacheKey({ source: direction.source, target: language, text: translationInput });
@@ -1931,8 +1993,10 @@ export const createInterpreterSession = async ({
         if (languageState) {
           languageState.providerSelected = result.provider;
           languageState.provider = result.provider;
+          languageState.providerModel = result.providerModel || null;
           languageState.fallbackProvider = null;
-          languageState.httpStatus = null;
+          languageState.httpStatus = result.httpStatus || 200;
+          languageState.retryCount = Math.max(languageState.retryCount || 0, result.retryCount || 0);
           languageState.lastError = null;
           languageState.status = "translated";
         }
@@ -1944,13 +2008,21 @@ export const createInterpreterSession = async ({
           sourceText: translationInput,
           provider: result.provider
         });
-        return { text: result.translatedText, provider: result.provider };
+        return {
+          text: result.translatedText,
+          provider: result.provider,
+          providerModel: result.providerModel || null,
+          httpStatus: result.httpStatus || 200,
+          retryCount: result.retryCount || 0,
+          latencyMs: result.latencyMs || result.responseTimeMs || 0
+        };
       }
 
       lastError = result.error || new Error(`${result.provider || "Provider"} did not return a valid ${language} translation`);
       if (languageState) {
         languageState.lastError = lastError;
         languageState.httpStatus = getErrorStatusCode(lastError);
+        languageState.providerModel = result.providerModel || lastError?.providerModel || lastError?.model || languageState.providerModel || null;
         languageState.fallbackProvider = providerOrder[providerOrder.indexOf(result.provider) + 1] || null;
       }
       if (
@@ -1965,7 +2037,15 @@ export const createInterpreterSession = async ({
       ) {
         noteProviderFailure(result.provider, lastError);
       }
-      return { text: "", provider: result.provider };
+      return {
+        text: "",
+        provider: result.provider,
+        providerModel: result.providerModel || lastError?.providerModel || lastError?.model || null,
+        httpStatus: result.httpStatus || getErrorStatusCode(lastError),
+        retryCount: result.retryCount || 0,
+        latencyMs: result.latencyMs || result.responseTimeMs || 0,
+        error: lastError
+      };
     };
 
     for (const provider of providerOrder) {
@@ -1990,6 +2070,7 @@ export const createInterpreterSession = async ({
           if (staleTranslationJobs.has(jobId)) break;
         }
 
+        lastAttemptedProvider = provider;
         const result = await runProviderTranslationAttempt({
           provider,
           language,
@@ -2023,6 +2104,7 @@ export const createInterpreterSession = async ({
         sessionId,
         jobId,
         provider,
+        providerModel: lastError?.providerModel || lastError?.model || languageState?.providerModel || null,
         targetLang: language,
         nextProvider: providerOrder[providerOrder.indexOf(provider) + 1] || "none",
         error: lastError?.message || lastError
@@ -2030,7 +2112,15 @@ export const createInterpreterSession = async ({
     }
 
     noteTranslationFailure(language, lastError);
-    return { text: "", provider: providerOrder[providerOrder.length - 1] || "provider", error: lastError };
+    return {
+      text: "",
+      provider: lastAttemptedProvider || lastError?.provider || "provider",
+      providerModel: lastError?.providerModel || lastError?.model || languageState?.providerModel || null,
+      httpStatus: getErrorStatusCode(lastError),
+      retryCount: languageState?.retryCount || 0,
+      latencyMs: Number(lastError?.latencyMs) || 0,
+      error: lastError
+    };
   };
 
   const translationTaskKey = (jobId, language) => `${jobId}:${language}`;
@@ -2191,21 +2281,29 @@ export const createInterpreterSession = async ({
       originalText: job.sentence,
       ...createTranslationPayloadMetadata(job),
       translatedText: job.translations[language] || "",
-      diagnostics: createTranslationDiagnostics({
-        language,
-        provider,
-        reason: status === "failed" && errorPayload?.diagnostics?.message ? errorPayload.diagnostics.message : status,
-        retryCount: languageState?.retryCount || job.providerRetryAttempts?.get?.(language) || 0,
-        latencyMs: Date.now() - job.startedAt,
-        requestId: languageState?.requestId || `${job.id}:${language}`,
-        socketId: languageState?.socketId || session?.socketId || "",
-        status,
-        fallbackProvider: languageState?.fallbackProvider || (job.providerFallbackLanguages?.has?.(language) ? "provider-fallback" : undefined),
-        httpStatus: languageState?.httpStatus || null,
-        providerResponse: errorPayload?.diagnostics?.providerResponse || null,
-        queueLength: languageState?.queueLength ?? errorPayload?.diagnostics?.queueLength ?? null,
-        activeWorkers: languageState?.activeWorkers ?? errorPayload?.diagnostics?.activeWorkers ?? null
-      }),
+      diagnostics: status === "failed" && errorPayload?.diagnostics
+        ? {
+            ...errorPayload.diagnostics,
+            language,
+            providerModel: errorPayload.diagnostics.providerModel || languageState?.providerModel || null,
+            requestId: errorPayload.diagnostics.requestId || languageState?.requestId || `${job.id}:${language}`
+          }
+        : createTranslationDiagnostics({
+            language,
+            provider,
+            providerModel: languageState?.providerModel || null,
+            reason: status,
+            retryCount: languageState?.retryCount || job.providerRetryAttempts?.get?.(language) || 0,
+            latencyMs: Date.now() - job.startedAt,
+            requestId: languageState?.requestId || `${job.id}:${language}`,
+            socketId: languageState?.socketId || session?.socketId || "",
+            status,
+            fallbackProvider: languageState?.fallbackProvider || (job.providerFallbackLanguages?.has?.(language) ? "provider-fallback" : undefined),
+            httpStatus: languageState?.httpStatus || null,
+            providerResponse: null,
+            queueLength: languageState?.queueLength ?? null,
+            activeWorkers: languageState?.activeWorkers ?? null
+          }),
       translations: { ...job.translations },
       translationOutputs: translationOutputsForJob(job),
       translationStatus: translationStatusForJob(job),
@@ -2247,18 +2345,22 @@ export const createInterpreterSession = async ({
 
     const languageState = getOrCreateLanguageState(job, language);
     const latencyMs = Date.now() - job.startedAt;
-    const attempt = (job.providerRetryAttempts?.get?.(language) || 0) + 1;
+    const attempt = Math.max(languageState?.retryCount || 0, job.providerRetryAttempts?.get?.(language) || 0);
 
     let reason = "failed";
+    let failureProvider = provider;
     let statusCode = null;
     let providerResponse = null;
+    let providerModel = languageState?.providerModel || null;
     let retryAfterMs = null;
     let requestId = null;
 
     if (errorOrReason && typeof errorOrReason === "object") {
+      failureProvider = errorOrReason.provider || provider;
       reason = errorOrReason.message || errorOrReason.reason || "failed";
       statusCode = getErrorStatusCode(errorOrReason) || null;
       providerResponse = errorOrReason.providerResponse || errorOrReason.response || errorOrReason.message || null;
+      providerModel = errorOrReason.providerModel || errorOrReason.model || providerModel;
       retryAfterMs = errorOrReason.retryAfterMs || null;
       requestId = errorOrReason.requestId || languageState?.requestId || null;
     } else {
@@ -2267,7 +2369,8 @@ export const createInterpreterSession = async ({
     }
 
     const diagnostic = buildTranslationFailureDiagnostic({
-      provider,
+      provider: failureProvider,
+      providerModel,
       statusCode,
       reason,
       retryAfterMs,
@@ -2282,7 +2385,8 @@ export const createInterpreterSession = async ({
     if (!job.languageErrors) job.languageErrors = {};
     job.languageErrors[language] = {
       language,
-      provider,
+      provider: failureProvider,
+      providerModel,
       statusCode,
       attempt,
       latencyMs,
@@ -2305,7 +2409,7 @@ export const createInterpreterSession = async ({
       targetLang: language,
       completedLanguages: [...(job.completedLanguages || new Set())],
       remainingLanguages: [...(job.pendingLanguages || new Set()), ...(job.runningLanguages || new Set())],
-      provider,
+      provider: failureProvider,
       latencyMs,
       error: reason,
       statusCode,
@@ -2572,10 +2676,11 @@ export const createInterpreterSession = async ({
     touchSessionHistory(sessionId);
   };
 
-  const emitTranslationUpdate = (job, language, translatedText, provider) => {
+  const emitTranslationUpdate = (job, language, translatedText, provider, providerModel = null) => {
     if (!translatedText || job.stale || staleTranslationJobs.has(job.id)) return false;
     const safeTranslatedText = cleanTranscriptText(translatedText);
     const languageState = getOrCreateLanguageState(job, language);
+    const actualProviderModel = providerModel || languageState?.providerModel || null;
     if (
       !isTranslationDisplayable({
         text: safeTranslatedText,
@@ -2589,6 +2694,14 @@ export const createInterpreterSession = async ({
     }
 
     job.translations[language] = safeTranslatedText;
+    if (job.languageErrors?.[language]) delete job.languageErrors[language];
+    if (languageState) {
+      languageState.provider = provider;
+      languageState.providerModel = actualProviderModel;
+      languageState.lastError = null;
+      languageState.status = "translated";
+      languageState.httpStatus = 200;
+    }
     job.lastProviderUsed = provider;
     setTranslationLanguageStatus(job, language, "translated");
     const translationOutputs = translationOutputsForJob(job);
@@ -2597,6 +2710,7 @@ export const createInterpreterSession = async ({
     logTranslationEvent("TRANSLATION_SUCCESS", {
       jobId: job.id,
       provider,
+      providerModel: actualProviderModel,
       sourceLang: job.direction.source,
       targetLang: language,
       latencyMs: Date.now() - job.startedAt,
@@ -2611,6 +2725,7 @@ export const createInterpreterSession = async ({
       diagnostics: createTranslationDiagnostics({
         language,
         provider,
+        providerModel: actualProviderModel,
         reason: "translated",
         retryCount: languageState?.retryCount || job.providerRetryAttempts?.get?.(language) || 0,
         latencyMs: Date.now() - job.startedAt,
@@ -2635,6 +2750,7 @@ export const createInterpreterSession = async ({
       detectedLanguage: job.detectedLanguage,
       latencyMs: Date.now() - job.startedAt,
       provider,
+      providerModel: actualProviderModel,
       mode: "production"
     });
     logTranslationEvent("LANGUAGE_EMIT", {
@@ -3160,12 +3276,13 @@ export const createInterpreterSession = async ({
           })
         ) {
           finishSequentialLanguage(job, language, "translated");
-          emitTranslationUpdate(job, language, translatedText, provider);
+          emitTranslationUpdate(job, language, translatedText, provider, result?.providerModel || null);
           logTranslationEvent("LANGUAGE_SUCCESS", {
             sessionId,
             sequence: job.sequence,
             language,
             provider,
+            providerModel: result?.providerModel || null,
             latency: Date.now() - languageStartedAt,
             jobId: job.id,
             requestId: context.requestId || `${job.id}:${language}`
@@ -3174,8 +3291,9 @@ export const createInterpreterSession = async ({
           finishSequentialLanguage(job, language, "failed");
           const providerFailure = result?.error;
           markTranslationLanguageFailed(job, language, {
-            message: providerFailure?.message || "empty_or_invalid_translation",
+            message: providerFailure?.reason || providerFailure?.message || "empty_or_invalid_translation",
             provider,
+            providerModel: result?.providerModel || providerFailure?.providerModel || providerFailure?.model || null,
             requestId: context.requestId || `${job.id}:${language}`,
             providerResponse: providerFailure?.message || translatedText || "",
             statusCode: getErrorStatusCode(providerFailure),
@@ -3186,6 +3304,7 @@ export const createInterpreterSession = async ({
             sequence: job.sequence,
             language,
             provider,
+            providerModel: result?.providerModel || providerFailure?.providerModel || providerFailure?.model || null,
             latency: Date.now() - languageStartedAt,
             jobId: job.id,
             requestId: context.requestId || `${job.id}:${language}`
@@ -3196,8 +3315,9 @@ export const createInterpreterSession = async ({
           noteTranslationFailure(language, error);
           finishSequentialLanguage(job, language, "failed");
           markTranslationLanguageFailed(job, language, {
-            message: error?.message || "translation_failed",
+            message: error?.reason || error?.message || "translation_failed",
             provider: "orchestrator",
+            providerModel: error?.providerModel || error?.model || null,
             requestId: context.requestId || `${job.id}:${language}`,
             providerResponse: error?.message || String(error),
             statusCode: getErrorStatusCode(error),

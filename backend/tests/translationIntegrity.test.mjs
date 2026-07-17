@@ -196,7 +196,7 @@ assert.match(frontendSource, /completedTranslationSignaturesRef/);
 assert.match(frontendSource, /staleUpdates\[language\]\s*=\s*"stale"/);
 assert.match(readFileSync(resolve(__dirname, "../services/openai.js"), "utf8"), /mergeAbortSignals\(signal,\s*controller\.signal\)/);
 assert.doesNotMatch(readFileSync(resolve(__dirname, "../services/openai.js"), "utf8"), /forbidden output languages/);
-assert.match(readFileSync(resolve(__dirname, "../services/gemini.js"), "utf8"), /createAbortPromise/);
+assert.match(readFileSync(resolve(__dirname, "../services/gemini.js"), "utf8"), /mergeAbortSignals/);
 assert.match(readFileSync(resolve(__dirname, "../services/gemini.js"), "utf8"), /clearTimeout\(timeout\)/);
 assert.match(readFileSync(resolve(__dirname, "../services/audioPipeline.js"), "utf8"), /DUPLICATE_HASH_WINDOW\s*=\s*24/);
 assert.match(readFileSync(resolve(__dirname, "../services/deepgram.js"), "utf8"), /MAX_QUEUED_CHUNKS\s*=\s*2400/);

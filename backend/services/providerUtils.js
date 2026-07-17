@@ -14,27 +14,34 @@ export const normalizeForComparison = (value = "") =>
     .replace(/[.!?]+$/g, "");
 
 export const delay = (ms) => new Promise((resolve) => {
-  const timer = setTimeout(resolve, ms);
-  timer.unref?.();
+  setTimeout(resolve, ms);
 });
+
+export const getRetryAfterMs = (error = {}) => {
+  const headers = error.headers || error.response?.headers;
+  const rawValue = typeof headers?.get === "function"
+    ? headers.get("retry-after")
+    : headers?.["retry-after"] || headers?.["Retry-After"];
+
+  if (rawValue === undefined || rawValue === null || String(rawValue).trim() === "") return null;
+
+  const value = String(rawValue).trim();
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+
+  const retryAt = Date.parse(value);
+  return Number.isFinite(retryAt) ? Math.max(0, retryAt - Date.now()) : null;
+};
 
 export const getRetryDelay = ({ attempt = 1, baseMs = 1000, maxMs = 4000, error = null }) => {
   if (error) {
-    const headers = error.headers || error.response?.headers;
-    if (headers) {
-      const retryAfterHeader = typeof headers.get === "function" ? headers.get("retry-after") : headers["retry-after"];
-      if (retryAfterHeader) {
-        const seconds = parseInt(retryAfterHeader, 10);
-        if (!isNaN(seconds) && seconds > 0) {
-          return seconds * 1000;
-        }
-      }
-    }
+    const retryAfterMs = getRetryAfterMs(error);
+    if (retryAfterMs !== null) return Math.min(maxMs, retryAfterMs);
     const match = /retry after (\d+) second/i.exec(error.message || "");
     if (match) {
       const seconds = parseInt(match[1], 10);
       if (!isNaN(seconds) && seconds > 0) {
-        return seconds * 1000;
+        return Math.min(maxMs, seconds * 1000);
       }
     }
   }

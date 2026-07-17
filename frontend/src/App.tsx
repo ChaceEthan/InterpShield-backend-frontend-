@@ -51,9 +51,10 @@ type TranslationLifecycleState = "ready" | "queued" | "processing" | "translatin
 type TranslationProviderDiagnostic = {
   language?: string;
   provider?: string;
-  retryCount?: number;
-  latencyMs?: number;
-  requestId?: string;
+  providerModel?: string | null;
+  retryCount?: number | null;
+  latencyMs?: number | null;
+  requestId?: string | null;
   status?: string;
   reason?: string;
   httpStatus?: number | string | null;
@@ -630,14 +631,19 @@ const coerceTranslationState = (value: unknown): TranslationLifecycleState | "" 
 };
 
 const formatProviderDiagnostic = (diagnostic: TranslationProviderDiagnostic) => {
-  if (diagnostic.message) return String(diagnostic.message);
-  const lines = ["FAILED"];
-  if (diagnostic.provider) lines.push(`Provider: ${diagnostic.provider}`);
-  if (diagnostic.httpStatus) lines.push(`HTTP: ${diagnostic.httpStatus}`);
-  if (diagnostic.reason) lines.push(`Reason: ${diagnostic.reason}`);
-  if (typeof diagnostic.retryCount === "number") lines.push(`Retries: ${diagnostic.retryCount}`);
-  if (typeof diagnostic.latencyMs === "number") lines.push(`Latency: ${diagnostic.latencyMs} ms`);
-  if (diagnostic.requestId) lines.push(`Request ID: ${diagnostic.requestId}`);
+  const reason = diagnostic.reason || diagnostic.message || "Translation failed";
+  const lines = [
+    "FAILED",
+    `Provider: ${diagnostic.provider || "unknown"}`,
+    `HTTP Status: ${diagnostic.httpStatus ?? "unknown"}`,
+    `Failure Reason: ${reason}`,
+    `Latency: ${typeof diagnostic.latencyMs === "number" ? `${diagnostic.latencyMs} ms` : "unknown"}`,
+    `Retry Count: ${typeof diagnostic.retryCount === "number" ? diagnostic.retryCount : 0}`,
+    `Queue Length: ${typeof diagnostic.queueLength === "number" ? diagnostic.queueLength : "unknown"}`,
+    `Active Workers: ${typeof diagnostic.activeWorkers === "number" ? diagnostic.activeWorkers : "unknown"}`,
+    `Request ID: ${diagnostic.requestId || "unknown"}`
+  ];
+  if (diagnostic.providerModel) lines.splice(2, 0, `Provider Model: ${diagnostic.providerModel}`);
   return lines.join("\n");
 };
 
@@ -2570,12 +2576,22 @@ export default function App() {
 
       const diagnosticUpdates: Record<string, string> = {};
       for (const [language, diagnostic] of Object.entries(diagnosticObjectsByLanguage)) {
+        const diagnosticStatus = coerceTranslationState(diagnostic.status || nextStatusUpdates[language]);
+        const hasSuccessfulTranslation = Boolean(mergedTranslations[language] || nextTranslations[language]);
+        const isFailureDiagnostic = !hasSuccessfulTranslation && (diagnosticStatus === "failed" || (failedLanguages || []).includes(language));
+        if (!isFailureDiagnostic) {
+          diagnosticUpdates[language] = "";
+          continue;
+        }
+
+        nextStatusUpdates[language] = "failed";
         diagnosticUpdates[language] = formatProviderDiagnostic(diagnostic);
         console.info("[FRONTEND_TRANSLATION_DIAGNOSTIC]", {
           requestUrl: API,
           websocketUrl: WS_URL || SOCKET_URL,
           requestId: diagnostic.requestId || `${jobId || "job"}:${language}`,
           provider: diagnostic.provider || provider || "unknown",
+          providerModel: diagnostic.providerModel || null,
           latency: diagnostic.latencyMs ?? latencyMs ?? null,
           retries: diagnostic.retryCount ?? 0,
           queueLength: diagnostic.queueLength ?? null,

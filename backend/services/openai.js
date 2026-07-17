@@ -9,6 +9,8 @@ import {
 } from "../../shared/languages.mjs";
 import {
   delay,
+  getErrorStatusCode,
+  getRetryAfterMs,
   getRetryDelay,
   isNonRetryableProviderError,
   mergeAbortSignals,
@@ -18,7 +20,7 @@ import {
 } from "./providerUtils.js";
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
-const OPENAI_TRANSLATION_MODEL = "gpt-4o-mini";
+export const OPENAI_TRANSLATION_MODEL = "gpt-4o-mini";
 const OPENAI_TIMEOUT_MS = 22000;
 const OPENAI_MAX_ATTEMPTS = 3;
 const OPENAI_RETRY_BASE_MS = 1000;
@@ -52,6 +54,7 @@ const noteOpenAIFailure = (error) => {
   openAIHealth.status = "degraded";
   openAIHealth.failures += 1;
   openAIHealth.lastFailureAt = Date.now();
+  openAIHealth.lastLatencyMs = Number(error?.latencyMs) || 0;
   openAIHealth.lastError = providerErrorMessage(error);
 };
 
@@ -164,7 +167,7 @@ const buildSystemPrompt = ({ sourceLang, targetLang, translationContext }) => {
   ].join("\n");
 };
 
-export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang, translationContext, signal }) => {
+export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang, translationContext, signal, includeMetadata = false, request = globalThis.fetch }) => {
   const cleanText = text?.trim();
 
   if (!cleanText || !apiKey) {
@@ -178,6 +181,7 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
   const targetLanguage = describeLanguage(targetLang);
 
   const systemPrompt = buildSystemPrompt({ sourceLang, targetLang, translationContext });
+  const operationStartedAt = Date.now();
   let lastError = null;
 
   for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt += 1) {
@@ -191,7 +195,7 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
 
       const mergedSignal = mergeAbortSignals(signal, controller.signal);
 
-      const response = await fetch(OPENAI_API_URL, {
+      const response = await request(OPENAI_API_URL, {
         method: "POST",
         signal: mergedSignal.signal,
         headers: {
@@ -225,7 +229,11 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
         error.status = response.status;
         error.httpStatus = response.status;
         error.provider = "openai";
+        error.providerModel = OPENAI_TRANSLATION_MODEL;
+        error.model = OPENAI_TRANSLATION_MODEL;
         error.headers = response.headers;
+        error.reason = String(message);
+        error.retryAfterMs = getRetryAfterMs(error);
         throw error;
       }
 
@@ -252,14 +260,31 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
         throw new Error("OpenAI echoed the source text");
       }
 
-      noteOpenAISuccess(Date.now() - startedAt);
-      return translatedText;
+      const latencyMs = Date.now() - operationStartedAt;
+      noteOpenAISuccess(latencyMs);
+      const metadata = {
+        text: translatedText,
+        provider: "openai",
+        model: OPENAI_TRANSLATION_MODEL,
+        providerModel: OPENAI_TRANSLATION_MODEL,
+        httpStatus: 200,
+        retryCount: attempt - 1,
+        latencyMs
+      };
+      return includeMetadata ? metadata : translatedText;
     } catch (error) {
       if (signal?.aborted || error?.name === "AbortError") {
         throw new Error("OpenAI translation aborted");
       }
 
       lastError = error;
+      error.provider = error.provider || "openai";
+      error.providerModel = error.providerModel || OPENAI_TRANSLATION_MODEL;
+      error.model = error.model || OPENAI_TRANSLATION_MODEL;
+      error.httpStatus = getErrorStatusCode(error);
+      error.reason = error.reason || providerErrorMessage(error) || "OpenAI translation failed";
+      error.retryCount = attempt - 1;
+      error.latencyMs = Date.now() - operationStartedAt;
       noteOpenAIFailure(error);
 
       if (attempt >= OPENAI_MAX_ATTEMPTS || isNonRetryableProviderError(error, [400, 401, 403, 404], ["quota", "billing", "unauthori[sz]ed", "forbidden", "invalid api key", "permission", "insufficient"])) {
@@ -267,7 +292,7 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
       }
 
       openAIHealth.retryCount += 1;
-      await delay(getRetryDelay({ attempt, baseMs: OPENAI_RETRY_BASE_MS, maxMs: OPENAI_RETRY_MAX_MS }));
+      await delay(getRetryDelay({ attempt, baseMs: OPENAI_RETRY_BASE_MS, maxMs: OPENAI_RETRY_MAX_MS, error }));
     }
   }
 

@@ -121,6 +121,7 @@ export const env = {
   mongoUri: readSecret(process.env.MONGO_URI),
   deepgramApiKey: readSecret(process.env.DEEPGRAM_API_KEY),
   geminiApiKey: readSecret(process.env.GEMINI_API_KEY),
+  geminiModel: String(process.env.GEMINI_MODEL || "gemini-flash-latest").trim() || "gemini-flash-latest",
   openaiApiKey: readSecret(process.env.OPENAI_API_KEY),
   hasJwtSecret: Boolean(readSecret(process.env.JWT_SECRET)),
   jwtSecret: readSecret(process.env.JWT_SECRET),
