@@ -194,6 +194,11 @@ const sanitizeTranslationResult = (result = {}) => {
   }
 
   const translatedText = translations[result.targetLang] || translations[targetLanguages[0]] || Object.values(translations).find(Boolean) || "";
+  const diagnostics = result.diagnostics && typeof result.diagnostics === "object" ? result.diagnostics : null;
+  const diagnosticsLanguage = normalizeSocketLanguageCode(diagnostics?.language || result.lang || result.targetLang || targetLanguages[0]);
+  const diagnosticsByLanguage = diagnostics && diagnosticsLanguage
+    ? { [diagnosticsLanguage]: diagnostics }
+    : {};
   const translationOutputs = targetLanguages
     .map((language) => {
       const text = translations[language];
@@ -208,13 +213,17 @@ const sanitizeTranslationResult = (result = {}) => {
       translations,
       translationOutputs,
       translationStatus: result.translationStatus || {},
-      failedLanguages: Array.isArray(result.failedLanguages) ? result.failedLanguages : []
+      failedLanguages: Array.isArray(result.failedLanguages) ? result.failedLanguages : [],
+      diagnostics,
+      diagnosticsByLanguage
     },
     translatedText,
     translations,
     translationOutputs,
     translationStatus: result.translationStatus || {},
-    failedLanguages: Array.isArray(result.failedLanguages) ? result.failedLanguages : []
+      failedLanguages: Array.isArray(result.failedLanguages) ? result.failedLanguages : [],
+      diagnostics,
+      diagnosticsByLanguage
   };
 };
 
@@ -429,6 +438,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
             outputs: safe.translationOutputs,
             statusByLanguage: safe.translationStatus,
             failedLanguages: safe.failedLanguages,
+            diagnostics: result.diagnostics || null,
+            diagnosticsByLanguage: safe.diagnosticsByLanguage,
             lang: result.lang,
             status: result.status,
             sourceLang: result.sourceLang,
@@ -481,7 +492,9 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           outputs: safe.translationOutputs,
           statusByLanguage: safe.translationStatus,
           failedLanguages: safe.failedLanguages,
-          lang: result.lang,
+            diagnostics: result.diagnostics || null,
+            diagnosticsByLanguage: safe.diagnosticsByLanguage,
+            lang: result.lang,
           status: result.status,
           sourceLang: result.sourceLang,
           targetLang: result.targetLang,

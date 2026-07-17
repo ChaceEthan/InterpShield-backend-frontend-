@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { buildProviderExecutionOrder, isTranslationDisplayable, runSequentialTasks, shouldDegradeProviderHealth } from "../services/interpreter.js";
+import { buildProviderExecutionOrder, createPerLanguageDispatchQueue, isTranslationDisplayable, runSequentialTasks, shouldDegradeProviderHealth } from "../services/interpreter.js";
 import { resolveLocalTranslation } from "../utils/translationEnhancer.js";
 import { createAudioPipelineSession, upsertCallRoomParticipant, removeCallRoomParticipant } from "../services/audioPipeline.js";
 import {
@@ -120,6 +120,18 @@ const sequentialResults = await runSequentialTasks(["es", "fr", "de"], async (la
 assert.deepEqual(sequentialResults, ["ES", "FR", "DE"]);
 assert.equal(maxConcurrentRuns, 3, "target languages should be processed concurrently up to the configured limit");
 
+const dispatchQueue = createPerLanguageDispatchQueue({
+  languages: ["es", "fr", "de"],
+  concurrency: 2,
+  requestDelayMs: 0,
+  worker: async (language) => {
+    await Promise.resolve();
+    return language.toUpperCase();
+  }
+});
+const dispatchedResults = await dispatchQueue.run();
+assert.deepEqual(dispatchedResults, ["ES", "FR", "DE"], "each target language should receive its own independent dispatch queue");
+
 const controller = new AbortController();
 const mergedSignal = mergeAbortSignals(controller.signal);
 controller.abort();
@@ -130,7 +142,7 @@ assert.match(frontendSource, /LANGUAGE_CATALOG/);
 assert.match(interpreterSource, /FAST_LOCAL_LANGUAGE_CODES\s*=\s*new Set\(\["sw",\s*"rw",\s*"rn",\s*"lg"\]\)/);
 assert.doesNotMatch(interpreterSource, /FORBIDDEN_LANGUAGE_CODES/);
 assert.match(interpreterSource, /sessionTranslationQueue\s*=\s*{\s*queue:\s*\[\],\s*processing:\s*false,\s*activeJob:\s*null,\s*currentAbortController:\s*null,\s*sequence:\s*0\s*}/s);
-assert.match(interpreterSource, /runSequentialTasks\(targetLanguages, processLanguage, MAX_CONCURRENT_TRANSLATION_LANGUAGES\)/);
+assert.match(interpreterSource, /createPerLanguageDispatchQueue\(/);
 assert.match(interpreterSource, /QUEUE_ADD/);
 assert.match(interpreterSource, /QUEUE_CLEAR/);
 assert.match(interpreterSource, /JOB_CANCEL/);

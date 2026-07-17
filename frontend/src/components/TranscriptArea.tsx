@@ -7,6 +7,7 @@ export interface TranscriptTranslationEntry {
   label: string;
   text: string;
   state: string;
+  diagnostic?: string;
 }
 
 interface TranscriptAreaProps {
@@ -99,6 +100,11 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
                 <p className="min-h-16 break-words text-base font-semibold leading-7 text-gray-950">
                   {entry.text || (isRecording ? "Translating..." : "Translation will appear here.")}
                 </p>
+                {entry.diagnostic && (
+                  <pre className="mt-3 whitespace-pre-wrap break-words rounded-lg border border-red-200 bg-white/80 p-3 text-xs font-semibold leading-5 text-red-800">
+                    {entry.diagnostic}
+                  </pre>
+                )}
               </motion.article>
             ))}
           </motion.div>

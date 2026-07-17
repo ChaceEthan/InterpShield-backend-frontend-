@@ -27,7 +27,7 @@ import {
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import { io, type Socket } from "socket.io-client";
-import { API, CLIENT_URL, FRONTEND_CONFIG_DIAGNOSTICS, GOOGLE_CLIENT_ID, SOCKET_TRANSPORTS, SOCKET_URL } from "./config/socket";
+import { API, CLIENT_URL, FRONTEND_CONFIG_DIAGNOSTICS, GOOGLE_CLIENT_ID, SOCKET_TRANSPORTS, SOCKET_URL, WS_URL } from "./config/socket";
 import { HeroSection } from "./components/HeroSection";
 import { LanguageSelector } from "./components/LanguageSelector";
 import { ModeTabs, type PrivacyMode } from "./components/ModeTabs";
@@ -48,6 +48,20 @@ type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history"
 type Mode = "transcribe" | "translate" | "dubbing";
 type SessionStatus = "idle" | "connecting" | "listening" | "stopping" | "error";
 type TranslationLifecycleState = "ready" | "queued" | "processing" | "translating" | "retrying" | "translated" | "done" | "failed" | "stale" | "cancelled";
+type TranslationProviderDiagnostic = {
+  language?: string;
+  provider?: string;
+  retryCount?: number;
+  latencyMs?: number;
+  requestId?: string;
+  status?: string;
+  reason?: string;
+  httpStatus?: number | string | null;
+  providerResponse?: string | null;
+  queueLength?: number | null;
+  activeWorkers?: number | null;
+  message?: string;
+};
 type SocketConnectionState = "ready" | "connecting" | "connected" | "listening" | "translating" | "reconnecting";
 type MicrophonePermissionState = "unknown" | "prompt" | "granted" | "denied" | "unsupported";
 type MicrophoneRuntimeState = "idle" | "checking" | "requesting" | "ready" | "recording" | "recovering" | "blocked" | "failed";
@@ -607,12 +621,24 @@ const translationStateClass = (state: TranslationLifecycleState) => {
 };
 
 const coerceTranslationState = (value: unknown): TranslationLifecycleState | "" => {
-  const state = String(value || "");
+  const state = String(value || "").trim().toLowerCase();
   if (state === "done") return "translated";
   if (state === "translating") return "processing";
   return ["ready", "queued", "processing", "retrying", "translated", "failed", "stale", "cancelled"].includes(state)
     ? (state as TranslationLifecycleState)
     : "";
+};
+
+const formatProviderDiagnostic = (diagnostic: TranslationProviderDiagnostic) => {
+  if (diagnostic.message) return String(diagnostic.message);
+  const lines = ["FAILED"];
+  if (diagnostic.provider) lines.push(`Provider: ${diagnostic.provider}`);
+  if (diagnostic.httpStatus) lines.push(`HTTP: ${diagnostic.httpStatus}`);
+  if (diagnostic.reason) lines.push(`Reason: ${diagnostic.reason}`);
+  if (typeof diagnostic.retryCount === "number") lines.push(`Retries: ${diagnostic.retryCount}`);
+  if (typeof diagnostic.latencyMs === "number") lines.push(`Latency: ${diagnostic.latencyMs} ms`);
+  if (diagnostic.requestId) lines.push(`Request ID: ${diagnostic.requestId}`);
+  return lines.join("\n");
 };
 
 const appendTextWindow = (current: string, next: string, maxChars = LIVE_TEXT_WINDOW_CHARS) => {
@@ -1349,6 +1375,7 @@ export default function App() {
   const [finalTranslationText, setFinalTranslationText] = useState("");
   const [finalTranslations, setFinalTranslations] = useState<Record<string, string>>({});
   const [translationStatuses, setTranslationStatuses] = useState<Record<string, TranslationLifecycleState>>({});
+  const [translationDiagnostics, setTranslationDiagnostics] = useState<Record<string, string>>({});
   const [interimOriginal, setInterimOriginal] = useState("");
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [chunkCount, setChunkCount] = useState(0);
@@ -1477,7 +1504,7 @@ export default function App() {
   const displayTranslationEntries = targetLanguages.map((language) => {
     const translatedText = finalTranslations[language]?.trim() || "";
     const state: TranslationLifecycleState = translatedText ? "translated" : translationStatuses[language] || (isRecording && mode !== "transcribe" ? "queued" : "ready");
-    return [language, translatedText, state] as const;
+    return [language, translatedText, state, translationDiagnostics[language] || ""] as const;
   });
   const microphoneStatusLabel = audioDiagnostic.state === "recording" && audioDiagnostic.mimeType
     ? `${audioDiagnostic.message} (${audioDiagnostic.mimeType.replace(/^audio\//, "")})`
@@ -2448,7 +2475,7 @@ export default function App() {
       }
     });
 
-    const handleTranslationUpdate = ({ original, text, translations, statusByLanguage, failedLanguages, latencyMs, provider, sessionId, jobId, sequence, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete, streaming, lang, status }: { original?: string; text?: string; translations?: Record<string, string>; statusByLanguage?: Record<string, string>; failedLanguages?: string[]; latencyMs?: number; provider?: string; sessionId?: string; jobId?: string | number; sequence?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean; streaming?: boolean; lang?: string; status?: string }) => {
+    const handleTranslationUpdate = ({ original, text, translations, statusByLanguage, failedLanguages, diagnostics, diagnosticsByLanguage, latencyMs, provider, sessionId, jobId, sequence, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete, streaming, lang, status }: { original?: string; text?: string; translations?: Record<string, string>; statusByLanguage?: Record<string, string>; failedLanguages?: string[]; diagnostics?: TranslationProviderDiagnostic | null; diagnosticsByLanguage?: Record<string, TranslationProviderDiagnostic>; latencyMs?: number; provider?: string; sessionId?: string; jobId?: string | number; sequence?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean; streaming?: boolean; lang?: string; status?: string }) => {
       const currentPendingTranscript = pendingFinalTranscriptRef.current;
       const updateOriginal = original?.trim() || "";
       const previewJob = typeof jobId === "string" && jobId.startsWith("preview-");
@@ -2528,8 +2555,40 @@ export default function App() {
           nextStatusUpdates[language] = "failed";
         }
       }
+
+      const diagnosticObjectsByLanguage: Record<string, TranslationProviderDiagnostic> = {};
+      if (diagnosticsByLanguage && typeof diagnosticsByLanguage === "object") {
+        for (const [language, diagnostic] of Object.entries(diagnosticsByLanguage)) {
+          const normalizedLanguage = normalizeLanguageCode(language);
+          if (normalizedLanguage && diagnostic && typeof diagnostic === "object") diagnosticObjectsByLanguage[normalizedLanguage] = diagnostic;
+        }
+      }
+      if (diagnostics && typeof diagnostics === "object") {
+        const diagnosticLanguage = normalizeLanguageCode(diagnostics.language || lang || eventTargetLang || singleLanguage);
+        if (diagnosticLanguage) diagnosticObjectsByLanguage[diagnosticLanguage] = diagnostics;
+      }
+
+      const diagnosticUpdates: Record<string, string> = {};
+      for (const [language, diagnostic] of Object.entries(diagnosticObjectsByLanguage)) {
+        diagnosticUpdates[language] = formatProviderDiagnostic(diagnostic);
+        console.info("[FRONTEND_TRANSLATION_DIAGNOSTIC]", {
+          requestUrl: API,
+          websocketUrl: WS_URL || SOCKET_URL,
+          requestId: diagnostic.requestId || `${jobId || "job"}:${language}`,
+          provider: diagnostic.provider || provider || "unknown",
+          latency: diagnostic.latencyMs ?? latencyMs ?? null,
+          retries: diagnostic.retryCount ?? 0,
+          queueLength: diagnostic.queueLength ?? null,
+          activeWorkers: diagnostic.activeWorkers ?? null,
+          finalErrorReason: diagnostic.reason || diagnostic.message || "unknown",
+          language,
+          status: diagnostic.status || nextStatusUpdates[language] || status || "unknown"
+        });
+      }
+
       for (const language of Object.keys(nextTranslations)) {
         nextStatusUpdates[language] = "translated";
+        diagnosticUpdates[language] = "";
       }
       const hasStatusUpdate = Object.keys(nextStatusUpdates).length > 0;
       const translationId = matchedPendingTranscript?.translationId || (shouldUpdateLiveTranslation ? activeTranslationIdRef.current : "") || matchedPendingTranscript?.timestamp || "current";
@@ -2538,6 +2597,9 @@ export default function App() {
         : "";
 
       if (!incomingTranslation && !hasStatusUpdate) return;
+      if (shouldUpdateLiveTranslation && Object.keys(diagnosticUpdates).length > 0) {
+        setTranslationDiagnostics((current) => ({ ...current, ...diagnosticUpdates }));
+      }
       if (hasStatusUpdate && shouldUpdateLiveTranslation) {
         updateTranslationStatuses(nextStatusUpdates);
         if (!streamingPreview && Number.isFinite(incomingSequence)) {
@@ -3296,11 +3358,12 @@ export default function App() {
           : !alert && microphoneAvailable === false
             ? "No microphone input was found."
             : null;
-    const translationEntries: TranscriptTranslationEntry[] = displayTranslationEntries.map(([language, translatedText, translationState]) => ({
+    const translationEntries: TranscriptTranslationEntry[] = displayTranslationEntries.map(([language, translatedText, translationState, diagnostic]) => ({
       language,
       label: `${languageName(language)} (${language.toUpperCase()})`,
       text: translatedText,
-      state: translationStateLabel(translationState)
+      state: translationStateLabel(translationState),
+      diagnostic
     }));
 
     const buildTargetList = (primaryLanguage: string, desiredCount = targetCount, sourceLanguage = sourceLang, existingTargets = targetLanguages) => {
