@@ -1,4 +1,3 @@
-// @ts-nocheck
 export const providerErrorMessage = (error = {}) => String(error?.message || error || "");
 
 export const normalizeProviderText = (value = "") =>

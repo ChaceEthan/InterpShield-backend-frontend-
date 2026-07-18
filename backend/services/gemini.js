@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { env } from "../config/env.js";
 import { LANGUAGE_NAMES, TARGET_LANGUAGE_INSTRUCTIONS } from "../data/languageMemory.js";
 import { enhanceTranslation } from "../utils/translationEnhancer.js";

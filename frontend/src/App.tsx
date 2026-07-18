@@ -1287,7 +1287,7 @@ const AuthPage = ({
   const googleLoading = authProvider === "google";
 
   return (
-    <main className="mx-auto grid min-h-[calc(100vh-76px)] w-full max-w-6xl grid-cols-1 gap-8 px-5 py-10 lg:grid-cols-[1fr_420px] lg:items-center">
+    <main className="mx-auto grid min-h-[calc(100dvh-76px)] w-full max-w-6xl grid-cols-1 gap-8 px-5 py-10 lg:grid-cols-[1fr_420px] lg:items-center">
       <div className="space-y-6">
         <div className="inline-flex items-center gap-2 rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-bold uppercase tracking-widest text-blue-700">
           <Shield className="h-3.5 w-3.5" />
@@ -3906,7 +3906,7 @@ export default function App() {
   );
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900">
+    <div className="min-h-dvh min-w-0 bg-gray-50 text-gray-900">
       {renderTopNav()}
       {view === "landing" && renderLanding()}
       {view === "login" && <AuthPage mode="login" authProvider={authProvider} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleError={setAuthError} onNavigate={navigate} />}

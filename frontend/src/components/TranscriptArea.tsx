@@ -1,4 +1,3 @@
-import { useEffect, useRef } from "react";
 import { Languages } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 
@@ -19,30 +18,11 @@ interface TranscriptAreaProps {
 }
 
 export function TranscriptArea({ mode, originalText, interimText = "", translations, isRecording }: TranscriptAreaProps) {
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  const endRef = useRef<HTMLDivElement | null>(null);
   const visibleOriginal = interimText || originalText;
   const hasTranslations = translations.some((entry) => entry.text.trim());
   const isTranscribe = mode === "transcribe";
-  const scrollSignature = [
-    visibleOriginal,
-    ...translations.map((entry) => `${entry.language}:${entry.state}:${entry.text}`)
-  ].join("|");
-
-  useEffect(() => {
-    const frame = window.requestAnimationFrame(() => {
-      const container = scrollRef.current;
-      if (!container) return;
-      container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
-    });
-
-    return () => window.cancelAnimationFrame(frame);
-  }, [scrollSignature]);
-
   return (
-    <div
-      ref={scrollRef}
-      className="mx-auto flex max-h-[360px] min-h-[220px] w-full max-w-4xl scroll-smooth flex-col gap-4 overflow-y-auto overscroll-contain px-1 pb-5 pt-2 pr-2 [scrollbar-gutter:stable] sm:max-h-[390px]"
+    <div      className="mx-auto flex min-h-[220px] w-full min-w-0 max-w-4xl flex-col gap-4 px-1 pb-5 pt-2"
     >
       <AnimatePresence mode="popLayout">
         {visibleOriginal ? (
@@ -52,7 +32,7 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -8 }}
-            className="rounded-2xl border border-gray-200 bg-white p-5 text-left shadow-sm sm:p-6"
+            className="min-w-0 rounded-2xl border border-gray-200 bg-white p-5 text-left shadow-sm sm:p-6"
           >
             <div className="mb-3 flex items-center justify-between gap-3">
               <span className="text-xs font-semibold uppercase tracking-wide text-gray-400">Live subtitles</span>
@@ -89,10 +69,10 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
               <motion.article
                 layout
                 key={entry.language}
-                className="rounded-2xl border border-blue-100 bg-blue-50/80 p-4 text-left shadow-sm"
+                className="min-w-0 rounded-2xl border border-blue-100 bg-blue-50/80 p-4 text-left shadow-sm"
               >
                 <div className="mb-3 flex items-center justify-between gap-2">
-                  <span className="truncate text-xs font-semibold uppercase tracking-wide text-blue-700">{entry.label}</span>
+                  <span className="min-w-0 break-words text-xs font-semibold uppercase tracking-wide text-blue-700">{entry.label}</span>
                   <span className="rounded-full bg-white px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-gray-500 shadow-sm">
                     {entry.state}
                   </span>
@@ -109,8 +89,6 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
             ))}
           </motion.div>
         )}
-      </AnimatePresence>
-      <div ref={endRef} className="h-px shrink-0" />
-    </div>
+      </AnimatePresence>    </div>
   );
 }
