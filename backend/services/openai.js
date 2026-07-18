@@ -27,7 +27,7 @@ const OPENAI_RETRY_BASE_MS = 1000;
 const OPENAI_RETRY_MAX_MS = 4000;
 const SUPPORTED_LANGUAGE_LIST = supportedLanguageList();
 
-const OPENAI_QUOTA_PATTERN = /\b(?:insufficient quota|quota exceeded|current quota(?: has been)? exceeded|exceeded your current quota|check your plan and billing|usage limit(?: has been)? reached|billing(?: hard)? limit(?: has been)? reached|billing|credit balance)\b/i;
+const OPENAI_QUOTA_PATTERN = /\b(?:insufficient quota|quota exceeded|current quota(?: has been)? exceeded|exceeded your current quota|check your plan and billing|billing not active|usage limit(?: has been)? reached|billing(?: hard)? limit(?: has been)? reached|billing|credit balance|spend limit)\b/i;
 const OPENAI_RATE_LIMIT_PATTERN = /\b(?:rate limit exceeded|rate limit(?:ed)?|too many requests|requests per minute|tokens per minute|rpm|tpm)\b/i;
 
 export const classifyOpenAIError = (error = {}) => {
@@ -37,16 +37,18 @@ export const classifyOpenAIError = (error = {}) => {
     .join(" ")
     .replace(/[_-]+/g, " ");
 
-  if (status === 401 || status === 403) return "authentication";
-  if (OPENAI_QUOTA_PATTERN.test(details)) return "quota";
-  if (OPENAI_RATE_LIMIT_PATTERN.test(details)) return "rate_limit";
-  if (["quota", "rate_limit", "authentication"].includes(error?.errorCategory)) return error.errorCategory;
-  if (status === 429) return "rate_limit";
-  return "provider";
+  if (OPENAI_QUOTA_PATTERN.test(details)) return "billing_quota_exhausted";
+  if (status === 401) return "authentication_failure";
+  if (status === 403) return "permission_failure";
+  if (OPENAI_RATE_LIMIT_PATTERN.test(details) || status === 429) return "temporary_rate_limit";
+  if (status === 503) return "provider_overloaded";
+  if (error?.name === "AbortError" || /\b(?:timed? out|timeout|econnreset|fetch failed|network)\b/i.test(details)) return "network_timeout";
+  if (["billing_quota_exhausted", "temporary_rate_limit", "authentication_failure", "permission_failure", "provider_overloaded", "network_timeout"].includes(error?.errorCategory)) return error.errorCategory;
+  return "unknown_provider_error";
 };
 
-export const isOpenAIQuotaError = (error = {}) => classifyOpenAIError(error) === "quota";
-export const isOpenAIRateLimitError = (error = {}) => classifyOpenAIError(error) === "rate_limit";
+export const isOpenAIQuotaError = (error = {}) => classifyOpenAIError(error) === "billing_quota_exhausted";
+export const isOpenAIRateLimitError = (error = {}) => classifyOpenAIError(error) === "temporary_rate_limit";
 
 const openAIHealth = {
   status: "idle",
@@ -206,12 +208,16 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
   let lastError = null;
 
   for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt += 1) {
+    let requestTimedOut = false;
     openAIHealth.status = attempt === 1 ? "requesting" : "retrying";
     openAIHealth.attempts += 1;
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+      const timeout = setTimeout(() => {
+        requestTimedOut = true;
+        controller.abort();
+      }, OPENAI_TIMEOUT_MS);
 
       const mergedSignal = mergeAbortSignals(signal, controller.signal);
 
@@ -259,8 +265,8 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
         error.errorCode = providerError.code ? String(providerError.code) : null;
         error.errorType = providerError.type ? String(providerError.type) : null;
         error.errorCategory = classifyOpenAIError(error);
-        error.quotaExhausted = error.errorCategory === "quota";
-        error.rateLimited = error.errorCategory === "rate_limit";
+        error.quotaExhausted = error.errorCategory === "billing_quota_exhausted";
+        error.rateLimited = error.errorCategory === "temporary_rate_limit";
         error.retryAfterMs = getRetryAfterMs(error);
         throw error;
       }
@@ -312,8 +318,8 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
       error.httpStatus = getErrorStatusCode(error);
       error.reason = error.reason || providerErrorMessage(error) || "OpenAI translation failed";
       error.errorCategory = classifyOpenAIError(error);
-      error.quotaExhausted = error.errorCategory === "quota";
-      error.rateLimited = error.errorCategory === "rate_limit";
+      error.quotaExhausted = error.errorCategory === "billing_quota_exhausted";
+      error.rateLimited = error.errorCategory === "temporary_rate_limit";
       error.retryCount = attempt - 1;
       error.latencyMs = Date.now() - operationStartedAt;
       noteOpenAIFailure(error);

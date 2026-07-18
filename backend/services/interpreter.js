@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { createDeepgramSession } from "./deepgram.js";
-import { translateWithGemini } from "./gemini.js";
+import { classifyGeminiError, translateWithGemini } from "./gemini.js";
 import { classifyOpenAIError, translateWithOpenAI } from "./openai.js";
 import {
   detectLocalSourceLanguage,
@@ -89,6 +89,7 @@ const PROVIDER_NON_RETRYABLE_FAILURE_THRESHOLD = 2;
 const PROVIDER_COOLDOWN_MS = 45000;
 const PROVIDER_HARD_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 export const OPENAI_QUOTA_COOLDOWN_MS = 30 * 60 * 1000;
+export const PROVIDER_QUOTA_COOLDOWN_MS = 30 * 60 * 1000;
 const SESSION_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
 const SESSION_HEALTH_CHECK_MS = 2500;
 const MAX_STALE_TRANSLATION_JOBS = 40;
@@ -509,13 +510,12 @@ export const applyProviderFailureToHealth = ({ provider, health, error, now = Da
 
   const statusCode = getErrorStatusCode(error);
   const retryAfterMs = Number(error?.retryAfterMs);
-  const classifiedCategory = provider === "openai" ? classifyOpenAIError(error) : (error?.errorCategory || null);
-  const errorCategory = classifiedCategory || (statusCode === 429 ? "rate_limit" : null);
-  const quotaExhausted = provider === "openai" && errorCategory === "quota";
+  const classifiedCategory = provider === "openai" ? classifyOpenAIError(error) : classifyGeminiError(error);
+  const errorCategory = classifiedCategory || (statusCode === 429 ? "daily_quota_exhausted" : "unknown_provider_error");
+  const quotaExhausted = ["daily_quota_exhausted", "billing_quota_exhausted"].includes(errorCategory);
   const reason = error?.reason || getProviderErrorMessage(error) || "Provider request failed";
-  const existingQuotaActive = provider === "openai" &&
-    health.quotaExhausted &&
-    health.errorCategory === "quota" &&
+  const existingQuotaActive = health.quotaExhausted &&
+    ["daily_quota_exhausted", "billing_quota_exhausted"].includes(health.errorCategory) &&
     now < Number(health.cooldownUntil || 0);
 
   if (existingQuotaActive && !quotaExhausted) {
@@ -524,7 +524,7 @@ export const applyProviderFailureToHealth = ({ provider, health, error, now = Da
       cooldownApplied: true,
       cooldownMs: Math.max(0, Number(health.cooldownUntil || 0) - now),
       reason: "quota_exhausted",
-      errorCategory: "quota",
+      errorCategory: health.errorCategory,
       preserved: true
     };
   }
@@ -544,15 +544,15 @@ export const applyProviderFailureToHealth = ({ provider, health, error, now = Da
   };
 
   if (quotaExhausted) {
-    const cooldownMs = Math.max(OPENAI_QUOTA_COOLDOWN_MS, Number.isFinite(retryAfterMs) ? retryAfterMs : 0);
+    const cooldownMs = Math.max(provider === "openai" ? OPENAI_QUOTA_COOLDOWN_MS : PROVIDER_QUOTA_COOLDOWN_MS, Number.isFinite(retryAfterMs) ? retryAfterMs : 0);
     health.cooldownUntil = Math.max(Number(health.cooldownUntil || 0), now + cooldownMs);
     return { cooldownApplied: true, cooldownMs, reason: "quota_exhausted", errorCategory };
   }
 
-  if (statusCode === 429) {
+  if (["temporary_rate_limit", "provider_overloaded", "network_timeout"].includes(errorCategory)) {
     const cooldownMs = Math.max(PROVIDER_COOLDOWN_MS, Number.isFinite(retryAfterMs) ? retryAfterMs : 0);
     health.cooldownUntil = Math.max(Number(health.cooldownUntil || 0), now + cooldownMs);
-    return { cooldownApplied: true, cooldownMs, reason: provider === "openai" ? "rate_limit" : "resource_exhausted", errorCategory };
+    return { cooldownApplied: true, cooldownMs, reason: errorCategory, errorCategory };
   }
 
   const nonRetryable = isProviderNonRetryableFailure(error);

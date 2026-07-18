@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import {
   buildGeminiGenerateContentUrl,
   buildGeminiModelsListUrl,
+  classifyGeminiError,
   getGeminiModelOrder,
   listGeminiGenerateContentModels,
   normalizeGeminiModel,
@@ -232,7 +233,7 @@ assert.deepEqual(
       targetLang: "zh",
       request: async () => {
         calls += 1;
-        return jsonResponse(429, { error: { message: "Rate limit reached" } }, { "Retry-After": "2" });
+        return jsonResponse(429, { error: { message: "Requests per minute limit reached", status: "RESOURCE_EXHAUSTED" } }, { "Retry-After": "2" });
       },
       sleep: async () => {
         sleepCalls += 1;
@@ -245,7 +246,7 @@ assert.deepEqual(
   assert.ok(failure);
   assert.equal(failure.httpStatus, 429);
   assert.equal(failure.retryAfterMs, 2000);
-  assert.equal(failure.reason, "Rate limit reached");
+  assert.equal(failure.reason, "Requests per minute limit reached");
   assert.equal(failure.retryCount, 2);
   assert.equal(calls, 3, "temporary 429 must be bounded to the initial request plus two retries");
   assert.equal(sleepCalls, 2, "Retry-After must be respected within the bounded provider retry policy");
@@ -299,21 +300,36 @@ for (const status of [401, 403]) {
 
 assert.equal(
   classifyOpenAIError({ httpStatus: 429, errorCode: "rate_limit_exceeded", reason: "Requests per minute reached" }),
-  "rate_limit"
+  "temporary_rate_limit"
 );
 assert.equal(
   classifyOpenAIError({ httpStatus: 429, errorCode: "insufficient_quota", reason: "You exceeded your current quota, please check your plan and billing details." }),
-  "quota"
+  "billing_quota_exhausted"
 );
 assert.equal(isOpenAIRateLimitError({ httpStatus: 429, reason: "Too many requests" }), true);
 assert.equal(isOpenAIQuotaError({ httpStatus: 429, reason: "Credit balance is unavailable" }), true);
-assert.equal(classifyOpenAIError({ httpStatus: 429, errorCode: "billing_hard_limit_reached" }), "quota");
-assert.equal(classifyOpenAIError({ httpStatus: 429, errorCode: "requests_per_minute" }), "rate_limit");
+assert.equal(classifyOpenAIError({ httpStatus: 429, errorCode: "billing_hard_limit_reached" }), "billing_quota_exhausted");
+assert.equal(classifyOpenAIError({ httpStatus: 429, errorCode: "requests_per_minute" }), "temporary_rate_limit");
 assert.equal(
   classifyOpenAIError({ httpStatus: 401, errorCode: "insufficient_quota", reason: "Billing authentication rejected" }),
-  "authentication",
-  "authentication status must take precedence over message content"
+  "billing_quota_exhausted",
+  "a structured insufficient_quota code must remain a billing failure"
 );
+assert.equal(classifyOpenAIError({ httpStatus: 401, reason: "Invalid API key" }), "authentication_failure");
+assert.equal(classifyOpenAIError({ httpStatus: 403, reason: "Permission denied" }), "permission_failure");
+assert.equal(classifyOpenAIError({ httpStatus: 503, reason: "Service unavailable" }), "provider_overloaded");
+assert.equal(classifyOpenAIError({ reason: "Network timeout" }), "network_timeout");
+assert.equal(classifyOpenAIError({ httpStatus: 500, reason: "Unexpected provider response" }), "unknown_provider_error");
+
+assert.equal(classifyGeminiError({ httpStatus: 429, reason: "Requests per minute limit reached", errorStatus: "RESOURCE_EXHAUSTED" }), "temporary_rate_limit");
+assert.equal(classifyGeminiError({ httpStatus: 429, reason: "Requests per day quota exceeded", errorDetails: [{ quotaMetric: "generate_content_requests_per_day" }] }), "daily_quota_exhausted");
+assert.equal(classifyGeminiError({ httpStatus: 429, reason: "Quota limit reached", errorDetails: [{ quotaId: "free-tier", description: "limit: 0" }] }), "daily_quota_exhausted");
+assert.equal(classifyGeminiError({ httpStatus: 429, reason: "Check your plan and billing details" }), "billing_quota_exhausted");
+assert.equal(classifyGeminiError({ httpStatus: 503, reason: "The model is overloaded" }), "provider_overloaded");
+assert.equal(classifyGeminiError({ httpStatus: 404, reason: "Model not found" }), "model_unavailable");
+assert.equal(classifyGeminiError({ httpStatus: 401, reason: "API key not valid" }), "authentication_failure");
+assert.equal(classifyGeminiError({ httpStatus: 403, reason: "Permission denied" }), "permission_failure");
+assert.equal(classifyGeminiError({ reason: "Network timeout" }), "network_timeout");
 
 {
   let calls = 0;
@@ -402,7 +418,7 @@ let openAIQuotaFailure;
   assert.ok(openAIQuotaFailure);
   assert.equal(openAIQuotaFailure.httpStatus, 429);
   assert.equal(openAIQuotaFailure.errorCode, "insufficient_quota");
-  assert.equal(openAIQuotaFailure.errorCategory, "quota");
+  assert.equal(openAIQuotaFailure.errorCategory, "billing_quota_exhausted");
   assert.equal(openAIQuotaFailure.quotaExhausted, true);
   assert.equal(openAIQuotaFailure.providerRetryExhausted, true);
   assert.equal(openAIQuotaFailure.retryCount, 0);
@@ -462,13 +478,13 @@ let openAIQuotaFailure;
     error: Object.assign(new Error("Temporary rate limit"), {
       httpStatus: 429,
       reason: "Temporary rate limit",
-      errorCategory: "rate_limit"
+      errorCategory: "temporary_rate_limit"
     }),
     now: now + 1
   });
   assert.equal(preserved.preserved, true);
   assert.equal(providerHealth.openai.quotaExhausted, true);
-  assert.equal(providerHealth.openai.errorCategory, "quota");
+  assert.equal(providerHealth.openai.errorCategory, "billing_quota_exhausted");
   assert.equal(providerHealth.openai.lastFailure.reason, quotaReason, "a weaker in-flight failure must not overwrite active quota diagnostics");
 
   const afterFailureOrder = buildProviderExecutionOrder({
@@ -512,8 +528,9 @@ let openAIQuotaFailure;
     now
   });
   assert.equal(outcome.cooldownApplied, true);
-  assert.equal(outcome.reason, "resource_exhausted");
-  assert.ok(geminiHealth.cooldownUntil >= now + 45000);
+  assert.equal(outcome.reason, "quota_exhausted");
+  assert.equal(geminiHealth.errorCategory, "daily_quota_exhausted");
+  assert.ok(geminiHealth.cooldownUntil >= now + 30 * 60 * 1000);
 
   const unavailableError = createProviderUnavailableError({
     providerHealth: {
@@ -580,7 +597,7 @@ const translateWithBackendProviderFallback = async ({ language, geminiRequest, o
   const result = await translateWithBackendProviderFallback({
     language: "es",
     geminiRequest: async () =>
-      jsonResponse(429, { error: { message: "Rate limit reached" } }, { "Retry-After": "2" }),
+      jsonResponse(429, { error: { message: "Requests per minute limit reached", status: "RESOURCE_EXHAUSTED" } }, { "Retry-After": "2" }),
     openAIRequest: async () => openAISuccessResponse(translations.es)
   });
 
@@ -720,7 +737,9 @@ assert.match(interpreterSource, /`Failure Reason: \$\{summaryReason\}`/);
 assert.match(interpreterSource, /`Queue Length: \$\{Number\.isFinite\(queueLength\)/);
 assert.match(interpreterSource, /`Active Workers: \$\{Number\.isFinite\(activeWorkers\)/);
 assert.doesNotMatch(interpreterSource, /message:\s*["']FAILED["']/);
-assert.match(interpreterSource, /if \(statusCode === 429\)/);
+assert.match(interpreterSource, /temporary_rate_limit/);
+assert.match(interpreterSource, /daily_quota_exhausted/);
+assert.match(interpreterSource, /billing_quota_exhausted/);
 assert.match(interpreterSource, /existingQuotaActive/);
 assert.match(interpreterSource, /createProviderUnavailableError/);
 assert.match(frontendSource, /Provider Model:/);

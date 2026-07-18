@@ -78,6 +78,10 @@ export const listGeminiGenerateContentModels = async ({ apiKey, request = global
     error.reason = reason;
     error.headers = response.headers;
     error.retryAfterMs = getRetryAfterMs(error);
+    error.errorStatus = data?.error?.status || null;
+    error.errorCode = data?.error?.code || null;
+    error.errorDetails = Array.isArray(data?.error?.details) ? data.error.details : [];
+    error.errorCategory = classifyGeminiError(error);
     throw error;
   }
 
@@ -99,6 +103,35 @@ export const selectVerifiedGeminiFlashFallback = (models = [], excludedModels = 
       if (liteDifference !== 0) return liteDifference;
       return b.localeCompare(a, undefined, { numeric: true, sensitivity: "base" });
     })[0] || null;
+};
+
+const flattenGeminiErrorDetails = (error = {}) => {
+  const details = Array.isArray(error?.errorDetails) ? error.errorDetails : [];
+  const quotaViolations = details.flatMap((detail) => detail?.violations || detail?.quotaFailure?.violations || []);
+  return [
+    error?.errorStatus,
+    error?.errorCode,
+    error?.reason,
+    error?.message,
+    JSON.stringify(details),
+    ...details.map((detail) => detail?.reason || detail?.message || detail?.quotaMetric || detail?.quotaId),
+    ...quotaViolations.flatMap((violation) => [violation?.quotaMetric, violation?.quotaId, violation?.description])
+  ].filter(Boolean).join(" ").replace(/[_-]+/g, " ");
+};
+
+export const classifyGeminiError = (error = {}) => {
+  const status = getErrorStatusCode(error);
+  const details = flattenGeminiErrorDetails(error);
+  if (status === 401 || /\b(?:api key not valid|invalid api key|unauthenticated)\b/i.test(details)) return "authentication_failure";
+  if (status === 403 || /\bpermission denied\b/i.test(details)) return "permission_failure";
+  if (status === 404 || /\b(?:model not found|unsupported model|model unavailable)\b/i.test(details)) return "model_unavailable";
+  if (/\b(?:billing|current quota exceeded|check your plan|credit balance|spend limit|usage limit)\b/i.test(details)) return "billing_quota_exhausted";
+  if (/\b(?:requests per day|daily quota|rpd|per day|quota limit reached|limit\s*:?\s*0|quota value["']?\s*:?\s*["']?0)\b/i.test(details)) return "daily_quota_exhausted";
+  if (/\b(?:requests per minute|tokens per minute|rpm|tpm|too many requests)\b/i.test(details)) return "temporary_rate_limit";
+  if (status === 429) return "daily_quota_exhausted";
+  if (status === 503 || /\b(?:overloaded|service unavailable|resource exhausted temporarily)\b/i.test(details)) return "provider_overloaded";
+  if (error?.name === "AbortError" || /\b(?:timed? out|timeout|econnreset|fetch failed|network)\b/i.test(details)) return "network_timeout";
+  return "unknown_provider_error";
 };
 
 const geminiHealth = {
@@ -287,6 +320,7 @@ const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, tran
       const timeoutError = new Error(`Gemini translation timed out for ${targetLanguage}`);
       timeoutError.provider = "Gemini";
       timeoutError.providerModel = model;
+      timeoutError.errorCategory = "network_timeout";
       throw timeoutError;
     }
     throw error;
@@ -308,6 +342,10 @@ const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, tran
     error.reason = reason;
     error.headers = response.headers;
     error.retryAfterMs = getRetryAfterMs(error);
+    error.errorStatus = data?.error?.status || null;
+    error.errorCode = data?.error?.code || null;
+    error.errorDetails = Array.isArray(data?.error?.details) ? data.error.details : [];
+    error.errorCategory = classifyGeminiError(error);
     throw error;
   }
 
@@ -407,15 +445,16 @@ export const translateWithGemini = async ({ apiKey, model = GEMINI_MODEL, text, 
         error.latencyMs = Date.now() - operationStartedAt;
         error.attemptedModels = [...attemptedModels];
         if (error.retryAfterMs === undefined) error.retryAfterMs = getRetryAfterMs(error);
+        error.errorCategory = error.errorCategory || classifyGeminiError(error);
         lastError = error;
         noteGeminiFailure(error, candidateModel, attemptedModels);
 
-        if (status === 401 || status === 403) {
+        if (["authentication_failure", "permission_failure", "daily_quota_exhausted", "billing_quota_exhausted"].includes(error.errorCategory)) {
           error.providerRetryExhausted = true;
           throw error;
         }
 
-        if (status === 404) {
+        if (error.errorCategory === "model_unavailable") {
           if (!modelDiscoveryAttempted && modelIndex === candidateModels.length - 1) {
             modelDiscoveryAttempted = true;
             try {
@@ -441,7 +480,7 @@ export const translateWithGemini = async ({ apiKey, model = GEMINI_MODEL, text, 
           break;
         }
 
-        if (status === 429) {
+        if (error.errorCategory === "temporary_rate_limit") {
           if (attempt >= GEMINI_MAX_ATTEMPTS) {
             error.providerRetryExhausted = true;
             throw error;
