@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { createDeepgramSession } from "./deepgram.js";
 import { translateWithGemini } from "./gemini.js";
-import { translateWithOpenAI } from "./openai.js";
+import { classifyOpenAIError, translateWithOpenAI } from "./openai.js";
 import {
   detectLocalSourceLanguage,
   detectRegionAccent,
@@ -88,6 +88,7 @@ const PROVIDER_FAILURE_THRESHOLD = 6;
 const PROVIDER_NON_RETRYABLE_FAILURE_THRESHOLD = 2;
 const PROVIDER_COOLDOWN_MS = 45000;
 const PROVIDER_HARD_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
+export const OPENAI_QUOTA_COOLDOWN_MS = 30 * 60 * 1000;
 const SESSION_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
 const SESSION_HEALTH_CHECK_MS = 2500;
 const MAX_STALE_TRANSLATION_JOBS = 40;
@@ -95,6 +96,18 @@ const MAX_PENDING_SENTENCE_CHARS = 1400;
 const LOG_TEXT_PREVIEW_CHARS = 96;
 const sessionHistoryStore = new Map();
 const sharedTranslationCache = new Map();
+const createProviderHealthState = () => ({
+  failures: 0,
+  cooldownUntil: 0,
+  lastSuccessAt: 0,
+  lastFailure: null,
+  errorCategory: null,
+  quotaExhausted: false
+});
+const sharedProviderHealth = {
+  gemini: createProviderHealthState(),
+  openai: createProviderHealthState()
+};
 const debugFlagEnabled = (flag) =>
   ["1", "true", "yes", "on"].includes(String(process.env[flag] || process.env.DEBUG || "").trim().toLowerCase());
 
@@ -486,6 +499,101 @@ export const isRetryableProviderError = (error = {}) => {
   return !isProviderNonRetryableFailure(error) && /timed out|timeout|temporar|network|socket hang up|econnreset|fetch failed|reset|retry|overload|unavailable|busy/i.test(message);
 };
 
+export const isProviderAvailableFromHealth = (providerHealth = {}, provider = "", now = Date.now()) => {
+  const health = providerHealth?.[provider];
+  return Boolean(health) && now >= Number(health.cooldownUntil || 0);
+};
+
+export const applyProviderFailureToHealth = ({ provider, health, error, now = Date.now() } = {}) => {
+  if (!health) return { cooldownApplied: false, reason: "missing_health" };
+
+  const statusCode = getErrorStatusCode(error);
+  const retryAfterMs = Number(error?.retryAfterMs);
+  const classifiedCategory = provider === "openai" ? classifyOpenAIError(error) : (error?.errorCategory || null);
+  const errorCategory = classifiedCategory || (statusCode === 429 ? "rate_limit" : null);
+  const quotaExhausted = provider === "openai" && errorCategory === "quota";
+  const reason = error?.reason || getProviderErrorMessage(error) || "Provider request failed";
+  const existingQuotaActive = provider === "openai" &&
+    health.quotaExhausted &&
+    health.errorCategory === "quota" &&
+    now < Number(health.cooldownUntil || 0);
+
+  if (existingQuotaActive && !quotaExhausted) {
+    health.failures = Number(health.failures || 0) + 1;
+    return {
+      cooldownApplied: true,
+      cooldownMs: Math.max(0, Number(health.cooldownUntil || 0) - now),
+      reason: "quota_exhausted",
+      errorCategory: "quota",
+      preserved: true
+    };
+  }
+
+  health.failures = Number(health.failures || 0) + 1;
+  health.errorCategory = errorCategory;
+  health.quotaExhausted = quotaExhausted;
+  health.lastFailure = {
+    provider,
+    providerModel: error?.providerModel || error?.model || null,
+    httpStatus: statusCode,
+    reason,
+    errorCode: error?.errorCode || null,
+    errorCategory,
+    retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : null,
+    at: now
+  };
+
+  if (quotaExhausted) {
+    const cooldownMs = Math.max(OPENAI_QUOTA_COOLDOWN_MS, Number.isFinite(retryAfterMs) ? retryAfterMs : 0);
+    health.cooldownUntil = Math.max(Number(health.cooldownUntil || 0), now + cooldownMs);
+    return { cooldownApplied: true, cooldownMs, reason: "quota_exhausted", errorCategory };
+  }
+
+  if (statusCode === 429) {
+    const cooldownMs = Math.max(PROVIDER_COOLDOWN_MS, Number.isFinite(retryAfterMs) ? retryAfterMs : 0);
+    health.cooldownUntil = Math.max(Number(health.cooldownUntil || 0), now + cooldownMs);
+    return { cooldownApplied: true, cooldownMs, reason: provider === "openai" ? "rate_limit" : "resource_exhausted", errorCategory };
+  }
+
+  const nonRetryable = isProviderNonRetryableFailure(error);
+  const failureThreshold = nonRetryable ? PROVIDER_NON_RETRYABLE_FAILURE_THRESHOLD : PROVIDER_FAILURE_THRESHOLD;
+  if (health.failures < failureThreshold) {
+    return { cooldownApplied: false, reason: nonRetryable ? "non_retryable_threshold" : "failure_threshold", errorCategory };
+  }
+
+  const cooldownMs = nonRetryable ? PROVIDER_HARD_FAILURE_COOLDOWN_MS : PROVIDER_COOLDOWN_MS;
+  health.cooldownUntil = Math.max(Number(health.cooldownUntil || 0), now + cooldownMs);
+  return { cooldownApplied: true, cooldownMs, reason: nonRetryable ? "non_retryable_failure" : "failure_threshold", errorCategory };
+};
+
+export const getLatestConfiguredProviderFailure = ({ providerHealth = {}, env = {} } = {}) =>
+  Object.entries(providerHealth)
+    .filter(([name]) => name === "gemini" ? Boolean(env.geminiApiKey) : Boolean(env.openaiApiKey))
+    .map(([, health]) => health?.lastFailure)
+    .filter(Boolean)
+    .sort((a, b) => Number(b.at || 0) - Number(a.at || 0))[0] || null;
+
+export const createProviderUnavailableError = ({ providerHealth = {}, env = {} } = {}) => {
+  const lastFailure = getLatestConfiguredProviderFailure({ providerHealth, env });
+  const hasConfiguredProvider = Boolean(env.geminiApiKey || env.openaiApiKey);
+  const error = new Error(
+    lastFailure?.reason ||
+    (hasConfiguredProvider
+      ? "All configured translation providers are temporarily unavailable"
+      : "No translation provider is configured")
+  );
+  error.provider = lastFailure?.provider || "provider";
+  error.providerModel = lastFailure?.providerModel || null;
+  error.status = lastFailure?.httpStatus || null;
+  error.httpStatus = lastFailure?.httpStatus || null;
+  error.reason = lastFailure?.reason || error.message;
+  error.errorCode = lastFailure?.errorCode || null;
+  error.errorCategory = lastFailure?.errorCategory || null;
+  error.retryAfterMs = lastFailure?.retryAfterMs || null;
+  error.providerRetryExhausted = true;
+  return error;
+};
+
 const isSourceTaggedFallbackText = (text = "") => /^\[[a-z]{2,12}(?:-[a-z0-9]{2,12})?\]\s+/i.test(cleanTranscriptText(text));
 
 const isSourceEchoTranslation = ({ text = "", sourceText = "" } = {}) => {
@@ -790,40 +898,20 @@ export const shouldDegradeProviderHealth = ({ result = null, error = null, sourc
   );
 };
 
-export const buildProviderExecutionOrder = ({ providerHealth = {}, env = {}, preferredProvider = "auto", userPlan = "free", rotationOffset = 0 } = {}) => {
-  const providers = ["gemini", "openai"].filter((name) => {
-    const hasKey = name === "gemini" ? Boolean(env.geminiApiKey) : Boolean(env.openaiApiKey);
-    return hasKey;
-  });
-
-  if (providers.length === 0) return [];
-
+export const buildProviderExecutionOrder = ({ providerHealth = {}, env = {}, preferredProvider = "auto" } = {}) => {
   const now = Date.now();
-  const ranked = providers
-    .map((name) => {
-      const health = providerHealth[name] || {};
-      const cooldownRemainingMs = Math.max(0, (health.cooldownUntil || 0) - now);
-      const isHealthy = cooldownRemainingMs === 0;
-      const failures = Number.isFinite(health.failures) ? health.failures : 0;
-      const lastSuccessAt = Number.isFinite(health.lastSuccessAt) ? health.lastSuccessAt : 0;
-      return { name, failures, cooldownRemainingMs, isHealthy, lastSuccessAt };
-    })
+  const preferred = ["gemini", "openai"].includes(preferredProvider) ? preferredProvider : "gemini";
+
+  return ["gemini", "openai"]
+    .filter((name) => name === "gemini" ? Boolean(env.geminiApiKey) : Boolean(env.openaiApiKey))
+    .filter((name) => isProviderAvailableFromHealth(providerHealth, name, now))
     .sort((a, b) => {
-      if (a.isHealthy !== b.isHealthy) return a.isHealthy ? -1 : 1;
-      if (a.failures !== b.failures) return a.failures - b.failures;
-      if (a.cooldownRemainingMs !== b.cooldownRemainingMs) return a.cooldownRemainingMs - b.cooldownRemainingMs;
-      if (a.name === preferredProvider && b.name !== preferredProvider) return -1;
-      if (b.name === preferredProvider && a.name !== preferredProvider) return 1;
-      return (a.lastSuccessAt || 0) - (b.lastSuccessAt || 0);
+      if (a === preferred && b !== preferred) return -1;
+      if (b === preferred && a !== preferred) return 1;
+      const failureDifference = Number(providerHealth[a]?.failures || 0) - Number(providerHealth[b]?.failures || 0);
+      if (failureDifference !== 0) return failureDifference;
+      return a === "gemini" ? -1 : 1;
     });
-
-  const rotated = [...ranked];
-  const offset = Math.abs(rotationOffset % rotated.length);
-  for (let index = 0; index < offset; index += 1) {
-    rotated.push(rotated.shift());
-  }
-
-  return rotated.map(({ name }) => name);
 };
 
 const isCacheableTranslation = ({ text = "", sourceText = "", provider = "", sourceLang = "", targetLang = "" } = {}) =>
@@ -1123,10 +1211,7 @@ export const createInterpreterSession = async ({
   let providerStreamingPreviewSequence = 0;
   let lastAdminStatsAt = 0;
   const sessionId = createSessionId();
-  const providerHealth = {
-    gemini: { failures: 0, cooldownUntil: 0, lastSuccessAt: 0 },
-    openai: { failures: 0, cooldownUntil: 0, lastSuccessAt: 0 }
-  };
+  const providerHealth = sharedProviderHealth;
   const translationMetrics = {
     timeoutCount: 0,
     retryCount: 0,
@@ -1252,7 +1337,7 @@ export const createInterpreterSession = async ({
     }
   });
 
-  const createTranslationDiagnostics = ({ language, provider, providerModel = null, reason, retryCount = 0, latencyMs, requestId, socketId, status = "unknown", fallbackProvider, httpStatus, providerResponse, queueLength = null, activeWorkers = null }) => ({
+  const createTranslationDiagnostics = ({ language, provider, providerModel = null, reason, errorCode = null, errorCategory = null, retryCount = 0, latencyMs, requestId, socketId, status = "unknown", fallbackProvider, httpStatus, providerResponse, queueLength = null, activeWorkers = null }) => ({
     language,
     provider,
     providerModel,
@@ -1260,6 +1345,8 @@ export const createInterpreterSession = async ({
     latencyMs,
     httpStatus,
     reason,
+    errorCode,
+    errorCategory,
     requestId,
     socketId,
     status,
@@ -1270,7 +1357,7 @@ export const createInterpreterSession = async ({
     activeWorkers
   });
 
-  const buildTranslationFailureDiagnostic = ({ provider = "unknown", providerModel = null, statusCode = null, reason = "failed", retryAfterMs = null, requestId = null, latencyMs = 0, fallbackProvider = null, providerResponse = null, attempt = 0, queueLength = null, activeWorkers = null }) => {
+  const buildTranslationFailureDiagnostic = ({ provider = "unknown", providerModel = null, statusCode = null, reason = "failed", errorCode = null, errorCategory = null, retryAfterMs = null, requestId = null, latencyMs = 0, fallbackProvider = null, providerResponse = null, attempt = 0, queueLength = null, activeWorkers = null }) => {
     const providerName = typeof provider === "string" && provider.trim()
       ? provider.charAt(0).toUpperCase() + provider.slice(1)
       : "Provider";
@@ -1290,6 +1377,7 @@ export const createInterpreterSession = async ({
     ];
 
     if (retryAfterSeconds) lines.push(`Retry After: ${retryAfterSeconds} second${retryAfterSeconds === 1 ? "" : "s"}`);
+    if (errorCode) lines.push(`Error Code: ${errorCode}`);
     if (providerResponse) lines.push(`Provider Response: ${String(providerResponse).slice(0, 240)}`);
     if (fallbackProvider) lines.push(`Fallback Provider: ${fallbackProvider}`);
 
@@ -1299,6 +1387,8 @@ export const createInterpreterSession = async ({
       providerModel,
       httpStatus: statusCode,
       reason: summaryReason,
+      errorCode,
+      errorCategory,
       retryAfterMs,
       requestId,
       latencyMs,
@@ -1339,11 +1429,16 @@ export const createInterpreterSession = async ({
     const current = {
       gemini: {
         status: geminiAvailable ? "healthy" : "cooldown",
-        cooldownUntil: providerHealth.gemini.cooldownUntil
+        cooldownUntil: providerHealth.gemini.cooldownUntil,
+        errorCategory: providerHealth.gemini.errorCategory || null,
+        lastFailure: providerHealth.gemini.lastFailure || null
       },
       openai: {
         status: openaiAvailable ? "healthy" : "cooldown",
-        cooldownUntil: providerHealth.openai.cooldownUntil
+        cooldownUntil: providerHealth.openai.cooldownUntil,
+        errorCategory: providerHealth.openai.errorCategory || null,
+        quotaExhausted: Boolean(providerHealth.openai.quotaExhausted),
+        lastFailure: providerHealth.openai.lastFailure || null
       }
     };
     const stateStr = JSON.stringify(current);
@@ -1470,8 +1565,7 @@ export const createInterpreterSession = async ({
   };
 
   const providerAvailable = (provider) => {
-    const health = providerHealth[provider];
-    return Boolean(health) && Date.now() >= health.cooldownUntil;
+    return isProviderAvailableFromHealth(providerHealth, provider);
   };
 
   const noteProviderSuccess = (provider) => {
@@ -1480,41 +1574,28 @@ export const createInterpreterSession = async ({
     health.failures = 0;
     health.cooldownUntil = 0;
     health.lastSuccessAt = Date.now();
+    health.lastFailure = null;
+    health.errorCategory = null;
+    health.quotaExhausted = false;
   };
 
   const noteProviderFailure = (provider, error) => {
-    const health = providerHealth[provider];
-    if (!health) return;
-    const nonRetryable = isProviderNonRetryableFailure(error);
-    const statusCode = getErrorStatusCode(error);
-    const retryAfterMs = Number(error?.retryAfterMs);
-
-    health.failures += 1;
-    if (statusCode === 429 && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
-      health.cooldownUntil = Math.max(health.cooldownUntil || 0, Date.now() + retryAfterMs);
+    const outcome = applyProviderFailureToHealth({
+      provider,
+      health: providerHealth[provider],
+      error
+    });
+    if (outcome.cooldownApplied) {
       logTranslationEvent("PROVIDER_COOLDOWN", {
         sessionId,
         provider,
-        reason: "retry_after",
-        retryAfterMs,
+        reason: outcome.reason,
+        cooldownMs: outcome.cooldownMs,
+        httpStatus: getErrorStatusCode(error),
+        errorCategory: outcome.errorCategory || error?.errorCategory || null,
         error: error?.reason || getProviderErrorMessage(error)
       }, "warn");
-      emitProviderHealth();
-      return;
     }
-    const failureThreshold = nonRetryable ? PROVIDER_NON_RETRYABLE_FAILURE_THRESHOLD : PROVIDER_FAILURE_THRESHOLD;
-    if (health.failures < failureThreshold) {
-      emitProviderHealth();
-      return;
-    }
-
-    health.cooldownUntil = Date.now() + (nonRetryable ? PROVIDER_HARD_FAILURE_COOLDOWN_MS : PROVIDER_COOLDOWN_MS);
-    logTranslationEvent("PROVIDER_COOLDOWN", {
-      sessionId,
-      provider,
-      reason: nonRetryable ? "non_retryable_failure" : "failure_threshold",
-      error: getProviderErrorMessage(error)
-    }, "warn");
     emitProviderHealth();
   };
 
@@ -1527,6 +1608,8 @@ export const createInterpreterSession = async ({
         recovered.push(name);
         health.failures = 0;
         health.cooldownUntil = 0;
+        health.errorCategory = null;
+        health.quotaExhausted = false;
       }
     }
 
@@ -1539,17 +1622,13 @@ export const createInterpreterSession = async ({
 
   const getHealthyProviders = () => {
     refreshProviderCooldowns();
-    const primaryChoice = preferredProvider && preferredProvider !== "auto"
+    const primaryChoice = ["gemini", "openai"].includes(preferredProvider)
       ? preferredProvider
-      : userPlan === "pro"
-        ? "openai"
-        : "gemini";
+      : "gemini";
     const order = buildProviderExecutionOrder({
       providerHealth,
       env,
-      preferredProvider: primaryChoice,
-      userPlan,
-      rotationOffset: translationMetrics.completedCount + translationMetrics.failedCount
+      preferredProvider: primaryChoice
     });
     return order;
   };
@@ -1950,7 +2029,10 @@ export const createInterpreterSession = async ({
         available: hasKey && Date.now() >= (health.cooldownUntil || 0),
         cooldownRemainingMs,
         failures: health.failures,
-        lastSuccessAt: health.lastSuccessAt
+        lastSuccessAt: health.lastSuccessAt,
+        errorCategory: health.errorCategory || null,
+        quotaExhausted: Boolean(health.quotaExhausted),
+        lastFailure: health.lastFailure || null
       };
     });
     logTranslationEvent("PROVIDER_SELECTION", {
@@ -1965,6 +2047,7 @@ export const createInterpreterSession = async ({
     });
 
     if (providerOrder.length === 0) {
+      lastError = createProviderUnavailableError({ providerHealth, env });
       logTranslationEvent("TRANSLATION_FAILED", {
         sessionId,
         jobId,
@@ -2049,8 +2132,20 @@ export const createInterpreterSession = async ({
     };
 
     for (const provider of providerOrder) {
+      if (!providerAvailable(provider)) {
+        logTranslationEvent("PROVIDER_SKIPPED", {
+          sessionId,
+          jobId,
+          provider,
+          targetLang: language,
+          reason: providerHealth[provider]?.errorCategory || "cooldown"
+        }, "warn");
+        continue;
+      }
+
       for (let attempt = 0; attempt <= MAX_PROVIDER_RETRY_ATTEMPTS; attempt += 1) {
         if (staleTranslationJobs.has(jobId)) break;
+        if (!providerAvailable(provider)) break;
 
         if (attempt > 0) {
           translationMetrics.retryCount += 1;
@@ -2068,6 +2163,7 @@ export const createInterpreterSession = async ({
           }, "warn");
           await waitForMs(getRetryDelay({ attempt, baseMs: PROVIDER_RETRY_DELAY_MS, maxMs: PROVIDER_RETRY_MAX_DELAY_MS, error: lastError }));
           if (staleTranslationJobs.has(jobId)) break;
+          if (!providerAvailable(provider)) break;
         }
 
         lastAttemptedProvider = provider;
@@ -2111,6 +2207,9 @@ export const createInterpreterSession = async ({
       }, "warn");
     }
 
+    if (!lastError) {
+      lastError = createProviderUnavailableError({ providerHealth, env });
+    }
     noteTranslationFailure(language, lastError);
     return {
       text: "",
@@ -2354,15 +2453,19 @@ export const createInterpreterSession = async ({
     let providerModel = languageState?.providerModel || null;
     let retryAfterMs = null;
     let requestId = null;
+    let errorCode = null;
+    let errorCategory = null;
 
     if (errorOrReason && typeof errorOrReason === "object") {
       failureProvider = errorOrReason.provider || provider;
-      reason = errorOrReason.message || errorOrReason.reason || "failed";
+      reason = errorOrReason.reason || errorOrReason.message || "failed";
       statusCode = getErrorStatusCode(errorOrReason) || null;
       providerResponse = errorOrReason.providerResponse || errorOrReason.response || errorOrReason.message || null;
       providerModel = errorOrReason.providerModel || errorOrReason.model || providerModel;
       retryAfterMs = errorOrReason.retryAfterMs || null;
       requestId = errorOrReason.requestId || languageState?.requestId || null;
+      errorCode = errorOrReason.errorCode || null;
+      errorCategory = errorOrReason.errorCategory || null;
     } else {
       reason = String(errorOrReason || "failed");
       requestId = languageState?.requestId || null;
@@ -2373,6 +2476,8 @@ export const createInterpreterSession = async ({
       providerModel,
       statusCode,
       reason,
+      errorCode,
+      errorCategory,
       retryAfterMs,
       requestId,
       latencyMs,
@@ -2394,7 +2499,9 @@ export const createInterpreterSession = async ({
       diagnostics: diagnostic,
       providerResponse,
       retryAfterMs,
-      requestId
+      requestId,
+      errorCode,
+      errorCategory
     };
 
     logTranslationMetrics("language_failed", {

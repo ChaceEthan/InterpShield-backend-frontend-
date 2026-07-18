@@ -156,7 +156,7 @@ const createFakeClientFactory = (options = {}) => {
     preferredProvider: "gemini",
     rotationOffset: 0
   });
-  assert.deepEqual(order, ["openai", "gemini"], "providers whose cooldown elapsed should recover into selection order");
+  assert.deepEqual(order, ["gemini", "openai"], "providers whose cooldown elapsed should recover behind the preferred healthy provider");
 }
 
 {

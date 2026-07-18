@@ -4,12 +4,28 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   buildGeminiGenerateContentUrl,
+  buildGeminiModelsListUrl,
   getGeminiModelOrder,
+  listGeminiGenerateContentModels,
   normalizeGeminiModel,
+  selectVerifiedGeminiFlashFallback,
   translateWithGemini
 } from "../services/gemini.js";
-import { translateWithOpenAI } from "../services/openai.js";
-import { createPerLanguageDispatchQueue, isRetryableProviderError } from "../services/interpreter.js";
+import {
+  classifyOpenAIError,
+  isOpenAIQuotaError,
+  isOpenAIRateLimitError,
+  translateWithOpenAI
+} from "../services/openai.js";
+import {
+  OPENAI_QUOTA_COOLDOWN_MS,
+  applyProviderFailureToHealth,
+  buildProviderExecutionOrder,
+  createProviderUnavailableError,
+  createPerLanguageDispatchQueue,
+  isProviderAvailableFromHealth,
+  isRetryableProviderError
+} from "../services/interpreter.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const interpreterSource = readFileSync(resolve(__dirname, "../services/interpreter.js"), "utf8");
@@ -38,14 +54,44 @@ assert.equal(normalizeGeminiModel("models/gemini-flash-latest"), "gemini-flash-l
 assert.equal(normalizeGeminiModel("models/models/example-model"), "example-model");
 assert.deepEqual(
   getGeminiModelOrder("models/gemini-flash-latest"),
-  ["gemini-flash-latest", "gemini-3.1-flash-lite"],
+  ["gemini-flash-latest"],
   "normalized duplicate model names should be attempted once"
+);
+assert.deepEqual(
+  getGeminiModelOrder("models/custom-flash", ["models/gemini-flash-latest", "models/gemini-2.5-flash", "gemini-2.5-flash"]),
+  ["custom-flash", "gemini-flash-latest", "gemini-2.5-flash"],
+  "only authenticated fallback models should extend the bounded model order"
 );
 assert.equal(
   buildGeminiGenerateContentUrl("models/example-model"),
   "https://generativelanguage.googleapis.com/v1beta/models/example-model:generateContent"
 );
 assert.doesNotMatch(buildGeminiGenerateContentUrl("models/example-model"), /\/models\/models\//);
+assert.equal(buildGeminiModelsListUrl(), "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000");
+assert.equal(
+  selectVerifiedGeminiFlashFallback(
+    ["models/gemini-2.0-flash-exp", "models/text-embedding-004", "models/gemini-2.5-flash"],
+    ["gemini-flash-latest"]
+  ),
+  "gemini-2.5-flash"
+);
+assert.deepEqual(
+  await listGeminiGenerateContentModels({
+    apiKey: "test-only",
+    request: async (url, options) => {
+      assert.equal(url, buildGeminiModelsListUrl());
+      assert.equal(options.method, "GET");
+      return jsonResponse(200, {
+        models: [
+          { name: "models/gemini-2.5-flash", supportedGenerationMethods: ["generateContent"] },
+          { name: "models/gemini-embedding-001", supportedGenerationMethods: ["embedContent"] }
+        ]
+      });
+    }
+  }),
+  ["gemini-2.5-flash"],
+  "only authenticated models that advertise generateContent may be selected"
+);
 
 {
   const calls = [];
@@ -69,6 +115,39 @@ assert.doesNotMatch(buildGeminiGenerateContentUrl("models/example-model"), /\/mo
   assert.equal(result.providerModel, "gemini-flash-latest");
   assert.equal(result.retryCount, 1, "a model switch must be reported as a retry");
   assert.equal(calls.length, 2, "404 should advance immediately to the next unique model");
+  assert.ok(calls.every((url) => !url.includes("/models/models/")));
+}
+
+{
+  const calls = [];
+  const result = await translateWithGemini({
+    apiKey: "test-only",
+    model: "models/gemini-flash-latest",
+    text: sourceText,
+    sourceLang: "en",
+    targetLang: "es",
+    includeMetadata: true,
+    request: async (url) => {
+      calls.push(url);
+      if (url === buildGeminiModelsListUrl()) {
+        return jsonResponse(200, {
+          models: [
+            { name: "models/text-embedding-004", supportedGenerationMethods: ["embedContent"] },
+            { name: "models/gemini-2.5-flash", supportedGenerationMethods: ["generateContent"] }
+          ]
+        });
+      }
+      return url.includes("gemini-flash-latest")
+        ? jsonResponse(404, { error: { message: "Alias temporarily unavailable" } })
+        : geminiSuccessResponse(translations.es);
+    },
+    sleep: async () => undefined
+  });
+
+  assert.equal(result.providerModel, "gemini-2.5-flash");
+  assert.deepEqual(result.attemptedModels, ["gemini-flash-latest", "gemini-2.5-flash"]);
+  assert.equal(calls.length, 3, "404 should authenticate model discovery before using one verified Flash fallback");
+  assert.equal(calls.filter((url) => url === buildGeminiModelsListUrl()).length, 1);
   assert.ok(calls.every((url) => !url.includes("/models/models/")));
 }
 
@@ -167,8 +246,35 @@ assert.doesNotMatch(buildGeminiGenerateContentUrl("models/example-model"), /\/mo
   assert.equal(failure.httpStatus, 429);
   assert.equal(failure.retryAfterMs, 2000);
   assert.equal(failure.reason, "Rate limit reached");
-  assert.equal(calls, 1, "429 should hand off to OpenAI instead of fanning out across Gemini models");
-  assert.equal(sleepCalls, 0, "Retry-After is enforced as provider cooldown, not a blocked language worker");
+  assert.equal(failure.retryCount, 2);
+  assert.equal(calls, 3, "temporary 429 must be bounded to the initial request plus two retries");
+  assert.equal(sleepCalls, 2, "Retry-After must be respected within the bounded provider retry policy");
+  assert.deepEqual(failure.attemptedModels, ["gemini-flash-latest"], "429 must not fan out across Gemini models");
+}
+
+{
+  let calls = 0;
+  const sleeps = [];
+  let failure;
+  try {
+    await translateWithGemini({
+      apiKey: "test-only",
+      text: sourceText,
+      sourceLang: "en",
+      targetLang: "zh",
+      request: async () => {
+        calls += 1;
+        return jsonResponse(429, { error: { message: "Resource exhausted" } }, { "Retry-After": "60" });
+      },
+      sleep: async (ms) => sleeps.push(ms)
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure);
+  assert.equal(failure.retryAfterMs, 60000);
+  assert.equal(calls, 1, "a long Gemini Retry-After must fall back instead of retrying early");
+  assert.equal(sleeps.length, 0);
 }
 
 for (const status of [401, 403]) {
@@ -189,6 +295,246 @@ for (const status of [401, 403]) {
     (error) => error.httpStatus === status && error.providerModel === "custom-model"
   );
   assert.equal(calls, 1, `${status} must not retry with other Gemini models`);
+}
+
+assert.equal(
+  classifyOpenAIError({ httpStatus: 429, errorCode: "rate_limit_exceeded", reason: "Requests per minute reached" }),
+  "rate_limit"
+);
+assert.equal(
+  classifyOpenAIError({ httpStatus: 429, errorCode: "insufficient_quota", reason: "You exceeded your current quota, please check your plan and billing details." }),
+  "quota"
+);
+assert.equal(isOpenAIRateLimitError({ httpStatus: 429, reason: "Too many requests" }), true);
+assert.equal(isOpenAIQuotaError({ httpStatus: 429, reason: "Credit balance is unavailable" }), true);
+assert.equal(classifyOpenAIError({ httpStatus: 429, errorCode: "billing_hard_limit_reached" }), "quota");
+assert.equal(classifyOpenAIError({ httpStatus: 429, errorCode: "requests_per_minute" }), "rate_limit");
+assert.equal(
+  classifyOpenAIError({ httpStatus: 401, errorCode: "insufficient_quota", reason: "Billing authentication rejected" }),
+  "authentication",
+  "authentication status must take precedence over message content"
+);
+
+{
+  let calls = 0;
+  const sleeps = [];
+  const result = await translateWithOpenAI({
+    apiKey: "test-only",
+    text: sourceText,
+    sourceLang: "en",
+    targetLang: "es",
+    includeMetadata: true,
+    request: async () => {
+      calls += 1;
+      return calls < 3
+        ? jsonResponse(
+            429,
+            { error: { message: "Rate limit reached for requests per minute", code: "rate_limit_exceeded", type: "requests" } },
+            { "Retry-After": "2" }
+          )
+        : openAISuccessResponse(translations.es);
+    },
+    sleep: async (ms) => sleeps.push(ms)
+  });
+
+  assert.equal(result.text, translations.es);
+  assert.equal(result.providerModel, "gpt-4o-mini");
+  assert.equal(result.retryCount, 2);
+  assert.equal(calls, 3, "temporary OpenAI rate limiting should use only bounded retries");
+  assert.deepEqual(sleeps, [2000, 2000]);
+}
+
+{
+  let calls = 0;
+  const sleeps = [];
+  let failure;
+  try {
+    await translateWithOpenAI({
+      apiKey: "test-only",
+      text: sourceText,
+      sourceLang: "en",
+      targetLang: "es",
+      request: async () => {
+        calls += 1;
+        return jsonResponse(
+          429,
+          { error: { message: "Rate limit reached", code: "rate_limit_exceeded" } },
+          { "Retry-After": "60" }
+        );
+      },
+      sleep: async (ms) => sleeps.push(ms)
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure);
+  assert.equal(failure.retryAfterMs, 60000);
+  assert.equal(calls, 1, "a long OpenAI Retry-After must fall back instead of retrying early");
+  assert.equal(sleeps.length, 0);
+}
+
+let openAIQuotaFailure;
+{
+  let calls = 0;
+  const sleeps = [];
+  try {
+    await translateWithOpenAI({
+      apiKey: "test-only",
+      text: sourceText,
+      sourceLang: "en",
+      targetLang: "es",
+      request: async () => {
+        calls += 1;
+        return jsonResponse(429, {
+          error: {
+            message: "You exceeded your current quota, please check your plan and billing details.",
+            code: "insufficient_quota",
+            type: "insufficient_quota"
+          }
+        });
+      },
+      sleep: async (ms) => sleeps.push(ms)
+    });
+  } catch (error) {
+    openAIQuotaFailure = error;
+  }
+
+  assert.ok(openAIQuotaFailure);
+  assert.equal(openAIQuotaFailure.httpStatus, 429);
+  assert.equal(openAIQuotaFailure.errorCode, "insufficient_quota");
+  assert.equal(openAIQuotaFailure.errorCategory, "quota");
+  assert.equal(openAIQuotaFailure.quotaExhausted, true);
+  assert.equal(openAIQuotaFailure.providerRetryExhausted, true);
+  assert.equal(openAIQuotaFailure.retryCount, 0);
+  assert.equal(openAIQuotaFailure.reason, "You exceeded your current quota, please check your plan and billing details.");
+  assert.equal(calls, 1, "quota or billing failure must not receive a useless retry");
+  assert.equal(sleeps.length, 0);
+}
+
+{
+  let failure;
+  try {
+    await translateWithOpenAI({
+      apiKey: "test-only",
+      text: sourceText,
+      sourceLang: "en",
+      targetLang: "es",
+      request: async () => jsonResponse(429, { error: {} }),
+      sleep: async () => undefined
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure);
+  assert.doesNotMatch(failure.reason, /\[object Object\]/, "structured provider errors must never stringify as [object Object]");
+}
+
+{
+  const now = Date.now();
+  const providerHealth = {
+    gemini: { failures: 0, cooldownUntil: 0, lastSuccessAt: now, lastFailure: null },
+    openai: { failures: 0, cooldownUntil: 0, lastSuccessAt: now, lastFailure: null }
+  };
+  const beforeFailureOrder = buildProviderExecutionOrder({
+    providerHealth,
+    env: { geminiApiKey: "configured", openaiApiKey: "configured" },
+    preferredProvider: "openai",
+    userPlan: "pro",
+    rotationOffset: 1
+  });
+  assert.deepEqual(beforeFailureOrder, ["openai", "gemini"]);
+
+  const outcome = applyProviderFailureToHealth({
+    provider: "openai",
+    health: providerHealth.openai,
+    error: openAIQuotaFailure,
+    now
+  });
+  assert.equal(outcome.reason, "quota_exhausted");
+  assert.equal(outcome.cooldownApplied, true);
+  assert.ok(providerHealth.openai.cooldownUntil >= now + OPENAI_QUOTA_COOLDOWN_MS);
+  assert.equal(providerHealth.openai.quotaExhausted, true);
+  assert.equal(isProviderAvailableFromHealth(providerHealth, "openai", now + 1), false);
+  const quotaReason = providerHealth.openai.lastFailure.reason;
+  const preserved = applyProviderFailureToHealth({
+    provider: "openai",
+    health: providerHealth.openai,
+    error: Object.assign(new Error("Temporary rate limit"), {
+      httpStatus: 429,
+      reason: "Temporary rate limit",
+      errorCategory: "rate_limit"
+    }),
+    now: now + 1
+  });
+  assert.equal(preserved.preserved, true);
+  assert.equal(providerHealth.openai.quotaExhausted, true);
+  assert.equal(providerHealth.openai.errorCategory, "quota");
+  assert.equal(providerHealth.openai.lastFailure.reason, quotaReason, "a weaker in-flight failure must not overwrite active quota diagnostics");
+
+  const afterFailureOrder = buildProviderExecutionOrder({
+    providerHealth,
+    env: { geminiApiKey: "configured", openaiApiKey: "configured" },
+    preferredProvider: "openai",
+    userPlan: "pro",
+    rotationOffset: 1
+  });
+  assert.deepEqual(afterFailureOrder, ["gemini"], "quota-exhausted OpenAI must be skipped by every language lane during cooldown");
+
+  let openAICallsAfterCooldown = 0;
+  const routeLanguage = async (language) => {
+    for (const provider of afterFailureOrder) {
+      if (!isProviderAvailableFromHealth(providerHealth, provider, now + 1)) continue;
+      if (provider === "openai") {
+        openAICallsAfterCooldown += 1;
+        throw new Error("OpenAI should have been skipped");
+      }
+      return { language, provider, providerModel: "gemini-flash-latest", text: translations[language] };
+    }
+    throw new Error("No healthy provider");
+  };
+
+  const routed = await Promise.all(["es", "ja", "zh"].map(routeLanguage));
+  assert.equal(openAICallsAfterCooldown, 0, "no language may call OpenAI again after quota cooldown begins");
+  assert.deepEqual(routed.map((result) => result.provider), ["gemini", "gemini", "gemini"]);
+  assert.equal(routed.find((result) => result.language === "es").text, translations.es, "Spanish must route to healthy Gemini");
+}
+
+{
+  const now = Date.now();
+  const geminiHealth = { failures: 0, cooldownUntil: 0, lastSuccessAt: 0, lastFailure: null };
+  const outcome = applyProviderFailureToHealth({
+    provider: "gemini",
+    health: geminiHealth,
+    error: Object.assign(new Error("Gemini resource exhausted"), {
+      httpStatus: 429,
+      reason: "Gemini resource exhausted"
+    }),
+    now
+  });
+  assert.equal(outcome.cooldownApplied, true);
+  assert.equal(outcome.reason, "resource_exhausted");
+  assert.ok(geminiHealth.cooldownUntil >= now + 45000);
+
+  const unavailableError = createProviderUnavailableError({
+    providerHealth: {
+      gemini: geminiHealth,
+      openai: {
+        failures: 1,
+        cooldownUntil: now + OPENAI_QUOTA_COOLDOWN_MS,
+        lastFailure: {
+          provider: "openai",
+          httpStatus: 429,
+          reason: "Unconfigured provider failure",
+          at: now + 10
+        }
+      }
+    },
+    env: { geminiApiKey: "configured", openaiApiKey: "" }
+  });
+  assert.equal(unavailableError.provider, "gemini");
+  assert.equal(unavailableError.httpStatus, 429);
+  assert.equal(unavailableError.reason, "Gemini resource exhausted");
+  assert.equal(unavailableError.providerRetryExhausted, true);
 }
 
 const translateWithBackendProviderFallback = async ({ language, geminiRequest, openAIRequest }) => {
@@ -275,6 +621,50 @@ const translateWithBackendProviderFallback = async ({ language, geminiRequest, o
 }
 
 {
+  let openAICalls = 0;
+  const events = [];
+  const queue = createPerLanguageDispatchQueue({
+    languages: ["es", "ja", "zh"],
+    concurrency: 3,
+    requestDelayMs: 100,
+    maxRetries: 0,
+    onEvent: (event) => events.push(event),
+    worker: async (language) => {
+      const providerHealth = {
+        gemini: { failures: 0, cooldownUntil: 0, lastSuccessAt: 0 },
+        openai: { failures: 1, cooldownUntil: Date.now() + OPENAI_QUOTA_COOLDOWN_MS, lastSuccessAt: 0, quotaExhausted: true }
+      };
+      const providerOrder = buildProviderExecutionOrder({
+        providerHealth,
+        env: { geminiApiKey: "configured", openaiApiKey: "configured" },
+        preferredProvider: "gemini",
+        userPlan: "pro"
+      });
+      assert.deepEqual(providerOrder, ["gemini"]);
+
+      if (providerOrder.includes("openai")) openAICalls += 1;
+      return translateWithGemini({
+        apiKey: "test-only",
+        text: sourceText,
+        sourceLang: "en",
+        targetLang: language,
+        includeMetadata: true,
+        request: async () => geminiSuccessResponse(translations[language]),
+        sleep: async () => undefined
+      });
+    }
+  });
+
+  const results = await queue.run();
+  assert.equal(openAICalls, 0);
+  assert.equal(results.length, 3);
+  assert.deepEqual(results.map((result) => result.provider), ["gemini", "gemini", "gemini"]);
+  assert.deepEqual(results.map((result) => result.providerModel), ["gemini-flash-latest", "gemini-flash-latest", "gemini-flash-latest"]);
+  assert.ok(results.every((result) => result.text && result.text !== sourceText));
+  assert.equal(events.filter((event) => event.type === "dispatch_complete").length, 3);
+}
+
+{
   const queue = createPerLanguageDispatchQueue({
     languages: ["es", "ja", "zh"],
     concurrency: 3,
@@ -301,6 +691,8 @@ const translateWithBackendProviderFallback = async ({ language, geminiRequest, o
             providerModel: error.providerModel,
             httpStatus: error.httpStatus,
             reason: error.message,
+            errorCode: error.errorCode || null,
+            errorCategory: error.errorCategory || null,
             latencyMs: 1,
             retryCount: error.retryCount || 0,
             queueLength: context.queueLength,
@@ -317,7 +709,7 @@ const translateWithBackendProviderFallback = async ({ language, geminiRequest, o
   assert.equal(results.find((result) => result.language === "ja").status, "translated");
   assert.equal(results.find((result) => result.language === "zh").status, "translated");
   const diagnostic = results.find((result) => result.language === "es").diagnostic;
-  for (const field of ["provider", "providerModel", "httpStatus", "reason", "latencyMs", "retryCount", "queueLength", "activeWorkers", "requestId"]) {
+  for (const field of ["provider", "providerModel", "httpStatus", "reason", "errorCode", "errorCategory", "latencyMs", "retryCount", "queueLength", "activeWorkers", "requestId"]) {
     assert.ok(Object.hasOwn(diagnostic, field), `failure diagnostic must include ${field}`);
   }
 }
@@ -328,9 +720,13 @@ assert.match(interpreterSource, /`Failure Reason: \$\{summaryReason\}`/);
 assert.match(interpreterSource, /`Queue Length: \$\{Number\.isFinite\(queueLength\)/);
 assert.match(interpreterSource, /`Active Workers: \$\{Number\.isFinite\(activeWorkers\)/);
 assert.doesNotMatch(interpreterSource, /message:\s*["']FAILED["']/);
-assert.match(interpreterSource, /statusCode === 429 && Number\.isFinite\(retryAfterMs\)/);
+assert.match(interpreterSource, /if \(statusCode === 429\)/);
+assert.match(interpreterSource, /existingQuotaActive/);
+assert.match(interpreterSource, /createProviderUnavailableError/);
 assert.match(frontendSource, /Provider Model:/);
 assert.match(frontendSource, /diagnosticUpdates\[language\]\s*=\s*""/);
 assert.match(frontendSource, /hasSuccessfulTranslation/);
+assert.match(frontendSource, /OpenAI quota is currently unavailable/);
+assert.match(frontendSource, /errorCategory\?: string \| null/);
 assert.doesNotMatch(frontendSource, /if\s*\(diagnostic\.message\)\s*return/);
 assert.doesNotMatch(frontendSource, /coerceTranslationState\(diagnostic\.status\s*\|\|\s*nextStatusUpdates\[language\]\s*\|\|\s*status\)/);

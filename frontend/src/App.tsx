@@ -57,6 +57,9 @@ type TranslationProviderDiagnostic = {
   requestId?: string | null;
   status?: string;
   reason?: string;
+  errorCode?: string | null;
+  errorCategory?: string | null;
+  fallbackProvider?: string | null;
   httpStatus?: number | string | null;
   providerResponse?: string | null;
   queueLength?: number | null;
@@ -632,6 +635,19 @@ const coerceTranslationState = (value: unknown): TranslationLifecycleState | "" 
 
 const formatProviderDiagnostic = (diagnostic: TranslationProviderDiagnostic) => {
   const reason = diagnostic.reason || diagnostic.message || "Translation failed";
+  const quotaEvidence = [
+    diagnostic.errorCode,
+    diagnostic.errorCategory,
+    diagnostic.reason,
+    diagnostic.providerResponse
+  ].filter(Boolean).join(" ").toLowerCase();
+  const isOpenAiQuota = String(diagnostic.provider || "").toLowerCase() === "openai" &&
+    /(insufficient[_ ]quota|current quota(?: has been)? exceeded|exceeded your current quota|check your plan and billing|usage limit(?: has been)? reached|billing|credit balance)/i.test(quotaEvidence);
+  if (isOpenAiQuota) {
+    return String(diagnostic.status || "").toLowerCase() === "retrying"
+      ? "OpenAI quota is currently unavailable.\nTrying the alternative translation provider."
+      : "OpenAI quota is currently unavailable.";
+  }
   const lines = [
     "FAILED",
     `Provider: ${diagnostic.provider || "unknown"}`,
@@ -2592,6 +2608,9 @@ export default function App() {
           requestId: diagnostic.requestId || `${jobId || "job"}:${language}`,
           provider: diagnostic.provider || provider || "unknown",
           providerModel: diagnostic.providerModel || null,
+          errorCode: diagnostic.errorCode || null,
+          errorCategory: diagnostic.errorCategory || null,
+          fallbackProvider: diagnostic.fallbackProvider || null,
           latency: diagnostic.latencyMs ?? latencyMs ?? null,
           retries: diagnostic.retryCount ?? 0,
           queueLength: diagnostic.queueLength ?? null,

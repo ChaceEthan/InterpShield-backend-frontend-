@@ -21,7 +21,6 @@ import {
 
 const GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_GEMINI_MODEL = "gemini-flash-latest";
-const GEMINI_FALLBACK_MODELS = [DEFAULT_GEMINI_MODEL, "gemini-3.1-flash-lite"];
 const GEMINI_TIMEOUT_MS = 25000;
 const GEMINI_MAX_ATTEMPTS = 3;
 const GEMINI_RETRY_BASE_MS = 1000;
@@ -40,11 +39,11 @@ export const GEMINI_MODEL = normalizeGeminiModel(
   process.env.GEMINI_MODEL || env.geminiModel || DEFAULT_GEMINI_MODEL
 );
 
-export const getGeminiModelOrder = (configuredModel = GEMINI_MODEL) => {
+export const getGeminiModelOrder = (configuredModel = GEMINI_MODEL, verifiedFallbackModels = []) => {
   const models = [];
   const seen = new Set();
 
-  for (const candidate of [configuredModel, ...GEMINI_FALLBACK_MODELS]) {
+  for (const candidate of [configuredModel, DEFAULT_GEMINI_MODEL, ...verifiedFallbackModels]) {
     const model = normalizeGeminiModel(candidate);
     const key = model.toLowerCase();
     if (seen.has(key)) continue;
@@ -57,6 +56,51 @@ export const getGeminiModelOrder = (configuredModel = GEMINI_MODEL) => {
 
 export const buildGeminiGenerateContentUrl = (model = GEMINI_MODEL) =>
   `${GEMINI_API_BASE_URL}/models/${encodeURIComponent(normalizeGeminiModel(model))}:generateContent`;
+
+export const buildGeminiModelsListUrl = () => `${GEMINI_API_BASE_URL}/models?pageSize=1000`;
+
+export const listGeminiGenerateContentModels = async ({ apiKey, request = globalThis.fetch, signal } = {}) => {
+  if (!apiKey) return [];
+
+  const response = await request(buildGeminiModelsListUrl(), {
+    method: "GET",
+    signal,
+    headers: { "X-goog-api-key": apiKey }
+  });
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const reason = data?.error?.message || data?.message || response.statusText || "Gemini models list failed";
+    const error = new Error(reason);
+    error.provider = "Gemini";
+    error.status = response.status;
+    error.statusCode = response.status;
+    error.httpStatus = response.status;
+    error.reason = reason;
+    error.headers = response.headers;
+    error.retryAfterMs = getRetryAfterMs(error);
+    throw error;
+  }
+
+  return (Array.isArray(data?.models) ? data.models : [])
+    .filter((candidate) => Array.isArray(candidate?.supportedGenerationMethods) && candidate.supportedGenerationMethods.includes("generateContent"))
+    .map((candidate) => normalizeGeminiModel(candidate.name))
+    .filter(Boolean);
+};
+
+export const selectVerifiedGeminiFlashFallback = (models = [], excludedModels = []) => {
+  const excluded = new Set(excludedModels.map((model) => normalizeGeminiModel(model).toLowerCase()));
+  return models
+    .map((model) => normalizeGeminiModel(model))
+    .filter((model) => /gemini.*flash/i.test(model))
+    .filter((model) => !/(?:preview|experimental|exp|image|tts)/i.test(model))
+    .filter((model) => !excluded.has(model.toLowerCase()))
+    .sort((a, b) => {
+      const liteDifference = Number(/flash-lite/i.test(a)) - Number(/flash-lite/i.test(b));
+      if (liteDifference !== 0) return liteDifference;
+      return b.localeCompare(a, undefined, { numeric: true, sensitivity: "base" });
+    })[0] || null;
+};
 
 const geminiHealth = {
   status: "idle",
@@ -299,8 +343,11 @@ export const translateWithGemini = async ({ apiKey, model = GEMINI_MODEL, text, 
   let requestCount = 0;
   const operationStartedAt = Date.now();
   const attemptedModels = [];
+  const candidateModels = getGeminiModelOrder(model);
+  let modelDiscoveryAttempted = false;
 
-  for (const candidateModel of getGeminiModelOrder(model)) {
+  for (let modelIndex = 0; modelIndex < candidateModels.length; modelIndex += 1) {
+    const candidateModel = candidateModels[modelIndex];
     attemptedModels.push(candidateModel);
 
     for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt += 1) {
@@ -369,11 +416,48 @@ export const translateWithGemini = async ({ apiKey, model = GEMINI_MODEL, text, 
           throw error;
         }
 
-        if (status === 404) break;
+        if (status === 404) {
+          if (!modelDiscoveryAttempted && modelIndex === candidateModels.length - 1) {
+            modelDiscoveryAttempted = true;
+            try {
+              const verifiedModels = await listGeminiGenerateContentModels({ apiKey, request, signal });
+              const verifiedFallback = selectVerifiedGeminiFlashFallback(verifiedModels, candidateModels);
+              if (verifiedFallback) candidateModels.push(verifiedFallback);
+            } catch (modelListError) {
+              const listStatus = getErrorStatusCode(modelListError);
+              modelListError.provider = "Gemini";
+              modelListError.providerModel = candidateModel;
+              modelListError.model = candidateModel;
+              modelListError.httpStatus = listStatus;
+              modelListError.reason = modelListError.reason || providerErrorMessage(modelListError) || "Gemini models list failed";
+              modelListError.retryCount = retryCount;
+              modelListError.latencyMs = Date.now() - operationStartedAt;
+              modelListError.attemptedModels = [...attemptedModels];
+              modelListError.providerRetryExhausted = true;
+              lastError = modelListError;
+              noteGeminiFailure(modelListError, candidateModel, attemptedModels);
+              throw modelListError;
+            }
+          }
+          break;
+        }
 
         if (status === 429) {
-          error.providerRetryExhausted = true;
-          throw error;
+          if (attempt >= GEMINI_MAX_ATTEMPTS) {
+            error.providerRetryExhausted = true;
+            throw error;
+          }
+          if (Number(error.retryAfterMs) > GEMINI_RETRY_MAX_MS) {
+            error.providerRetryExhausted = true;
+            throw error;
+          }
+          await sleep(getRetryDelay({
+            attempt,
+            baseMs: GEMINI_RETRY_BASE_MS,
+            maxMs: GEMINI_RETRY_MAX_MS,
+            error
+          }));
+          continue;
         }
 
         const retryable = !status || [408, 409, 500, 502, 503, 504].includes(status);

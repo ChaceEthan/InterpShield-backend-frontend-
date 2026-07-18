@@ -27,6 +27,27 @@ const OPENAI_RETRY_BASE_MS = 1000;
 const OPENAI_RETRY_MAX_MS = 4000;
 const SUPPORTED_LANGUAGE_LIST = supportedLanguageList();
 
+const OPENAI_QUOTA_PATTERN = /\b(?:insufficient quota|quota exceeded|current quota(?: has been)? exceeded|exceeded your current quota|check your plan and billing|usage limit(?: has been)? reached|billing(?: hard)? limit(?: has been)? reached|billing|credit balance)\b/i;
+const OPENAI_RATE_LIMIT_PATTERN = /\b(?:rate limit exceeded|rate limit(?:ed)?|too many requests|requests per minute|tokens per minute|rpm|tpm)\b/i;
+
+export const classifyOpenAIError = (error = {}) => {
+  const status = getErrorStatusCode(error);
+  const details = [error?.errorCode, error?.errorType, error?.reason, error?.message]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/[_-]+/g, " ");
+
+  if (status === 401 || status === 403) return "authentication";
+  if (OPENAI_QUOTA_PATTERN.test(details)) return "quota";
+  if (OPENAI_RATE_LIMIT_PATTERN.test(details)) return "rate_limit";
+  if (["quota", "rate_limit", "authentication"].includes(error?.errorCategory)) return error.errorCategory;
+  if (status === 429) return "rate_limit";
+  return "provider";
+};
+
+export const isOpenAIQuotaError = (error = {}) => classifyOpenAIError(error) === "quota";
+export const isOpenAIRateLimitError = (error = {}) => classifyOpenAIError(error) === "rate_limit";
+
 const openAIHealth = {
   status: "idle",
   attempts: 0,
@@ -167,7 +188,7 @@ const buildSystemPrompt = ({ sourceLang, targetLang, translationContext }) => {
   ].join("\n");
 };
 
-export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang, translationContext, signal, includeMetadata = false, request = globalThis.fetch }) => {
+export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang, translationContext, signal, includeMetadata = false, request = globalThis.fetch, sleep = delay }) => {
   const cleanText = text?.trim();
 
   if (!cleanText || !apiKey) {
@@ -185,7 +206,6 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
   let lastError = null;
 
   for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt += 1) {
-    const startedAt = Date.now();
     openAIHealth.status = attempt === 1 ? "requesting" : "retrying";
     openAIHealth.attempts += 1;
 
@@ -224,7 +244,10 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        const message = errorData?.error?.message || errorData?.error || response.statusText || "OpenAI translation request failed";
+        const providerError = errorData?.error && typeof errorData.error === "object" ? errorData.error : {};
+        const providerMessage = typeof providerError.message === "string" ? providerError.message : "";
+        const responseErrorMessage = typeof errorData?.error === "string" ? errorData.error : "";
+        const message = providerMessage || responseErrorMessage || response.statusText || "OpenAI translation request failed";
         const error = new Error(`OpenAI ${response.status}: ${message}`);
         error.status = response.status;
         error.httpStatus = response.status;
@@ -233,6 +256,11 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
         error.model = OPENAI_TRANSLATION_MODEL;
         error.headers = response.headers;
         error.reason = String(message);
+        error.errorCode = providerError.code ? String(providerError.code) : null;
+        error.errorType = providerError.type ? String(providerError.type) : null;
+        error.errorCategory = classifyOpenAIError(error);
+        error.quotaExhausted = error.errorCategory === "quota";
+        error.rateLimited = error.errorCategory === "rate_limit";
         error.retryAfterMs = getRetryAfterMs(error);
         throw error;
       }
@@ -283,16 +311,26 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
       error.model = error.model || OPENAI_TRANSLATION_MODEL;
       error.httpStatus = getErrorStatusCode(error);
       error.reason = error.reason || providerErrorMessage(error) || "OpenAI translation failed";
+      error.errorCategory = classifyOpenAIError(error);
+      error.quotaExhausted = error.errorCategory === "quota";
+      error.rateLimited = error.errorCategory === "rate_limit";
       error.retryCount = attempt - 1;
       error.latencyMs = Date.now() - operationStartedAt;
       noteOpenAIFailure(error);
 
-      if (attempt >= OPENAI_MAX_ATTEMPTS || isNonRetryableProviderError(error, [400, 401, 403, 404], ["quota", "billing", "unauthori[sz]ed", "forbidden", "invalid api key", "permission", "insufficient"])) {
+      const terminalFailure = error.quotaExhausted || isNonRetryableProviderError(error, [400, 401, 403, 404], ["unauthori[sz]ed", "forbidden", "invalid api key", "permission"]);
+      if (terminalFailure || attempt >= OPENAI_MAX_ATTEMPTS) {
+        error.providerRetryExhausted = true;
+        break;
+      }
+
+      if (error.rateLimited && Number(error.retryAfterMs) > OPENAI_RETRY_MAX_MS) {
+        error.providerRetryExhausted = true;
         break;
       }
 
       openAIHealth.retryCount += 1;
-      await delay(getRetryDelay({ attempt, baseMs: OPENAI_RETRY_BASE_MS, maxMs: OPENAI_RETRY_MAX_MS, error }));
+      await sleep(getRetryDelay({ attempt, baseMs: OPENAI_RETRY_BASE_MS, maxMs: OPENAI_RETRY_MAX_MS, error }));
     }
   }
 

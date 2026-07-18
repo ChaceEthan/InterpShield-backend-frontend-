@@ -92,7 +92,7 @@ assert.deepEqual(
     userPlan: "free",
     rotationOffset: 0
   }),
-  ["openai", "gemini"]
+  ["openai"]
 );
 assert.deepEqual(
   buildProviderExecutionOrder({
@@ -105,7 +105,7 @@ assert.deepEqual(
     userPlan: "free",
     rotationOffset: 1
   }),
-  ["openai", "gemini"]
+  ["gemini", "openai"]
 );
 
 let concurrentRuns = 0;
