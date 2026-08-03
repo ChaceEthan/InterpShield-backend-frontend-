@@ -386,25 +386,35 @@ const TOOL_ITEMS: Array<{ mode: Mode; label: string; icon: LucideIcon }> = [
 
 const PRICING_PLANS = [
   {
-    name: "Basic",
-    monthly: 49,
-    features: ["360 mins captions", "72 mins translation", "AI summary", "Transcript export"]
+    name: "FREE",
+    monthly: 0,
+    features: ["10 mins captions/month", "3 mins translation/month", "No dubbing", "Session history", "Watermarked output", "AI Summary: Off"]
   },
   {
-    name: "Premium",
-    monthly: 99,
+    name: "STARTER",
+    monthly: 3,
+    features: ["60 mins captions", "15 mins translation", "Session history", "No dubbing"]
+  },
+  {
+    name: "BASIC",
+    monthly: 5,
+    features: ["180 mins captions", "45 mins translation", "15 mins dubbing", "AI Summary", "Transcript export"]
+  },
+  {
+    name: "STANDARD",
+    monthly: 8,
+    features: ["360 mins captions", "90 mins translation", "30 mins dubbing", "AI Summary", "Transcript export"]
+  },
+  {
+    name: "PRO",
+    monthly: 10,
     highlighted: true,
-    features: ["900 mins captions", "180 mins translation", "API access", "Priority support"]
+    features: ["720 mins captions", "180 mins translation", "60 mins dubbing", "AI Summary", "Transcript export", "Session sharing", "Priority processing"]
   },
   {
-    name: "Business",
-    monthly: 199,
-    features: ["1800 mins captions", "360 mins translation", "180 mins dubbing", "Session sharing", "Glossary"]
-  },
-  {
-    name: "Business Plus",
-    monthly: 449,
-    features: ["4500 mins captions", "900 mins translation", "450 mins dubbing"]
+    name: "PREMIUM",
+    monthly: 25,
+    features: ["2400 mins captions", "600 mins translation", "240 mins dubbing", "AI Summary", "Transcript export", "Session sharing", "Glossary", "Priority processing", "Premium support"]
   }
 ];
 
@@ -3628,10 +3638,10 @@ export default function App() {
           ))}
 
           <GlassPanel className="p-5">
-            <p className="text-xl font-black text-gray-950">Enterprise</p>
+            <p className="text-xl font-black text-gray-950">ENTERPRISE</p>
             <p className="mt-4 text-3xl font-black text-gray-950">Custom</p>
             <ul className="mt-5 space-y-3 text-sm text-gray-600">
-              {["Custom pricing", "Dedicated onboarding", "Security review", "Contact form"].map((feature) => (
+              {["Custom pricing", "Unlimited team members", "Dedicated onboarding", "Security review", "API access", "Dedicated support"].map((feature) => (
                 <li key={feature} className="flex items-start gap-2">
                   <Check className="mt-0.5 h-4 w-4 shrink-0 text-blue-300" />
                   {feature}
@@ -3639,7 +3649,7 @@ export default function App() {
               ))}
             </ul>
             <button onClick={() => setAlert("Enterprise contact form is ready for your sales workflow.")} className="mt-6 w-full rounded-lg border border-gray-200 bg-white px-4 py-3 text-sm font-black text-gray-800 hover:bg-gray-50">
-              Contact sales
+              Contact Sales
             </button>
           </GlassPanel>
         </div>
