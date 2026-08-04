@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { analyzeTranscriptCompleteness, buildProductionAudioConstraints, createVadController, getDynamicSilenceHoldMs } from "../src/audio/vadController.mjs";
+import { createUtteranceBoundaryController, stableSessionStartTime } from "../src/audio/recorderLifecycle.mjs";
 
 const constraints = buildProductionAudioConstraints({ echoCancellation: true, noiseSuppression: true, autoGainControl: true, sampleRate: true, channelCount: true });
 assert.equal(constraints.noiseSuppression, true);
@@ -131,4 +132,47 @@ recorder.resume();
 assert.equal(recorder.instances, 1, "automatic resume must reuse the MediaRecorder");
 recorder.stop();
 assert.equal(recorder.state, "inactive", "manual stop must stop the recorder");
+
+{
+  const timers = [];
+  const boundaries = [];
+  const cancellations = [];
+  let sessionStartedAt = stableSessionStartTime(null, 1000);
+  let sequence = 7;
+  let recorderStops = 0;
+  let trackStops = 0;
+  const lifecycle = createUtteranceBoundaryController({
+    timeoutMs: 2500,
+    setTimer: (callback) => { timers.push(callback); return timers.length; },
+    clearTimer: () => undefined,
+    onBoundary: (boundary, reason) => boundaries.push({ ...boundary, reason }),
+    onCancelled: (boundary, reason) => cancellations.push({ ...boundary, reason })
+  });
+
+  assert.equal(lifecycle.request({ sequence, capturedAt: 2000, speechThreshold: 0.02 }), true);
+  assert.equal(boundaries.length, 0, "utterance retirement must await the final dataavailable event");
+  assert.equal(recorderStops, 0, "soft-pause must not stop MediaRecorder");
+  assert.equal(trackStops, 0, "soft-pause must not stop microphone tracks");
+  assert.equal(stableSessionStartTime(sessionStartedAt, 5000), 1000, "soft-pause must not reset the session timer");
+  assert.equal(sequence, 7, "utterance completion must not reset or consume sequence numbers");
+
+  lifecycle.onDataAvailable(0.001);
+  assert.equal(boundaries.length, 1, "delayed Android-style dataavailable must retire the utterance once");
+  assert.equal(boundaries[0].reason, "dataavailable");
+  assert.equal(lifecycle.hasPending(), false);
+
+  sequence += 1;
+  assert.equal(lifecycle.request({ sequence, capturedAt: 4000, speechThreshold: 0.02 }), true, "the same recorder lifecycle must support another utterance");
+  lifecycle.onDataAvailable(0.04);
+  assert.equal(cancellations.length, 1, "renewed speech must cancel a pending boundary");
+  assert.equal(boundaries.length, 1);
+  assert.equal(recorderStops, 0);
+  assert.equal(trackStops, 0);
+  sessionStartedAt = stableSessionStartTime(sessionStartedAt, 9000);
+  assert.equal(sessionStartedAt, 1000, "multiple utterances must share one stable timer origin");
+  assert.equal(lifecycle.request({ sequence: sequence + 1, capturedAt: 6000, speechThreshold: 0.02 }), true);
+  timers.at(-1)();
+  assert.equal(boundaries.at(-1).reason, "timeout", "a throttled mobile data event must use the non-destructive fallback boundary");
+  lifecycle.stop();
+}
 console.log("Hybrid VAD controller regression tests passed.");

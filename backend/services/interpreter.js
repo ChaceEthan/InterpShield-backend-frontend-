@@ -3742,6 +3742,7 @@ export const createInterpreterSession = async ({
   sessionHealthMonitor.unref?.();
 
   let latestSpeechSignal = "";
+  let utteranceBoundaryPending = false;
   const session = createDeepgramSession({
     apiKey: env.deepgramApiKey,
     sourceLang,
@@ -3863,6 +3864,10 @@ export const createInterpreterSession = async ({
         direction,
         detectedLanguage: effectiveDetectedLanguage
       });
+      if (utteranceBoundaryPending) {
+        utteranceBoundaryPending = false;
+        scheduleStableTranslation(0);
+      }
       latestSpeechSignal = "";
     }
   });
@@ -3870,7 +3875,13 @@ export const createInterpreterSession = async ({
   const completeDeepgramUtterance = session.completeUtterance;
   session.completeUtterance = () => {
     completeDeepgramUtterance?.();
-    if (!currentSentence.trim() || sessionStopped) return false;
+    if (sessionStopped) return false;
+    if (!currentSentence.trim()) {
+      utteranceBoundaryPending = true;
+      logTranslationEvent("UTTERANCE_BOUNDARY_PENDING", { sessionId });
+      return true;
+    }
+    utteranceBoundaryPending = false;
     scheduleStableTranslation(0);
     return true;
   };
@@ -3883,6 +3894,7 @@ export const createInterpreterSession = async ({
   const stopDeepgramSession = session.stop;
   session.stop = () => {
     sessionStopped = true;
+    utteranceBoundaryPending = false;
     providerStreamingPreviewSequence += 1;
     clearTranslationTimer();
     clearInterval(sessionHealthMonitor);

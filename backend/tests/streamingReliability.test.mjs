@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { createDeepgramSession } from "../services/deepgram.js";
 import { buildProviderExecutionOrder, createInterpreterSession } from "../services/interpreter.js";
 import { createAudioPipelineSession } from "../services/audioPipeline.js";
+import { normalizeLanguageCode } from "../../shared/languages.mjs";
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -110,6 +111,41 @@ const createFakeClientFactory = (options = {}) => {
   assert.equal(session.getHealth().queuedChunks, 1, "completed utterance overlap must not be queued for reconnect replay");
   await wait(650);
   assert.equal(factory.connections[1].sentMedia.length, 1, "only current-utterance audio should recover after reconnect");
+  session.stop();
+}
+
+{
+  assert.equal(normalizeLanguageCode("ZH"), "zh");
+  assert.equal(normalizeLanguageCode("zh-CN"), "zh");
+  assert.equal(normalizeLanguageCode("FR"), "fr");
+  assert.equal(normalizeLanguageCode("fr-FR"), "fr");
+  assert.equal(normalizeLanguageCode("RU"), "ru");
+  assert.equal(normalizeLanguageCode("ru-RU"), "ru");
+}
+
+{
+  const factory = createFakeClientFactory();
+  const finals = [];
+  const translations = [];
+  const session = await createInterpreterSession({
+    env: { deepgramApiKey: "test-key", geminiApiKey: "", openaiApiKey: "" },
+    sourceLang: "en",
+    targetLanguages: ["fr-FR", "ru-RU", "zh-CN"],
+    shouldTranslate: true,
+    deepgramClientFactory: factory,
+    onResult: (result) => {
+      if (result.isTranscriptOnly) finals.push(result);
+      if (result.isTranslationComplete) translations.push(result);
+    }
+  });
+  await wait(10);
+  session.completeUtterance();
+  factory.connections[0].emitTranscript("Thank you.", { isFinal: true, speechFinal: true });
+  await wait(1000);
+  assert.equal(finals.length, 1, "an early mobile utterance boundary must finalize the later Deepgram segment exactly once");
+  assert.equal(translations.length, 1, "the retained boundary must dispatch one final translation job");
+  assert.deepEqual(finals[0].targetLanguages, ["fr", "ru", "zh"], "regional and uppercase target codes must normalize consistently");
+  assert.equal(factory.connections.length, 1, "the early-boundary recovery must retain the Deepgram connection");
   session.stop();
 }
 

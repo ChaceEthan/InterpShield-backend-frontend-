@@ -193,7 +193,8 @@ assert.match(frontendSource, /latestTranslationSequenceRef\.current\s*=\s*transc
 assert.match(frontendSource, /finalTranslationsRef/);
 assert.match(frontendSource, /pendingFinalTranscriptsRef/);
 assert.match(frontendSource, /completedTranslationSignaturesRef/);
-assert.match(frontendSource, /staleUpdates\[language\]\s*=\s*"stale"/);
+assert.match(frontendSource, /staleUpdates\[language\]\s*=\s*"failed"/);
+assert.match(frontendSource, /Translation timed out\. Speak again to retry\./);
 assert.match(readFileSync(resolve(__dirname, "../services/openai.js"), "utf8"), /mergeAbortSignals\(signal,\s*controller\.signal\)/);
 assert.doesNotMatch(readFileSync(resolve(__dirname, "../services/openai.js"), "utf8"), /forbidden output languages/);
 assert.match(readFileSync(resolve(__dirname, "../services/gemini.js"), "utf8"), /mergeAbortSignals/);

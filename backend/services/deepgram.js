@@ -354,6 +354,13 @@ export const createDeepgramSession = ({
         return;
       }
 
+      if (process.env.NODE_ENV !== "production") {
+        console.debug(message.is_final ? "[DEEPGRAM_FINAL_RECEIVED]" : "[DEEPGRAM_INTERIM_RECEIVED]", {
+          chars: transcript.length,
+          speechFinal: Boolean(message.speech_final)
+        });
+      }
+
       onTranscript?.({
         text: transcript,
         isFinal: Boolean(message.is_final),
@@ -415,6 +422,9 @@ export const createDeepgramSession = ({
 
     try {
       sendToDeepgram(buffer);
+      if (process.env.NODE_ENV !== "production" && (health.sentChunks === 0 || health.sentChunks % 25 === 0)) {
+        console.debug("[DEEPGRAM_AUDIO_SENT]", { bytes: buffer.length, sentChunks: health.sentChunks + 1 });
+      }
       rememberRecentAudio(buffer);
       health.sentChunks += 1;
       health.lastAudioSentAt = Date.now();

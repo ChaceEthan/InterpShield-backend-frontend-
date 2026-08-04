@@ -37,6 +37,7 @@ import { TranslationOptions } from "./components/TranslationOptions";
 import { TranslationPanel } from "./components/TranslationPanel";
 import type { TranscriptTranslationEntry } from "./components/TranscriptArea";
 import { buildProductionAudioConstraints, createVadController, DEFAULT_VAD_CONFIG } from "./audio/vadController.mjs";
+import { createUtteranceBoundaryController, stableSessionStartTime } from "./audio/recorderLifecycle.mjs";
 import {
   LANGUAGE_CATALOG,
   LANGUAGE_FLAGS,
@@ -265,7 +266,8 @@ const DUBBING_UTTERANCE_TTL_MS = 45000;
 const MIN_MEDIA_CHUNK_BYTES = 96;
 const MIN_AUDIO_CHUNK_INTERVAL_MS = 45;
 const VAD_POLL_INTERVAL_MS = 30;
-const FINAL_CHUNK_GRACE_MS = 90;
+const FINAL_CHUNK_ACK_TIMEOUT_MS = 2500;
+const CAPTION_WATCHDOG_MS = 12000;
 const MAX_QUEUED_AUDIO_CHUNKS = 240;
 const MAX_PENDING_FINAL_TRANSCRIPTS = 16;
 const CLIENT_HEARTBEAT_MS = 25000;
@@ -1442,7 +1444,8 @@ export default function App() {
   const getAudioLevelRef = useRef<() => number>(() => 0);
   const vadControllerRef = useRef(createVadController());
   const vadPollTimerRef = useRef<number | null>(null);
-  const finalChunkTimerRef = useRef<number | null>(null);
+  const utteranceBoundaryRef = useRef<ReturnType<typeof createUtteranceBoundaryController> | null>(null);
+  const captionWatchdogTimerRef = useRef<number | null>(null);
   const pendingSpeechChunksRef = useRef<AudioChunkPayload[]>([]);
   const recordingRef = useRef(false);
   const modeRef = useRef<Mode>("translate");
@@ -1519,7 +1522,7 @@ export default function App() {
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro";
-  const isRecording = ["connecting", "listening", "speaking", "finalizing", "paused"].includes(status);
+  const isRecording = ["connecting", "listening", "speaking", "soft-pause", "finalizing", "paused"].includes(status);
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
   const isTranslationActive = mode !== "transcribe" && Object.values(translationStatuses).some((translationState) =>
@@ -1539,7 +1542,7 @@ export default function App() {
               : "ready";
   const displayTranslationEntries = targetLanguages.map((language) => {
     const translatedText = finalTranslations[language]?.trim() || "";
-    const state: TranslationLifecycleState = translatedText ? "translated" : translationStatuses[language] || (isRecording && mode !== "transcribe" ? "queued" : "ready");
+    const state: TranslationLifecycleState = translatedText ? "translated" : translationStatuses[language] || "ready";
     return [language, translatedText, state, translationDiagnostics[language] || ""] as const;
   });
   const microphoneStatusLabel = audioDiagnostic.state === "recording" && audioDiagnostic.mimeType
@@ -2052,10 +2055,10 @@ export default function App() {
       window.clearInterval(vadPollTimerRef.current);
       vadPollTimerRef.current = null;
     }
-    if (finalChunkTimerRef.current) {
-      window.clearTimeout(finalChunkTimerRef.current);
-      finalChunkTimerRef.current = null;
-    }
+    utteranceBoundaryRef.current?.stop();
+    utteranceBoundaryRef.current = null;
+    if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
+    captionWatchdogTimerRef.current = null;
     vadControllerRef.current.stop();
     pendingSpeechChunksRef.current = [];
     getAudioLevelRef.current = () => 0;
@@ -2364,10 +2367,10 @@ export default function App() {
       const recorder = mediaRecorderRef.current;
       if (recorder?.state === "inactive") {
         recorder.start(audioChunkMsRef.current);
-        if (["listening", "paused"].includes(vadControllerRef.current.getState()) && (recorder as MediaRecorder).state === "recording") recorder.pause();
-        sessionStartedAtRef.current = Date.now();
-        setSessionSeconds(0);
       }
+      const previousStartedAt = sessionStartedAtRef.current;
+      sessionStartedAtRef.current = stableSessionStartTime(previousStartedAt);
+      if (!previousStartedAt) setSessionSeconds(0);
       flushQueuedAudioChunks();
       audioRestartAttemptsRef.current = 0;
       setAudioDiagnostic((current) => ({
@@ -2431,6 +2434,9 @@ export default function App() {
 
     socket.on("transcript_partial", ({ text, detectedLanguage, providerFinal, speechFinal, utteranceEnd, speechStarted }: { text?: string; detectedLanguage?: string; providerFinal?: boolean; speechFinal?: boolean; utteranceEnd?: boolean; speechStarted?: boolean }) => {
       const originalText = text?.trim() || "";
+      if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
+      captionWatchdogTimerRef.current = null;
+      logFrontendDebug("audio", "TRANSCRIPT_PARTIAL_RECEIVED", { chars: originalText.length, providerFinal, speechFinal, utteranceEnd });
       vadControllerRef.current.noteTranscript(originalText, { providerFinal, speechFinal, utteranceEnd });
       if (speechStarted && vadControllerRef.current.getState() === "soft-pause") {
         setStatus("speaking");
@@ -2446,6 +2452,9 @@ export default function App() {
 
     socket.on("transcript_final", ({ text, sessionId, jobId, sequence, detectedLanguage, latencyMs, provider, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages }: { text?: string; sessionId?: string; jobId?: string | number; sequence?: number; detectedLanguage?: string; latencyMs?: number; provider?: string; sourceLang?: string; targetLang?: string; targetLanguages?: string[] }) => {
       const originalText = text?.trim() || "";
+      if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
+      captionWatchdogTimerRef.current = null;
+      logFrontendDebug("audio", "TRANSCRIPT_FINAL_RECEIVED", { chars: originalText.length, sequence, jobId });
       if (!originalText || originalText === lastFinalOriginalRef.current) return;
       if (detectedLanguage) setDetectedLanguage(detectedLanguage);
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
@@ -2755,6 +2764,16 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const resumeVisibleAudio = () => {
+      if (document.visibilityState !== "visible" || !recordingRef.current) return;
+      const audioContext = audioContextRef.current;
+      if (audioContext?.state === "suspended") void audioContext.resume().catch(() => undefined);
+    };
+    document.addEventListener("visibilitychange", resumeVisibleAudio);
+    return () => document.removeEventListener("visibilitychange", resumeVisibleAudio);
+  }, []);
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
       if (!recordingRef.current || !sessionStartedAtRef.current) return;
 
@@ -2775,7 +2794,10 @@ export default function App() {
       for (const [language, state] of Object.entries(translationStatuses)) {
         if (!["queued", "translating", "processing", "retrying"].includes(state as string)) continue;
         const updatedAt = translationStatusUpdatedAtRef.current[language] || 0;
-        if (updatedAt && now - updatedAt > STALE_TRANSLATION_STATE_MS) staleUpdates[language] = "stale";
+        if (updatedAt && now - updatedAt > STALE_TRANSLATION_STATE_MS) {
+          staleUpdates[language] = "failed";
+          setTranslationDiagnostics((current) => ({ ...current, [language]: "Translation timed out. Speak again to retry." }));
+        }
       }
 
       if (Object.keys(staleUpdates).length > 0) updateTranslationStatuses(staleUpdates);
@@ -2940,6 +2962,8 @@ export default function App() {
     setStatus("connecting");
     setAudioDiagnostic({ state: "checking", message: "Checking microphone" });
     setDetectedLanguage(null);
+    sessionStartedAtRef.current = null;
+    if (!recordingRef.current) setSessionSeconds(0);
     setChunkCount(0);
     setLastLatency(null);
     setTranslationStatuses({});
@@ -3082,28 +3106,56 @@ export default function App() {
         if (sequenceRef.current % 3 === 0) setChunkCount(sequenceRef.current);
       };
 
+      utteranceBoundaryRef.current?.stop();
+      utteranceBoundaryRef.current = createUtteranceBoundaryController({
+        timeoutMs: FINAL_CHUNK_ACK_TIMEOUT_MS,
+        getAudioLevel: enhancedAudio.getAudioLevel,
+        onCancelled: () => {
+          if (!vadControllerRef.current.cancelFinalization()) return;
+          setStatus("speaking");
+          setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Speaking" }));
+        },
+        onBoundary: (boundary, reason) => {
+          if (!recordingRef.current) return;
+          pendingSpeechChunksRef.current = [];
+          vadControllerRef.current.markPaused();
+          socketRef.current?.emit("audio_utterance_end", {
+            sequence: sequenceRef.current,
+            capturedAt: boundary.capturedAt,
+            finalChunk: reason === "dataavailable"
+          });
+          logFrontendDebug("audio", "UTTERANCE_BOUNDARY_EMITTED", { sequence: boundary.sequence, reason });
+          setStatus("listening");
+          setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
+        }
+      });
+
       recorder.ondataavailable = (event) => {
-        if (event.data.size < MIN_MEDIA_CHUNK_BYTES) return;
         const capturedAt = Date.now();
         const audioLevel = enhancedAudio.getAudioLevel();
-        const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
-        if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.002) return;
-        const chunk = {
-          audio: event.data,
-          audioLevel,
-          chunkMs: audioChunkMsRef.current,
-          capturedAt,
-          mimeType: recorderMimeType
-        };
-        const vadState = vadControllerRef.current.getState();
-        if (vadState === "speaking" || vadState === "soft-pause" || vadState === "finalizing") {
-          sendCapturedChunk(chunk);
-          return;
-        }
-        if (vadState === "listening" || vadState === "paused") {
-          pendingSpeechChunksRef.current.push({ ...chunk, sequence: 0 });
-          const cutoff = capturedAt - DEFAULT_VAD_CONFIG.preSpeechBufferMs;
-          pendingSpeechChunksRef.current = pendingSpeechChunksRef.current.filter((item) => item.capturedAt >= cutoff);
+        try {
+          if (event.data.size < MIN_MEDIA_CHUNK_BYTES) return;
+          const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
+          if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.002) return;
+          const chunk = {
+            audio: event.data,
+            audioLevel,
+            chunkMs: audioChunkMsRef.current,
+            capturedAt,
+            mimeType: recorderMimeType
+          };
+          const vadState = vadControllerRef.current.getState();
+          if (vadState === "speaking" || vadState === "soft-pause" || vadState === "finalizing") {
+            sendCapturedChunk(chunk);
+            return;
+          }
+          if (vadState === "listening" || vadState === "paused") {
+            pendingSpeechChunksRef.current.push({ ...chunk, sequence: 0 });
+            const cutoff = capturedAt - DEFAULT_VAD_CONFIG.preSpeechBufferMs;
+            pendingSpeechChunksRef.current = pendingSpeechChunksRef.current.filter((item) => item.capturedAt >= cutoff);
+          }
+        } finally {
+          utteranceBoundaryRef.current?.onDataAvailable(audioLevel);
         }
       };
 
@@ -3138,11 +3190,10 @@ export default function App() {
           return;
         }
         if (action.type === "speech_candidate") {
-          if (recorder.state === "paused") recorder.resume();
+          if (enhancedAudio.audioContext?.state === "suspended") void enhancedAudio.audioContext.resume().catch(() => undefined);
           return;
         }
         if (action.type === "speech_cancelled") {
-          if (recorder.state === "recording") recorder.pause();
           return;
         }
         if (action.type === "speech_started") {
@@ -3154,6 +3205,12 @@ export default function App() {
           }
           setStatus("speaking");
           setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Speaking" }));
+          if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
+          captionWatchdogTimerRef.current = window.setTimeout(() => {
+            captionWatchdogTimerRef.current = null;
+            if (!recordingRef.current || lastInterimRef.current || lastFinalOriginalRef.current) return;
+            setAlert("No caption received yet. Still listening…");
+          }, CAPTION_WATCHDOG_MS);
           return;
         }
         if (action.type === "speech_resumed") {
@@ -3169,23 +3226,18 @@ export default function App() {
         if (action.type === "finalize") {
           setStatus("finalizing");
           setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Finishing caption" }));
-          if (recorder.state === "recording") recorder.requestData();
-          if (finalChunkTimerRef.current) window.clearTimeout(finalChunkTimerRef.current);
-          finalChunkTimerRef.current = window.setTimeout(() => {
-            finalChunkTimerRef.current = null;
-            if (!recordingRef.current) return;
-            if (getAudioLevelRef.current() >= action.speech && vadControllerRef.current.cancelFinalization()) {
-              setStatus("speaking");
-              setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Speaking" }));
-              return;
+          const requested = utteranceBoundaryRef.current?.request({
+            sequence: sequenceRef.current,
+            capturedAt: Date.now(),
+            speechThreshold: action.speech
+          });
+          if (requested && recorder.state === "recording") {
+            try {
+              recorder.requestData();
+            } catch (error) {
+              logFrontendDebug("audio", "FINAL_CHUNK_REQUEST_DELAYED", { message: error instanceof Error ? error.message : String(error) });
             }
-            if (recorder.state === "recording") recorder.pause();
-            pendingSpeechChunksRef.current = [];
-            vadControllerRef.current.markPaused();
-            socketRef.current?.emit("audio_utterance_end", { sequence: sequenceRef.current, capturedAt: Date.now() });
-            setStatus("paused");
-            setAudioDiagnostic((current) => ({ ...current, state: "ready", message: "Paused — start speaking" }));
-          }, FINAL_CHUNK_GRACE_MS);
+          }
         }
       }, VAD_POLL_INTERVAL_MS);
 
@@ -3296,7 +3348,7 @@ export default function App() {
     setTranslationStatuses({});
     translationStatusUpdatedAtRef.current = {};
     setInterimOriginal("");
-    setSessionSeconds(0);
+    if (!recordingRef.current) setSessionSeconds(0);
     setChunkCount(0);
     setLastLatency(null);
     setDetectedLanguage(null);

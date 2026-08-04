@@ -410,6 +410,9 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
       if (!result?.isFinal) {
         const activeSocket = getActiveSocket();
+        if (process.env.NODE_ENV !== "production") {
+          console.debug("[TRANSCRIPT_PARTIAL_EMITTED]", { chars: String(result.originalText || "").length });
+        }
         activeSocket.emit("transcript_partial", {
           text: result.originalText,
           sourceLang: result.sourceLang,
@@ -462,6 +465,9 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       }
 
       const activeSocket = getActiveSocket();
+      if (process.env.NODE_ENV !== "production") {
+        console.debug("[TRANSCRIPT_FINAL_EMITTED]", { sequence: result.sequence, jobId: result.jobId, chars: String(result.originalText || "").length });
+      }
       activeSocket.emit("transcript_final", {
         text: result.originalText,
         sessionId: result.sessionId,
@@ -794,10 +800,16 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
             at: new Date().toISOString(),
             snapshot: socket.data.audioPipeline
           };
+          if (process.env.NODE_ENV !== "production") {
+            console.debug("[AUDIO_CHUNK_REJECTED]", { sequence, reason: processedAudio.reason });
+          }
           return;
         }
 
         session.sendAudio(processedAudio.buffer);
+        if (process.env.NODE_ENV !== "production" && (sequence === 1 || sequence % 25 === 0)) {
+          console.debug("[AUDIO_CHUNK_ACCEPTED]", { sequence, bytes: processedAudio.buffer.length });
+        }
         socket.data.audioPipeline = audioPipeline?.getSnapshot?.() || socket.data.audioPipeline;
         socketRuntime.lastAudioAt = new Date().toISOString();
         socketRuntime.latestAudio = {
@@ -873,9 +885,12 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     });
     socket.on("audio_chunk", handleAudioChunk);
     socket.on("audio-chunk", handleAudioChunk);
-    socket.on("audio_utterance_end", () => {
+    socket.on("audio_utterance_end", (payload = {}) => {
       // This is an idle boundary, not a session stop. Deepgram remains open and
       // owns its reconnect lifecycle; only replay overlap is retired.
+      if (process.env.NODE_ENV !== "production") {
+        console.debug("[UTTERANCE_BOUNDARY_RECEIVED]", { sequence: payload.sequence, finalChunk: payload.finalChunk });
+      }
       session?.completeUtterance?.();
     });
     socket.on("end_session", handleEndSession);
