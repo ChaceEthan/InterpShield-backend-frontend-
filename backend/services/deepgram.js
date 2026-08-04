@@ -49,6 +49,7 @@ export const createDeepgramSession = ({
   clientFactory = createClient,
   onOpen,
   onTranscript,
+  onSpeechSignal,
   onError,
   onClose
 }) => {
@@ -283,8 +284,8 @@ export const createDeepgramSession = ({
       interim_results: true,
       punctuate: true,
       smart_format: true,
-      endpointing: 300,
-      utterance_end_ms: 1000,
+      endpointing: 500,
+      utterance_end_ms: 1800,
       vad_events: true,
       reconnectAttempts: 0,
       connectionTimeoutInSeconds: 10
@@ -335,6 +336,13 @@ export const createDeepgramSession = ({
     connection.on("message", (message) => {
       if (!isCurrentConnectionEvent()) return;
       health.lastMessageAt = Date.now();
+      if (message?.type === "SpeechStarted" || message?.type === "UtteranceEnd") {
+        onSpeechSignal?.({
+          type: message.type === "SpeechStarted" ? "speech_started" : "utterance_end",
+          at: Date.now()
+        });
+        return;
+      }
       if (message?.type !== "Results") {
         return;
       }
@@ -349,6 +357,7 @@ export const createDeepgramSession = ({
       onTranscript?.({
         text: transcript,
         isFinal: Boolean(message.is_final),
+        speechFinal: Boolean(message.speech_final),
         detectedLanguage: message.detected_language || alternative?.languages?.[0]
       });
       health.transcripts += 1;

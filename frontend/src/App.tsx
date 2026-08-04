@@ -47,7 +47,7 @@ import {
 
 type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
-type SessionStatus = "idle" | "connecting" | "listening" | "speaking" | "finalizing" | "paused" | "stopping" | "error";
+type SessionStatus = "idle" | "connecting" | "listening" | "speaking" | "soft-pause" | "finalizing" | "paused" | "stopping" | "error";
 type TranslationLifecycleState = "ready" | "queued" | "processing" | "translating" | "retrying" | "translated" | "done" | "failed" | "stale" | "cancelled";
 type TranslationProviderDiagnostic = {
   language?: string;
@@ -1532,7 +1532,7 @@ export default function App() {
         ? "connecting"
         : isTranslationActive
           ? "translating"
-          : ["listening", "speaking", "finalizing", "paused"].includes(status)
+          : ["listening", "speaking", "soft-pause", "finalizing", "paused"].includes(status)
             ? "listening"
             : socketConnected
               ? "connected"
@@ -1557,6 +1557,8 @@ export default function App() {
       ? "Attention"
       : status === "speaking"
         ? "Speaking…"
+        : status === "soft-pause"
+          ? "Waiting for more speech…"
         : status === "finalizing"
           ? "Finishing caption…"
           : status === "paused"
@@ -2012,7 +2014,7 @@ export default function App() {
     setLiveText(pending.text);
     setInterimOriginal(pending.text);
 
-    setStatus("listening");
+    setStatus((current) => current === "soft-pause" ? current : "speaking");
   }, []);
 
   const schedulePartialTranscript = useCallback(
@@ -2427,8 +2429,12 @@ export default function App() {
       }
     };
 
-    socket.on("transcript_partial", ({ text, detectedLanguage }: { text?: string; detectedLanguage?: string }) => {
+    socket.on("transcript_partial", ({ text, detectedLanguage, providerFinal, speechFinal, utteranceEnd, speechStarted }: { text?: string; detectedLanguage?: string; providerFinal?: boolean; speechFinal?: boolean; utteranceEnd?: boolean; speechStarted?: boolean }) => {
       const originalText = text?.trim() || "";
+      vadControllerRef.current.noteTranscript(originalText, { providerFinal, speechFinal, utteranceEnd });
+      if (speechStarted && vadControllerRef.current.getState() === "soft-pause") {
+        setStatus("speaking");
+      }
       if (!originalText || originalText === lastInterimRef.current) return;
 
       lastInterimRef.current = originalText;
@@ -3090,7 +3096,7 @@ export default function App() {
           mimeType: recorderMimeType
         };
         const vadState = vadControllerRef.current.getState();
-        if (vadState === "speaking" || vadState === "finalizing") {
+        if (vadState === "speaking" || vadState === "soft-pause" || vadState === "finalizing") {
           sendCapturedChunk(chunk);
           return;
         }
@@ -3118,7 +3124,9 @@ export default function App() {
         }
       };
 
-      vadControllerRef.current = createVadController({ silenceHoldMs: autoStopOnSilence ? 1500 : Number.POSITIVE_INFINITY });
+      vadControllerRef.current = createVadController({
+        autoFinalize: autoStopOnSilence
+      });
       vadControllerRef.current.start(Date.now());
       if (vadPollTimerRef.current) window.clearInterval(vadPollTimerRef.current);
       vadPollTimerRef.current = window.setInterval(() => {
@@ -3148,6 +3156,16 @@ export default function App() {
           setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Speaking" }));
           return;
         }
+        if (action.type === "speech_resumed") {
+          setStatus("speaking");
+          setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Speaking" }));
+          return;
+        }
+        if (action.type === "soft_pause") {
+          setStatus("soft-pause");
+          setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Waiting for more speech" }));
+          return;
+        }
         if (action.type === "finalize") {
           setStatus("finalizing");
           setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Finishing caption" }));
@@ -3156,6 +3174,11 @@ export default function App() {
           finalChunkTimerRef.current = window.setTimeout(() => {
             finalChunkTimerRef.current = null;
             if (!recordingRef.current) return;
+            if (getAudioLevelRef.current() >= action.speech && vadControllerRef.current.cancelFinalization()) {
+              setStatus("speaking");
+              setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Speaking" }));
+              return;
+            }
             if (recorder.state === "recording") recorder.pause();
             pendingSpeechChunksRef.current = [];
             vadControllerRef.current.markPaused();

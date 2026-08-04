@@ -1,5 +1,62 @@
-export const DEFAULT_VAD_CONFIG = Object.freeze({ calibrationMs: 650, speechThreshold: 0.014, silenceThreshold: 0.009, minimumSpeechMs: 140, silenceHoldMs: 1500, preSpeechBufferMs: 900, maximumUtteranceMs: 45000, noiseFloorMultiplier: 2.4 });
+export const DEFAULT_VAD_CONFIG = Object.freeze({
+  autoFinalize: true,
+  calibrationMs: 1000,
+  speechThreshold: 0.014,
+  silenceThreshold: 0.009,
+  minimumSpeechMs: 220,
+  minimumUtteranceMs: 1000,
+  speechHangoverMs: 550,
+  preSpeechBufferMs: 900,
+  postSpeechBufferMs: 700,
+  shortPauseGraceMs: 1500,
+  hardFinalizeMs: 4500,
+  maximumUtteranceMs: 55000,
+  transcriptChangeGraceMs: 650,
+  noiseFloorMultiplier: 2.4
+});
+
+const INCOMPLETE_ENDINGS = new Set([
+  "and", "or", "but", "because", "so", "then", "if", "when", "while", "to", "with", "for", "of",
+  "kandi", "cyangwa", "ariko", "kuko", "rero", "niba", "igihe", "na",
+  "au", "lakini", "basi", "kama", "wakati", "ili",
+  "et", "ou", "mais", "donc", "si", "quand", "pour", "avec"
+]);
+const INCOMPLETE_PHRASES = ["kugira ngo", "kwa sababu", "parce que"];
+const COMPLETE_SHORT_PHRASES = new Set([
+  "yes", "no", "okay", "ok", "thank you", "i understand", "murakoze", "yego", "oya", "sawa", "merci", "hello", "bye", "ndabyumva"
+]);
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+const normalizeText = (text = "") => String(text).trim().replace(/\s+/g, " ");
+const meaningfulWords = (text = "") => normalizeText(text).match(/[\p{L}\p{N}']+/gu) || [];
+
+export const analyzeTranscriptCompleteness = (text = "") => {
+  const clean = normalizeText(text);
+  const normalized = clean.toLocaleLowerCase().replace(/[.!?,;:]+$/u, "").trim();
+  const words = meaningfulWords(normalized);
+  const lastWord = words.at(-1)?.toLocaleLowerCase() || "";
+  const incompleteConnector = INCOMPLETE_ENDINGS.has(lastWord) || INCOMPLETE_PHRASES.some((phrase) => normalized.endsWith(phrase));
+  const incompleteLastWord = words.length > 1 && lastWord.length === 1 && !["i", "a", "à", "y"].includes(lastWord);
+  return {
+    text: clean,
+    wordCount: words.length,
+    meaningful: words.some((word) => word.length > 1),
+    punctuated: /[.!?]$/u.test(clean),
+    incomplete: incompleteConnector || incompleteLastWord || /(?:\.\.\.|…)$/u.test(clean),
+    completeShortPhrase: COMPLETE_SHORT_PHRASES.has(normalized)
+  };
+};
+
+export const getDynamicSilenceHoldMs = (text = "", signals = {}) => {
+  const analysis = analyzeTranscriptCompleteness(text);
+  let hold = analysis.wordCount <= 3 ? 3200 : analysis.wordCount <= 10 ? 2600 : 2300;
+  if (analysis.wordCount > 10 && analysis.punctuated) hold = 2100;
+  if (analysis.punctuated) hold -= 250;
+  if (analysis.incomplete) hold += 700;
+  if (analysis.completeShortPhrase) hold = 1800;
+  if (signals.speechFinal || signals.utteranceEnd) hold -= 200;
+  return clamp(hold, 1800, 3500);
+};
+
 /** @param {MediaTrackSupportedConstraints} [supported] @param {string | Record<string, unknown>} [microphoneOrOptions] */
 export const buildProductionAudioConstraints = (supported = {}, microphoneOrOptions = {}) => ({
   ...(supported.echoCancellation !== false ? { echoCancellation: true } : {}),
@@ -10,26 +67,144 @@ export const buildProductionAudioConstraints = (supported = {}, microphoneOrOpti
   ...(supported.sampleSize ? { sampleSize: { ideal: 16 } } : {}),
   ...(typeof microphoneOrOptions === "string" && microphoneOrOptions !== "default" ? { deviceId: { exact: microphoneOrOptions } } : {})
 });
+
 export const createVadController = (options = {}) => {
   const config = { ...DEFAULT_VAD_CONFIG, ...options };
   let state = "idle", startedAt = 0, calibrationTotal = 0, calibrationSamples = 0, noiseFloor = 0.003;
-  let speechCandidateAt = 0, utteranceStartedAt = 0, silenceStartedAt = 0;
+  let speechCandidateAt = 0, utteranceStartedAt = 0, silenceStartedAt = 0, lastSpeechAt = 0;
+  let transcript = "", transcriptChangedAt = 0, providerFinal = false, speechFinal = false, utteranceEnd = false;
   const thresholds = () => {
     const speech = clamp(Math.max(config.speechThreshold, noiseFloor * config.noiseFloorMultiplier), config.speechThreshold, 0.12);
     return { speech, silence: clamp(Math.min(speech * 0.68, Math.max(config.silenceThreshold, noiseFloor * 1.35)), config.silenceThreshold, speech * 0.8) };
   };
-  const start = (now = Date.now()) => { state = "calibrating"; startedAt = now; calibrationTotal = calibrationSamples = speechCandidateAt = utteranceStartedAt = silenceStartedAt = 0; return state; };
+  const clearUtterance = () => {
+    speechCandidateAt = utteranceStartedAt = silenceStartedAt = lastSpeechAt = transcriptChangedAt = 0;
+    transcript = "";
+    providerFinal = speechFinal = utteranceEnd = false;
+  };
+  const start = (now = Date.now()) => {
+    state = "calibrating";
+    startedAt = now;
+    calibrationTotal = calibrationSamples = 0;
+    clearUtterance();
+    return state;
+  };
+  const noteTranscript = (nextText = "", signals = {}, now = Date.now()) => {
+    const clean = normalizeText(nextText);
+    if (clean && clean !== transcript) {
+      transcript = clean;
+      transcriptChangedAt = now;
+    }
+    providerFinal ||= Boolean(signals.providerFinal);
+    speechFinal ||= Boolean(signals.speechFinal);
+    utteranceEnd ||= Boolean(signals.utteranceEnd);
+    return getDynamicSilenceHoldMs(transcript, { speechFinal, utteranceEnd });
+  };
   const update = (rawLevel, now = Date.now(), forceTransmit = false) => {
     const level = Number.isFinite(rawLevel) ? clamp(rawLevel, 0, 1) : 0;
-    if (state === "idle" || state === "stopped") return null;
-    if (forceTransmit) { if (state !== "speaking") { state = "speaking"; utteranceStartedAt = now; silenceStartedAt = 0; return { type: "speech_started", state, level, ...thresholds() }; } silenceStartedAt = 0; return null; }
-    if (state === "calibrating") { calibrationTotal += level; calibrationSamples += 1; if (now - startedAt >= config.calibrationMs) { noiseFloor = clamp(calibrationTotal / Math.max(1, calibrationSamples), 0.001, 0.04); state = "listening"; return { type: "calibrated", state, level, ...thresholds() }; } return null; }
+    if (state === "idle" || state === "stopped" || state === "finalizing") return null;
+    if (forceTransmit) {
+      if (state !== "speaking") {
+        state = "speaking";
+        utteranceStartedAt ||= now;
+        lastSpeechAt = now;
+        silenceStartedAt = 0;
+        return { type: "speech_started", state, level, ...thresholds() };
+      }
+      lastSpeechAt = now;
+      silenceStartedAt = 0;
+      return null;
+    }
+    if (state === "calibrating") {
+      calibrationTotal += level;
+      calibrationSamples += 1;
+      if (now - startedAt >= config.calibrationMs) {
+        noiseFloor = clamp(calibrationTotal / Math.max(1, calibrationSamples), 0.001, 0.04);
+        state = "listening";
+        return { type: "calibrated", state, level, ...thresholds() };
+      }
+      return null;
+    }
     const { speech, silence } = thresholds();
-    if (state === "listening" || state === "paused") { noiseFloor = clamp(noiseFloor * 0.985 + Math.min(level, speech) * 0.015, 0.001, 0.04); if (level >= speech) { if (!speechCandidateAt) { speechCandidateAt = now; return { type: "speech_candidate", state, level, speech, silence }; } if (now - speechCandidateAt >= config.minimumSpeechMs) { state = "speaking"; utteranceStartedAt = speechCandidateAt; silenceStartedAt = 0; return { type: "speech_started", state, level, speech, silence }; } } else if (level <= silence && speechCandidateAt) { speechCandidateAt = 0; return { type: "speech_cancelled", state, level, speech, silence }; } return null; }
-    if (state === "speaking") { if (now - utteranceStartedAt >= config.maximumUtteranceMs) { state = "finalizing"; return { type: "finalize", reason: "maximum_duration", state, level, speech, silence }; } if (level <= silence) { silenceStartedAt ||= now; if (now - silenceStartedAt >= config.silenceHoldMs) { state = "finalizing"; return { type: "finalize", reason: "silence", state, level, speech, silence }; } } else silenceStartedAt = 0; }
+    if (state === "listening" || state === "paused") {
+      noiseFloor = clamp(noiseFloor * 0.985 + Math.min(level, speech) * 0.015, 0.001, 0.04);
+      if (level >= speech) {
+        if (!speechCandidateAt) {
+          speechCandidateAt = now;
+          return { type: "speech_candidate", state, level, speech, silence };
+        }
+        if (now - speechCandidateAt >= config.minimumSpeechMs) {
+          state = "speaking";
+          utteranceStartedAt = speechCandidateAt;
+          lastSpeechAt = now;
+          silenceStartedAt = 0;
+          return { type: "speech_started", state, level, speech, silence };
+        }
+      } else if (level <= silence && speechCandidateAt) {
+        speechCandidateAt = 0;
+        return { type: "speech_cancelled", state, level, speech, silence };
+      }
+      return null;
+    }
+    if (state === "speaking" || state === "soft-pause") {
+      if (now - utteranceStartedAt >= config.maximumUtteranceMs) {
+        state = "finalizing";
+        return { type: "finalize", reason: "maximum_duration", state, level, speech, silence };
+      }
+      if (level >= speech) {
+        const resumed = state === "soft-pause";
+        state = "speaking";
+        lastSpeechAt = now;
+        silenceStartedAt = 0;
+        speechFinal = utteranceEnd = false;
+        return resumed ? { type: "speech_resumed", state, level, speech, silence } : null;
+      }
+      if (level > silence) {
+        const resumed = state === "soft-pause";
+        lastSpeechAt = now;
+        silenceStartedAt = 0;
+        if (state === "soft-pause") state = "speaking";
+        return resumed ? { type: "speech_resumed", state, level, speech, silence } : null;
+      }
+      silenceStartedAt ||= now;
+      const silenceMs = now - silenceStartedAt;
+      if (state === "speaking" && silenceMs >= config.speechHangoverMs) {
+        state = "soft-pause";
+        return { type: "soft_pause", state, level, speech, silence, silenceMs };
+      }
+      if (state !== "soft-pause") return null;
+      const analysis = analyzeTranscriptCompleteness(transcript);
+      const speechDurationMs = Math.max(0, (lastSpeechAt || now) - utteranceStartedAt);
+      const transcriptSettled = !transcriptChangedAt || now - transcriptChangedAt >= config.transcriptChangeGraceMs;
+      const dynamicHoldMs = getDynamicSilenceHoldMs(transcript, { speechFinal, utteranceEnd });
+      const hasEnoughSpeech = speechDurationMs >= config.minimumUtteranceMs;
+      const contentAllowsFinalize = analysis.completeShortPhrase || analysis.wordCount >= 3;
+      const signalAgreement = providerFinal || speechFinal || utteranceEnd || analysis.punctuated || silenceMs >= dynamicHoldMs + 300;
+      const safeToFinalize = silenceMs >= 900 && hasEnoughSpeech && analysis.meaningful && contentAllowsFinalize && !analysis.incomplete && transcriptSettled && signalAgreement;
+      if (config.autoFinalize && ((safeToFinalize && silenceMs >= dynamicHoldMs) || (analysis.meaningful && silenceMs >= config.hardFinalizeMs))) {
+        state = "finalizing";
+        return { type: "finalize", reason: silenceMs >= config.hardFinalizeMs ? "safety_pause" : "hybrid_end", state, level, speech, silence, silenceMs, dynamicHoldMs };
+      }
+    }
     return null;
   };
-  const markPaused = () => { state = "paused"; speechCandidateAt = silenceStartedAt = utteranceStartedAt = 0; return state; };
-  const stop = () => (state = "stopped");
-  return { start, update, markPaused, stop, getState: () => state, getConfig: () => ({ ...config }), getNoiseFloor: () => noiseFloor };
+  const markPaused = () => {
+    state = "paused";
+    clearUtterance();
+    return state;
+  };
+  const cancelFinalization = (now = Date.now()) => {
+    if (state !== "finalizing") return false;
+    state = "speaking";
+    lastSpeechAt = now;
+    silenceStartedAt = 0;
+    speechFinal = utteranceEnd = false;
+    return true;
+  };
+  const stop = () => {
+    state = "stopped";
+    clearUtterance();
+    return state;
+  };
+  return { start, update, noteTranscript, cancelFinalization, markPaused, stop, getState: () => state, getConfig: () => ({ ...config }), getNoiseFloor: () => noiseFloor };
 };

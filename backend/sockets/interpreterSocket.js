@@ -415,7 +415,11 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           sourceLang: result.sourceLang,
           targetLang: result.targetLang,
           targetLanguages: result.targetLanguages || [result.targetLang],
-          detectedLanguage: result.detectedLanguage
+          detectedLanguage: result.detectedLanguage,
+          providerFinal: Boolean(result.providerFinal),
+          speechFinal: Boolean(result.speechFinal),
+          utteranceEnd: Boolean(result.utteranceEnd),
+          speechStarted: Boolean(result.speechStarted)
         });
         activeSocket.emit("result", result);
         return;

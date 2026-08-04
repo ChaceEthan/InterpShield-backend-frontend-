@@ -73,8 +73,8 @@ const MAX_STYLE_MEMORY_ENTRIES = 20;
 const MAX_TRANSLATION_CACHE_ENTRIES = 1200;
 const FAST_LOCAL_TRANSLATION_CACHE_TTL_MS = 25 * 60 * 1000;
 const PROVIDER_TRANSLATION_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
-const PARTIAL_TRANSLATION_PREVIEW_THROTTLE_MS = 140;
-const PROVIDER_STREAMING_PREVIEW_THROTTLE_MS = 650;
+const PARTIAL_TRANSLATION_PREVIEW_THROTTLE_MS = 450;
+const PROVIDER_STREAMING_PREVIEW_THROTTLE_MS = 500;
 const PROVIDER_STREAMING_PREVIEW_MIN_WORDS = 2;
 const PROVIDER_STREAMING_PREVIEW_MIN_CHARS = 6;
 const ADMIN_STATS_EMIT_MS = 10000;
@@ -3741,6 +3741,7 @@ export const createInterpreterSession = async ({
   }, SESSION_HEALTH_CHECK_MS);
   sessionHealthMonitor.unref?.();
 
+  let latestSpeechSignal = "";
   const session = createDeepgramSession({
     apiKey: env.deepgramApiKey,
     sourceLang,
@@ -3755,7 +3756,22 @@ export const createInterpreterSession = async ({
       onWarning?.("Deepgram streaming failed.");
     },
     onClose: onClosed,
-    onTranscript: async ({ text, isFinal, detectedLanguage }) => {
+    onSpeechSignal: ({ type }) => {
+      latestSpeechSignal = type || "";
+      if (type !== "utterance_end" || !currentSentence.trim()) return;
+      onResult?.({
+        originalText: currentSentence,
+        translatedText: "",
+        isFinal: false,
+        utteranceEnd: true,
+        sourceLang: currentDirection.source,
+        targetLang: currentDirection.target,
+        targetLanguages: currentDirection.targets,
+        detectedLanguage: currentDetectedLanguage
+      });
+      latestSpeechSignal = "";
+    },
+    onTranscript: async ({ text, isFinal, speechFinal, detectedLanguage }) => {
       const displayText = cleanTranscriptText(text);
       const normalized = normalizeTranscript(displayText);
 
@@ -3795,7 +3811,8 @@ export const createInterpreterSession = async ({
           sourceLang: direction.source,
           targetLang: direction.target,
           targetLanguages: direction.targets,
-          detectedLanguage: effectiveDetectedLanguage
+          detectedLanguage: effectiveDetectedLanguage,
+          speechStarted: latestSpeechSignal === "speech_started"
         });
         emitStreamingTranslationPreview({
           sentence: previewText,
@@ -3811,7 +3828,6 @@ export const createInterpreterSession = async ({
       if (recentFinalDuplicate) {
         return;
       }
-      session.completeUtterance?.();
       lastFinalTranscript = normalized;
       lastFinalTranscriptAt = Date.now();
       logTranslationEvent("TRANSCRIPT_RECEIVED", {
@@ -3829,9 +3845,35 @@ export const createInterpreterSession = async ({
         confidence: localDetection.confidence
       });
       currentSentence = trimTextWindow(appendSentenceChunk(currentSentence, displayText));
-      scheduleStableTranslation();
+      lastInterimTranscript = normalizeTranscript(currentSentence);
+      onResult?.({
+        originalText: currentSentence,
+        translatedText: "",
+        isFinal: false,
+        providerFinal: true,
+        speechFinal: Boolean(speechFinal),
+        utteranceEnd: latestSpeechSignal === "utterance_end",
+        sourceLang: direction.source,
+        targetLang: direction.target,
+        targetLanguages: direction.targets,
+        detectedLanguage: effectiveDetectedLanguage
+      });
+      emitStreamingTranslationPreview({
+        sentence: currentSentence,
+        direction,
+        detectedLanguage: effectiveDetectedLanguage
+      });
+      latestSpeechSignal = "";
     }
   });
+
+  const completeDeepgramUtterance = session.completeUtterance;
+  session.completeUtterance = () => {
+    completeDeepgramUtterance?.();
+    if (!currentSentence.trim() || sessionStopped) return false;
+    scheduleStableTranslation(0);
+    return true;
+  };
 
   session.id = sessionId;
   session.sessionId = sessionId;
