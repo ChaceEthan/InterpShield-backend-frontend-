@@ -36,6 +36,7 @@ import { ToolTabs } from "./components/ToolTabs";
 import { TranslationOptions } from "./components/TranslationOptions";
 import { TranslationPanel } from "./components/TranslationPanel";
 import type { TranscriptTranslationEntry } from "./components/TranscriptArea";
+import { buildProductionAudioConstraints, createVadController, DEFAULT_VAD_CONFIG } from "./audio/vadController.mjs";
 import {
   LANGUAGE_CATALOG,
   LANGUAGE_FLAGS,
@@ -46,7 +47,7 @@ import {
 
 type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
-type SessionStatus = "idle" | "connecting" | "listening" | "stopping" | "error";
+type SessionStatus = "idle" | "connecting" | "listening" | "speaking" | "finalizing" | "paused" | "stopping" | "error";
 type TranslationLifecycleState = "ready" | "queued" | "processing" | "translating" | "retrying" | "translated" | "done" | "failed" | "stale" | "cancelled";
 type TranslationProviderDiagnostic = {
   language?: string;
@@ -263,6 +264,8 @@ const MAX_SPOKEN_DUBBING_KEYS = 180;
 const DUBBING_UTTERANCE_TTL_MS = 45000;
 const MIN_MEDIA_CHUNK_BYTES = 96;
 const MIN_AUDIO_CHUNK_INTERVAL_MS = 45;
+const VAD_POLL_INTERVAL_MS = 30;
+const FINAL_CHUNK_GRACE_MS = 90;
 const MAX_QUEUED_AUDIO_CHUNKS = 240;
 const MAX_PENDING_FINAL_TRANSCRIPTS = 16;
 const CLIENT_HEARTBEAT_MS = 25000;
@@ -772,16 +775,12 @@ const buildAudioConstraints = ({
   autoGainControl: boolean;
 }): MediaTrackConstraints => {
   const supportedConstraints = typeof navigator !== "undefined" && navigator.mediaDevices?.getSupportedConstraints ? navigator.mediaDevices.getSupportedConstraints() : {};
-  const audio: MediaTrackConstraints = {};
-
-  if (supportedConstraints.echoCancellation) audio.echoCancellation = echoCancellation;
-  if (supportedConstraints.noiseSuppression) audio.noiseSuppression = noiseSuppression;
-  if (supportedConstraints.autoGainControl) audio.autoGainControl = autoGainControl;
-  if (supportedConstraints.sampleRate) audio.sampleRate = { ideal: 48000 };
-  if (supportedConstraints.channelCount) audio.channelCount = { ideal: 1 };
-  if (supportedConstraints.sampleSize) audio.sampleSize = { ideal: 16 };
-  if (microphoneId !== "default") audio.deviceId = { exact: microphoneId };
-  return audio;
+  // Production capture always enables native browser processing. The legacy
+  // arguments remain in the signature so stored settings stay compatible.
+  void echoCancellation;
+  void noiseSuppression;
+  void autoGainControl;
+  return buildProductionAudioConstraints(supportedConstraints, microphoneId);
 };
 
 const requestMicrophoneStream = async (audio: MediaTrackConstraints, fallbackAudio: MediaTrackConstraints) => {
@@ -1440,6 +1439,11 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const processedStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const getAudioLevelRef = useRef<() => number>(() => 0);
+  const vadControllerRef = useRef(createVadController());
+  const vadPollTimerRef = useRef<number | null>(null);
+  const finalChunkTimerRef = useRef<number | null>(null);
+  const pendingSpeechChunksRef = useRef<AudioChunkPayload[]>([]);
   const recordingRef = useRef(false);
   const modeRef = useRef<Mode>("translate");
   const sourceLangRef = useRef(sourceLang);
@@ -1515,20 +1519,20 @@ export default function App() {
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro";
-  const isRecording = status === "connecting" || status === "listening";
+  const isRecording = ["connecting", "listening", "speaking", "finalizing", "paused"].includes(status);
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
   const isTranslationActive = mode !== "transcribe" && Object.values(translationStatuses).some((translationState) =>
     ["queued", "processing", "translating", "retrying"].includes(translationState as string)
   );
   const connectionState: SocketConnectionState =
-    socketReconnecting || (!socketConnected && status === "listening")
+    socketReconnecting || (!socketConnected && isRecording)
       ? "reconnecting"
       : status === "connecting"
         ? "connecting"
         : isTranslationActive
           ? "translating"
-          : status === "listening"
+          : ["listening", "speaking", "finalizing", "paused"].includes(status)
             ? "listening"
             : socketConnected
               ? "connected"
@@ -1551,11 +1555,19 @@ export default function App() {
     ? "Stopping"
     : status === "error"
       ? "Attention"
+      : status === "speaking"
+        ? "Speaking…"
+        : status === "finalizing"
+          ? "Finishing caption…"
+          : status === "paused"
+            ? "Paused — start speaking"
+            : status === "idle"
+              ? "Microphone stopped"
       : {
           ready: "Ready",
           connecting: "Connecting",
           connected: "Connected",
-          listening: "Listening",
+          listening: "Listening…",
           translating: "Translating",
           reconnecting: "Reconnecting..."
         }[connectionState];
@@ -2033,23 +2045,18 @@ export default function App() {
     }
   }, []);
 
-  const resetSilenceMonitor = useCallback(() => {
-    if (!autoStopOnSilence || !recordingRef.current) {
-      stopSilenceMonitor();
-      return;
-    }
-
-    const silenceWindowMs = Math.max(4000, Number(silenceDuration || 30) * 1000);
-    if (silenceTimerRef.current) window.clearTimeout(silenceTimerRef.current);
-    silenceTimerRef.current = window.setTimeout(() => {
-      silenceTimerRef.current = null;
-      if (!recordingRef.current || sessionActionInFlightRef.current || !autoStopOnSilence) return;
-      setAlert(`No speech detected for ${silenceDuration}s. Session stopped automatically.`);
-      stopSession();
-    }, silenceWindowMs);
-  }, [autoStopOnSilence, silenceDuration, stopSilenceMonitor]);
-
   const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean } = {}) => {
+    if (vadPollTimerRef.current) {
+      window.clearInterval(vadPollTimerRef.current);
+      vadPollTimerRef.current = null;
+    }
+    if (finalChunkTimerRef.current) {
+      window.clearTimeout(finalChunkTimerRef.current);
+      finalChunkTimerRef.current = null;
+    }
+    vadControllerRef.current.stop();
+    pendingSpeechChunksRef.current = [];
+    getAudioLevelRef.current = () => 0;
     if (!options.preserveRecoveryTimer && audioRecoveryTimerRef.current) {
       window.clearTimeout(audioRecoveryTimerRef.current);
       audioRecoveryTimerRef.current = null;
@@ -2355,16 +2362,16 @@ export default function App() {
       const recorder = mediaRecorderRef.current;
       if (recorder?.state === "inactive") {
         recorder.start(audioChunkMsRef.current);
+        if (["listening", "paused"].includes(vadControllerRef.current.getState()) && (recorder as MediaRecorder).state === "recording") recorder.pause();
         sessionStartedAtRef.current = Date.now();
         setSessionSeconds(0);
       }
       flushQueuedAudioChunks();
       audioRestartAttemptsRef.current = 0;
-      resetSilenceMonitor();
       setAudioDiagnostic((current) => ({
         ...current,
         state: "recording",
-        message: "Microphone streaming",
+        message: "Listening",
         lastError: undefined
       }));
       setStatus("listening");
@@ -3030,6 +3037,7 @@ export default function App() {
       void refreshMicrophones();
 
       const enhancedAudio = createAmplifiedAudioStream(stream);
+      getAudioLevelRef.current = enhancedAudio.getAudioLevel;
       processedStreamRef.current = enhancedAudio.stream === stream ? null : enhancedAudio.stream;
       audioContextRef.current = enhancedAudio.audioContext;
       if (enhancedAudio.audioContext?.state === "suspended") {
@@ -3060,27 +3068,37 @@ export default function App() {
         track.onended = () => scheduleAudioRecovery("track_ended");
       }
 
+      const sendCapturedChunk = (chunk: Omit<AudioChunkPayload, "sequence">) => {
+        if (chunk.audio.size < MIN_MEDIA_CHUNK_BYTES) return;
+        sequenceRef.current += 1;
+        lastAudioChunkSentAtRef.current = chunk.capturedAt;
+        emitAudioChunkPayload({ ...chunk, sequence: sequenceRef.current });
+        if (sequenceRef.current % 3 === 0) setChunkCount(sequenceRef.current);
+      };
+
       recorder.ondataavailable = (event) => {
         if (event.data.size < MIN_MEDIA_CHUNK_BYTES) return;
-
-        sequenceRef.current += 1;
         const capturedAt = Date.now();
         const audioLevel = enhancedAudio.getAudioLevel();
         const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
-
         if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.002) return;
-        if (audioLevel > 0.004) resetSilenceMonitor();
-
-        lastAudioChunkSentAtRef.current = capturedAt;
-        emitAudioChunkPayload({
+        const chunk = {
           audio: event.data,
-          sequence: sequenceRef.current,
           audioLevel,
           chunkMs: audioChunkMsRef.current,
           capturedAt,
           mimeType: recorderMimeType
-        });
-        if (sequenceRef.current % 3 === 0) setChunkCount(sequenceRef.current);
+        };
+        const vadState = vadControllerRef.current.getState();
+        if (vadState === "speaking" || vadState === "finalizing") {
+          sendCapturedChunk(chunk);
+          return;
+        }
+        if (vadState === "listening" || vadState === "paused") {
+          pendingSpeechChunksRef.current.push({ ...chunk, sequence: 0 });
+          const cutoff = capturedAt - DEFAULT_VAD_CONFIG.preSpeechBufferMs;
+          pendingSpeechChunksRef.current = pendingSpeechChunksRef.current.filter((item) => item.capturedAt >= cutoff);
+        }
       };
 
       recorder.onerror = (event) => {
@@ -3099,6 +3117,54 @@ export default function App() {
           scheduleAudioRecovery("recorder_stopped");
         }
       };
+
+      vadControllerRef.current = createVadController({ silenceHoldMs: autoStopOnSilence ? 1500 : Number.POSITIVE_INFINITY });
+      vadControllerRef.current.start(Date.now());
+      if (vadPollTimerRef.current) window.clearInterval(vadPollTimerRef.current);
+      vadPollTimerRef.current = window.setInterval(() => {
+        if (!recordingRef.current) return;
+        const action = vadControllerRef.current.update(getAudioLevelRef.current(), Date.now(), false);
+        if (!action) return;
+        if (action.type === "calibrated") {
+          setStatus("listening");
+          return;
+        }
+        if (action.type === "speech_candidate") {
+          if (recorder.state === "paused") recorder.resume();
+          return;
+        }
+        if (action.type === "speech_cancelled") {
+          if (recorder.state === "recording") recorder.pause();
+          return;
+        }
+        if (action.type === "speech_started") {
+          const buffered = pendingSpeechChunksRef.current.splice(0);
+          for (const bufferedChunk of buffered) {
+            const { sequence: _discardedSequence, ...capturedChunk } = bufferedChunk;
+            void _discardedSequence;
+            sendCapturedChunk(capturedChunk);
+          }
+          setStatus("speaking");
+          setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Speaking" }));
+          return;
+        }
+        if (action.type === "finalize") {
+          setStatus("finalizing");
+          setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Finishing caption" }));
+          if (recorder.state === "recording") recorder.requestData();
+          if (finalChunkTimerRef.current) window.clearTimeout(finalChunkTimerRef.current);
+          finalChunkTimerRef.current = window.setTimeout(() => {
+            finalChunkTimerRef.current = null;
+            if (!recordingRef.current) return;
+            if (recorder.state === "recording") recorder.pause();
+            pendingSpeechChunksRef.current = [];
+            vadControllerRef.current.markPaused();
+            socketRef.current?.emit("audio_utterance_end", { sequence: sequenceRef.current, capturedAt: Date.now() });
+            setStatus("paused");
+            setAudioDiagnostic((current) => ({ ...current, state: "ready", message: "Paused — start speaking" }));
+          }, FINAL_CHUNK_GRACE_MS);
+        }
+      }, VAD_POLL_INTERVAL_MS);
 
       const activeSourceLang = normalizeLanguageCode(sourceLang) || "en";
       const activeTargetLanguages = normalizeTargetLanguages(targetLanguages, targetLang);
@@ -3167,7 +3233,7 @@ export default function App() {
 
       setAlert(message);
     }
-  }, [autoGainControl, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, resetSilenceMonitor, scheduleAudioRecovery, shareableMode, sourceLang, stopDubbingPlayback, targetLang, targetLanguages, user?.id, user?.plan, status]);
+  }, [autoGainControl, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, scheduleAudioRecovery, shareableMode, sourceLang, stopDubbingPlayback, targetLang, targetLanguages, user?.id, user?.plan, status]);
 
   useEffect(() => {
     startSessionRef.current = startSession;

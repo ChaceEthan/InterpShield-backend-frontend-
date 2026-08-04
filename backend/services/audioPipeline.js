@@ -89,6 +89,7 @@ export const createAudioPipelineSession = ({
   let lastAcceptedAt = 0;
   let lastHash = "";
   let duplicateHashCount = 0;
+  let consecutiveSilentChunks = 0;
   let acceptedChunks = 0;
   let droppedChunks = 0;
   const translatedSpeechQueue = [];
@@ -123,19 +124,22 @@ export const createAudioPipelineSession = ({
       buffer.length < MIN_AUDIO_CHUNK_BYTES &&
       silenceConfidence > 0.995;
     const duplicateSpam = duplicateHashCount >= DUPLICATE_HASH_WINDOW && silenceConfidence > 0.995;
+    const sustainedSilence = Number.isFinite(audioLevel) && audioLevel < 0.008 && silenceConfidence > 0.88;
+    consecutiveSilentChunks = sustainedSilence ? consecutiveSilentChunks + 1 : 0;
+    const silentRun = consecutiveSilentChunks > 2;
 
-    if ((tooFast && likelySilentMicroChunk) || duplicateSpam) {
+    if ((tooFast && likelySilentMicroChunk) || duplicateSpam || silentRun) {
       droppedChunks += 1;
       logAudioDebug("AUDIO_CHUNK_DROPPED", {
         sessionId,
-        reason: duplicateSpam ? "duplicate_chunk" : "silent_micro_chunk",
+        reason: duplicateSpam ? "duplicate_chunk" : silentRun ? "sustained_silence" : "silent_micro_chunk",
         bytes: buffer.length,
         audioLevel,
         droppedChunks
       });
       return {
         accepted: false,
-        reason: duplicateSpam ? "duplicate_chunk" : "silent_micro_chunk",
+        reason: duplicateSpam ? "duplicate_chunk" : silentRun ? "sustained_silence" : "silent_micro_chunk",
         silenceConfidence
       };
     }

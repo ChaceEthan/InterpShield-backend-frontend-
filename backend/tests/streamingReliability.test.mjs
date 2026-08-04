@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createDeepgramSession } from "../services/deepgram.js";
 import { buildProviderExecutionOrder, createInterpreterSession } from "../services/interpreter.js";
+import { createAudioPipelineSession } from "../services/audioPipeline.js";
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -85,6 +86,33 @@ const createFakeClientFactory = (options = {}) => {
 };
 
 {
+  const pipeline = createAudioPipelineSession({ sessionId: "vad-silence-test" });
+  const speech = pipeline.preprocessAudioChunk(Buffer.alloc(256, 23), { sequence: 1, audioLevel: 0.08, receivedAt: 1000 });
+  assert.equal(speech.accepted, true, "spoken audio must be accepted even after client-side gating");
+  pipeline.preprocessAudioChunk(Buffer.alloc(256, 0), { sequence: 2, audioLevel: 0.001, receivedAt: 1700 });
+  pipeline.preprocessAudioChunk(Buffer.alloc(256, 0), { sequence: 3, audioLevel: 0.001, receivedAt: 2400 });
+  const silentRun = pipeline.preprocessAudioChunk(Buffer.alloc(256, 0), { sequence: 4, audioLevel: 0.001, receivedAt: 3100 });
+  assert.equal(silentRun.accepted, false, "long runs of silence must be rejected server-side");
+  const resumedSpeech = pipeline.preprocessAudioChunk(Buffer.alloc(256, 41), { sequence: 5, audioLevel: 0.09, receivedAt: 3800 });
+  assert.equal(resumedSpeech.accepted, true, "speech after silence must reset the gate and be accepted");
+}
+
+{
+  const factory = createFakeClientFactory();
+  const session = createDeepgramSession({ apiKey: "test-key", sourceLang: "en", clientFactory: factory });
+  await session.start();
+  await wait(10);
+  session.sendAudio(Buffer.alloc(128, 31));
+  session.completeUtterance();
+  factory.connections[0].close();
+  session.sendAudio(Buffer.alloc(128, 32));
+  assert.equal(session.getHealth().queuedChunks, 1, "completed utterance overlap must not be queued for reconnect replay");
+  await wait(650);
+  assert.equal(factory.connections[1].sentMedia.length, 1, "only current-utterance audio should recover after reconnect");
+  session.stop();
+}
+
+{
   const factory = createFakeClientFactory();
   const errors = [];
   const session = createDeepgramSession({
@@ -142,6 +170,22 @@ const createFakeClientFactory = (options = {}) => {
   assert.ok(session.getHealth().queuedChunks >= 1, "failed flush should roll the audio chunk back into the queue");
   await wait(650);
   assert.equal(session.getHealth().queuedChunks, 0, "rolled-back queued audio should flush on the next reconnect");
+  session.stop();
+}
+
+{
+  const factory = createFakeClientFactory();
+  const session = createDeepgramSession({ apiKey: "test-key", sourceLang: "en", clientFactory: factory });
+  await session.start();
+  await wait(10);
+  session.sendAudio(Buffer.alloc(128, 21));
+  session.sendAudio(Buffer.alloc(128, 22));
+  session.completeUtterance();
+  factory.connections[0].close();
+  await wait(650);
+  assert.equal(factory.connections[1].sentMedia.length, 0, "completed utterance audio must not be replayed after reconnect");
+  session.sendAudio(Buffer.alloc(128, 23));
+  assert.equal(factory.connections[1].sentMedia.length, 1, "spoken audio after a completed utterance must still be accepted");
   session.stop();
 }
 

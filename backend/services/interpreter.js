@@ -3811,6 +3811,7 @@ export const createInterpreterSession = async ({
       if (recentFinalDuplicate) {
         return;
       }
+      session.completeUtterance?.();
       lastFinalTranscript = normalized;
       lastFinalTranscriptAt = Date.now();
       logTranslationEvent("TRANSCRIPT_RECEIVED", {

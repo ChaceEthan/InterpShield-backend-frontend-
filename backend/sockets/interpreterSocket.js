@@ -869,6 +869,11 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     });
     socket.on("audio_chunk", handleAudioChunk);
     socket.on("audio-chunk", handleAudioChunk);
+    socket.on("audio_utterance_end", () => {
+      // This is an idle boundary, not a session stop. Deepgram remains open and
+      // owns its reconnect lifecycle; only replay overlap is retired.
+      session?.completeUtterance?.();
+    });
     socket.on("end_session", handleEndSession);
     socket.on("session:stop", handleEndSession);
 

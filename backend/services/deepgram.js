@@ -418,6 +418,13 @@ export const createDeepgramSession = ({
     }
   };
 
+  // A final transcript makes the rolling reconnect overlap obsolete. Clearing
+  // only recent audio preserves any not-yet-sent reconnect queue.
+  const completeUtterance = () => {
+    recentAudio.length = 0;
+    updateQueueHealth();
+  };
+
   const stop = () => {
     const wasOpen = isOpen;
     stopped = true;
@@ -449,6 +456,7 @@ export const createDeepgramSession = ({
   return {
     start,
     sendAudio,
+    completeUtterance,
     stop,
     getHealth: () => ({
       ...health,
