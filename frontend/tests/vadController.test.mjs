@@ -53,6 +53,8 @@ const beginSpeech = (vad, start = 0) => {
   vad.update(0.001, 1800);
   assert.notEqual(vad.update(0.001, 2800)?.type, "finalize", "an incomplete connector must survive a 1.5 second pause");
   assert.equal(analyzeTranscriptCompleteness("kwa sababu").incomplete, true);
+  assert.equal(analyzeTranscriptCompleteness("ndashaka ko").incomplete, true);
+  assert.equal(analyzeTranscriptCompleteness("je veux que").incomplete, true);
   assert.equal(analyzeTranscriptCompleteness("kandi umuntu").completeShortPhrase, false);
 }
 

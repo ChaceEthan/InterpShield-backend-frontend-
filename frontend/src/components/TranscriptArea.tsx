@@ -51,7 +51,9 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
               <div className="mx-auto grid h-11 w-11 place-items-center rounded-full bg-blue-50 text-blue-600">
                 <Languages className="h-5 w-5" />
               </div>
-              <p className="mt-4 text-sm font-medium text-gray-500">Press and start talking</p>
+              <p className="mt-4 text-sm font-medium text-gray-500">
+                {isRecording ? "Waiting for more speech…" : "Press and start talking"}
+              </p>
             </div>
           </motion.div>
         )}

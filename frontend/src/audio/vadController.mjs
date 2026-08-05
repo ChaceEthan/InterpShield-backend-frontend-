@@ -17,9 +17,9 @@ export const DEFAULT_VAD_CONFIG = Object.freeze({
 
 const INCOMPLETE_ENDINGS = new Set([
   "and", "or", "but", "because", "so", "then", "if", "when", "while", "to", "with", "for", "of",
-  "kandi", "cyangwa", "ariko", "kuko", "rero", "niba", "igihe", "na",
-  "au", "lakini", "basi", "kama", "wakati", "ili",
-  "et", "ou", "mais", "donc", "si", "quand", "pour", "avec"
+  "kandi", "cyangwa", "ariko", "kuko", "rero", "niba", "igihe", "na", "ko",
+  "au", "lakini", "basi", "kama", "wakati", "ili", "sababu",
+  "et", "ou", "mais", "donc", "si", "quand", "pour", "avec", "que"
 ]);
 const INCOMPLETE_PHRASES = ["kugira ngo", "kwa sababu", "parce que"];
 const COMPLETE_SHORT_PHRASES = new Set([

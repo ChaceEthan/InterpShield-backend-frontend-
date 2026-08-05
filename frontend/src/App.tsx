@@ -48,7 +48,7 @@ import {
 
 type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
-type SessionStatus = "idle" | "connecting" | "listening" | "speaking" | "soft-pause" | "finalizing" | "paused" | "stopping" | "error";
+type SessionStatus = "idle" | "connecting" | "calibrating" | "listening" | "speaking" | "soft-pause" | "finalizing" | "dubbing" | "listening-after-dubbing" | "paused" | "stopping" | "error";
 type TranslationLifecycleState = "ready" | "queued" | "processing" | "translating" | "retrying" | "translated" | "done" | "failed" | "stale" | "cancelled";
 type TranslationProviderDiagnostic = {
   language?: string;
@@ -1506,6 +1506,7 @@ export default function App() {
   const historyEndRef = useRef<HTMLDivElement | null>(null);
   const dubbingQueueRef = useRef<DubbingQueueItem[]>([]);
   const dubbingSpeakingRef = useRef(false);
+  const dubbingTransmissionGatedRef = useRef(false);
   const activeDubbingUtteranceIdRef = useRef("");
   const activeDubbingLanguageRef = useRef("");
   const lastDubbingTextRef = useRef("");
@@ -1522,7 +1523,7 @@ export default function App() {
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro";
-  const isRecording = ["connecting", "listening", "speaking", "soft-pause", "finalizing", "paused"].includes(status);
+  const isRecording = ["connecting", "calibrating", "listening", "speaking", "soft-pause", "finalizing", "dubbing", "listening-after-dubbing", "paused"].includes(status);
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
   const isTranslationActive = mode !== "transcribe" && Object.values(translationStatuses).some((translationState) =>
@@ -1535,7 +1536,7 @@ export default function App() {
         ? "connecting"
         : isTranslationActive
           ? "translating"
-          : ["listening", "speaking", "soft-pause", "finalizing", "paused"].includes(status)
+          : ["calibrating", "listening", "speaking", "soft-pause", "finalizing", "dubbing", "listening-after-dubbing", "paused"].includes(status)
             ? "listening"
             : socketConnected
               ? "connected"
@@ -1562,8 +1563,12 @@ export default function App() {
         ? "Speaking…"
         : status === "soft-pause"
           ? "Waiting for more speech…"
-        : status === "finalizing"
+      : status === "finalizing"
           ? "Finishing caption…"
+        : status === "dubbing"
+          ? "Dubbing…"
+        : status === "listening-after-dubbing"
+          ? "Waiting for more speech…"
           : status === "paused"
             ? "Paused — start speaking"
             : status === "idle"
@@ -1602,6 +1607,7 @@ export default function App() {
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     if (clearQueue) dubbingQueueRef.current = [];
     dubbingSpeakingRef.current = false;
+    dubbingTransmissionGatedRef.current = false;
     activeDubbingUtteranceIdRef.current = "";
     activeDubbingLanguageRef.current = "";
   }, []);
@@ -1619,7 +1625,15 @@ export default function App() {
     }
 
     const nextUtterance = dubbingQueueRef.current.shift();
-    if (!nextUtterance) return;
+    if (!nextUtterance) {
+      dubbingTransmissionGatedRef.current = false;
+      if (recordingRef.current) {
+        vadControllerRef.current.markPaused();
+        setStatus("listening-after-dubbing");
+        setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
+      }
+      return;
+    }
 
     const utterance = new SpeechSynthesisUtterance(nextUtterance.text);
     utterance.lang = speechLanguage(nextUtterance.language);
@@ -1644,6 +1658,13 @@ export default function App() {
       window.setTimeout(() => playNextDubbingUtterance(), pauseMs);
     };
 
+    utterance.onstart = () => {
+      dubbingTransmissionGatedRef.current = true;
+      if (recordingRef.current) {
+        setStatus("dubbing");
+        setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Dubbing" }));
+      }
+    };
     utterance.onend = finish;
     utterance.onerror = finish;
 
@@ -2444,9 +2465,6 @@ export default function App() {
       if (!originalText || originalText === lastInterimRef.current) return;
 
       lastInterimRef.current = originalText;
-      if (modeRef.current === "dubbing" && (window.speechSynthesis?.speaking || window.speechSynthesis?.pending)) {
-        stopDubbingPlayback(true);
-      }
       schedulePartialTranscript({ text: originalText, detectedLanguage });
     });
 
@@ -3099,11 +3117,12 @@ export default function App() {
       }
 
       const sendCapturedChunk = (chunk: Omit<AudioChunkPayload, "sequence">) => {
-        if (chunk.audio.size < MIN_MEDIA_CHUNK_BYTES) return;
+        if (dubbingTransmissionGatedRef.current || chunk.audio.size < MIN_MEDIA_CHUNK_BYTES) return false;
         sequenceRef.current += 1;
         lastAudioChunkSentAtRef.current = chunk.capturedAt;
         emitAudioChunkPayload({ ...chunk, sequence: sequenceRef.current });
         if (sequenceRef.current % 3 === 0) setChunkCount(sequenceRef.current);
+        return true;
       };
 
       utteranceBoundaryRef.current?.stop();
@@ -3133,6 +3152,7 @@ export default function App() {
       recorder.ondataavailable = (event) => {
         const capturedAt = Date.now();
         const audioLevel = enhancedAudio.getAudioLevel();
+        let finalChunkSent = false;
         try {
           if (event.data.size < MIN_MEDIA_CHUNK_BYTES) return;
           const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
@@ -3144,9 +3164,10 @@ export default function App() {
             capturedAt,
             mimeType: recorderMimeType
           };
+          if (dubbingTransmissionGatedRef.current) return;
           const vadState = vadControllerRef.current.getState();
           if (vadState === "speaking" || vadState === "soft-pause" || vadState === "finalizing") {
-            sendCapturedChunk(chunk);
+            finalChunkSent = sendCapturedChunk(chunk);
             return;
           }
           if (vadState === "listening" || vadState === "paused") {
@@ -3155,7 +3176,9 @@ export default function App() {
             pendingSpeechChunksRef.current = pendingSpeechChunksRef.current.filter((item) => item.capturedAt >= cutoff);
           }
         } finally {
-          utteranceBoundaryRef.current?.onDataAvailable(audioLevel);
+          // Android can emit an empty or throttled event after requestData().
+          // A boundary is safe only after its non-empty final chunk was sent.
+          if (finalChunkSent) utteranceBoundaryRef.current?.onDataAvailable(audioLevel);
         }
       };
 
@@ -3180,9 +3203,11 @@ export default function App() {
         autoFinalize: autoStopOnSilence
       });
       vadControllerRef.current.start(Date.now());
+      setStatus("calibrating");
       if (vadPollTimerRef.current) window.clearInterval(vadPollTimerRef.current);
       vadPollTimerRef.current = window.setInterval(() => {
         if (!recordingRef.current) return;
+        if (dubbingTransmissionGatedRef.current) return;
         const action = vadControllerRef.current.update(getAudioLevelRef.current(), Date.now(), false);
         if (!action) return;
         if (action.type === "calibrated") {

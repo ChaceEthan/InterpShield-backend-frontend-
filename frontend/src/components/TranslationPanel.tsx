@@ -4,7 +4,7 @@ import { MicButton } from "./MicButton";
 import { StatusBar } from "./StatusBar";
 import { TranscriptArea, type TranscriptTranslationEntry } from "./TranscriptArea";
 
-type SessionStatus = "idle" | "connecting" | "listening" | "speaking" | "soft-pause" | "finalizing" | "paused" | "stopping" | "error";
+type SessionStatus = "idle" | "connecting" | "calibrating" | "listening" | "speaking" | "soft-pause" | "finalizing" | "dubbing" | "listening-after-dubbing" | "paused" | "stopping" | "error";
 type ToolMode = "transcribe" | "translate" | "dubbing";
 type ConnectionState = "ready" | "connecting" | "connected" | "listening" | "translating" | "reconnecting";
 
@@ -123,7 +123,7 @@ export function TranslationPanel({
 
         <div className="sticky bottom-4 z-20 mx-auto rounded-full bg-white/80 p-2 shadow-lg shadow-gray-200/80 backdrop-blur sm:static sm:bg-transparent sm:p-0 sm:shadow-none">
           <MicButton
-            isRecording={status === "listening"}
+            isRecording={isRecording}
             isConnecting={isConnecting}
             disabled={isBusy}
             onClick={onMicClick}
