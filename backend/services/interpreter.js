@@ -1108,6 +1108,7 @@ const resolveDirection = ({ sourceLang, targetLang, targetLanguages, detectedLan
 export const createInterpreterSession = async ({
   env,
   sourceLang,
+  mimeType = "",
   userPlan = "free",
   preferredProvider = "auto",
   targetLang,
@@ -1120,6 +1121,7 @@ export const createInterpreterSession = async ({
   onProviderHealth,
   onResult,
   onClosed,
+  onAudioStreamReset,
   deepgramClientFactory
 }) => {
   let lastFinalTranscript = "";
@@ -3746,6 +3748,7 @@ export const createInterpreterSession = async ({
   const session = createDeepgramSession({
     apiKey: env.deepgramApiKey,
     sourceLang,
+    mimeType,
     clientFactory: deepgramClientFactory,
     onOpen: onReady,
     onError: (message) => {
@@ -3757,6 +3760,7 @@ export const createInterpreterSession = async ({
       onWarning?.("Deepgram streaming failed.");
     },
     onClose: onClosed,
+    onGenerationChange: onAudioStreamReset,
     onSpeechSignal: ({ type }) => {
       latestSpeechSignal = type || "";
       if (type !== "utterance_end" || !currentSentence.trim()) return;

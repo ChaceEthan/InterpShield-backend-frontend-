@@ -40,6 +40,7 @@ import type { TranscriptTranslationEntry } from "./components/TranscriptArea";
 import { buildProductionAudioConstraints, createVadController, DEFAULT_VAD_CONFIG } from "./audio/vadController.mjs";
 import { createUtteranceBoundaryController, stableSessionStartTime } from "./audio/recorderLifecycle.mjs";
 import { createDubbingLifecycle } from "./audio/dubbingLifecycle.mjs";
+import { containerSignature, selectDeepgramMediaRecorderMimeType } from "./audio/mediaRecorderFormat.mjs";
 import { isAdminRole, normalizeAuthUser } from "./auth/roles.mjs";
 import { PLAN_CATALOG, PRICING_PLAN_IDS, yearlyMonthlyPrice } from "../../shared/plans.mjs";
 import {
@@ -227,6 +228,8 @@ interface AudioChunkPayload {
   chunkMs: number;
   capturedAt: number;
   mimeType: string;
+  streamGeneration: number;
+  containerHeader: boolean;
 }
 
 interface GoogleCredentialResponse {
@@ -285,7 +288,6 @@ const SOCKET_HEARTBEAT_STALE_MS = 75000;
 const MAX_AUDIO_RECOVERY_ATTEMPTS = 2;
 const AUDIO_RECOVERY_DELAY_MS = 900;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
-const AUDIO_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "subscription", "history", "help", "settings", "admin-login", "admin"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "subscription", "history", "settings", "admin"]);
 
@@ -777,8 +779,10 @@ const readStoredTranscriptHistory = (): TranscriptHistoryEntry[] => {
 };
 
 const getSupportedMimeType = () => {
-  if (typeof window === "undefined" || !("MediaRecorder" in window)) return "";
-  return AUDIO_MIME_TYPES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) || "";
+  if (typeof window === "undefined" || !("MediaRecorder" in window)) throw new Error("MediaRecorder is unavailable.");
+  const selection = selectDeepgramMediaRecorderMimeType((mimeType) => MediaRecorder.isTypeSupported(mimeType));
+  if (import.meta.env.DEV) console.info("[AUDIO_MIME_SUPPORT]", selection.support);
+  return selection.mimeType;
 };
 
 const isDeviceConstraintError = (error: unknown) =>
@@ -826,7 +830,7 @@ const createMediaRecorderWithFallback = (preferredStream: MediaStream, fallbackS
         { stream: preferredStream, label: "enhanced" },
         { stream: fallbackStream, label: "microphone" }
       ];
-  const mimeTypes = [...new Set([preferredMimeType, ...AUDIO_MIME_TYPES, ""].filter((value) => value !== undefined))];
+  const mimeTypes = [preferredMimeType];
   const errors: string[] = [];
 
   for (const { stream, label } of streams) {
@@ -837,14 +841,16 @@ const createMediaRecorderWithFallback = (preferredStream: MediaStream, fallbackS
           audioBitsPerSecond: 128_000
         };
         const recorder = new MediaRecorder(stream, options);
-        return { recorder, stream, mimeType: mimeType || recorder.mimeType || "", source: label };
+        if (!recorder.mimeType) throw new Error("MediaRecorder returned an empty MIME type.");
+        return { recorder, stream, mimeType: recorder.mimeType, source: label };
       } catch (error) {
         errors.push(`${label}:${mimeType || "default"}:${error instanceof Error ? error.message : String(error)}`);
       }
 
       try {
-        const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-        return { recorder, stream, mimeType: mimeType || recorder.mimeType || "", source: label };
+        const recorder = new MediaRecorder(stream, { mimeType });
+        if (!recorder.mimeType) throw new Error("MediaRecorder returned an empty MIME type.");
+        return { recorder, stream, mimeType: recorder.mimeType, source: label };
       } catch (error) {
         errors.push(`${label}:${mimeType || "default"}:basic:${error instanceof Error ? error.message : String(error)}`);
       }
@@ -1506,6 +1512,10 @@ export default function App() {
   } | null>(null);
   const shouldRestartSessionOnReconnectRef = useRef(false);
   const sequenceRef = useRef(0);
+  const audioStreamGenerationRef = useRef(1);
+  const pendingAudioStreamGenerationRef = useRef(1);
+  const awaitingContainerHeaderRef = useRef(true);
+  const recorderGenerationRestartRef = useRef(false);
   const lastAudioChunkSentAtRef = useRef(0);
   const queuedAudioChunksRef = useRef<AudioChunkPayload[]>([]);
   const queuedAudioDroppedRef = useRef(0);
@@ -2515,6 +2525,26 @@ export default function App() {
       lastServerHeartbeatAtRef.current = Date.now();
     });
 
+    const handleDeepgramStreamReset = ({ generation }: { generation?: number }) => {
+      const nextGeneration = Number(generation);
+      if (!recordingRef.current || !Number.isFinite(nextGeneration) || nextGeneration <= audioStreamGenerationRef.current) return;
+      const recorder = mediaRecorderRef.current;
+      pendingAudioStreamGenerationRef.current = nextGeneration;
+      queuedAudioChunksRef.current = [];
+      pendingSpeechChunksRef.current = [];
+      recorderGenerationRestartRef.current = true;
+      console.info("[AUDIO_STREAM_GENERATION_RESET]", { sessionId: clientSessionIdRef.current, oldGeneration: audioStreamGenerationRef.current, newGeneration: nextGeneration, recorderState: recorder?.state });
+      if (recorder?.state === "recording" || recorder?.state === "paused") {
+        recorder.stop();
+      } else if (recorder?.state === "inactive") {
+        audioStreamGenerationRef.current = nextGeneration;
+        awaitingContainerHeaderRef.current = true;
+        recorderGenerationRestartRef.current = false;
+        recorder.start(audioChunkMsRef.current);
+      }
+    };
+    socket.on("deepgram_stream_reset", handleDeepgramStreamReset);
+
     const markSessionReady = () => {
       sessionActionInFlightRef.current = false;
       const recorder = mediaRecorderRef.current;
@@ -2939,6 +2969,7 @@ export default function App() {
         subtitleThrottleTimerRef.current = null;
       }
       pendingPartialTranscriptRef.current = null;
+      socket.off("deepgram_stream_reset", handleDeepgramStreamReset);
       socket.off("translation_update", onTranslationUpdate);
       socket.off("translation_result", onTranslationResult);
       socket.off("translated_text", onTranslatedText);
@@ -3279,7 +3310,12 @@ export default function App() {
       const mimeType = getSupportedMimeType();
       const recorderSetup = createMediaRecorderWithFallback(enhancedAudio.stream, stream, mimeType);
       const recorder = recorderSetup.recorder;
-      const recorderMimeType = recorderSetup.mimeType || mimeType || "audio/webm";
+      const recorderMimeType = recorderSetup.mimeType;
+      sequenceRef.current = 0;
+      audioStreamGenerationRef.current = 1;
+      pendingAudioStreamGenerationRef.current = 1;
+      awaitingContainerHeaderRef.current = true;
+      recorderGenerationRestartRef.current = false;
       mediaRecorderRef.current = recorder;
       const deviceLabel = stream.getAudioTracks()[0]?.label || (microphoneId === "default" ? "System default microphone" : "Selected microphone");
       setAudioDiagnostic({
@@ -3290,7 +3326,9 @@ export default function App() {
         webAudio: Boolean(enhancedAudio.audioContext && recorderSetup.source === "enhanced")
       });
       logFrontendDebug("audio", "AUDIO_RECORDER_READY", {
-        mimeType: recorderMimeType,
+        selectedMimeType: mimeType,
+        actualMimeType: recorder.mimeType,
+        chunkIntervalMs: audioChunkMsRef.current,
         recorderSource: recorderSetup.source,
         webAudio: Boolean(enhancedAudio.audioContext),
         deviceLabel
@@ -3301,7 +3339,7 @@ export default function App() {
       }
 
       const sendCapturedChunk = (chunk: Omit<AudioChunkPayload, "sequence">) => {
-        if (dubbingTransmissionGatedRef.current || chunk.audio.size < MIN_MEDIA_CHUNK_BYTES) return false;
+        if ((dubbingTransmissionGatedRef.current && !chunk.containerHeader) || chunk.audio.size < MIN_MEDIA_CHUNK_BYTES) return false;
         sequenceRef.current += 1;
         lastAudioChunkSentAtRef.current = chunk.capturedAt;
         emitAudioChunkPayload({ ...chunk, sequence: sequenceRef.current });
@@ -3333,7 +3371,7 @@ export default function App() {
         }
       });
 
-      recorder.ondataavailable = (event) => {
+      recorder.ondataavailable = async (event) => {
         const capturedAt = Date.now();
         const audioLevel = enhancedAudio.getAudioLevel();
         let finalChunkSent = false;
@@ -3341,13 +3379,33 @@ export default function App() {
           if (event.data.size < MIN_MEDIA_CHUNK_BYTES) return;
           const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
           if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.002) return;
+          const isGenerationHeader = awaitingContainerHeaderRef.current;
+          let signature = { valid: false, container: "unknown", hex: "" };
+          if (isGenerationHeader) {
+            signature = containerSignature(await event.data.slice(0, 16).arrayBuffer());
+            if (!signature.valid) {
+              console.error("[AUDIO_CONTAINER_HEADER_INVALID]", { mimeType: recorderMimeType, streamGeneration: audioStreamGenerationRef.current, signature: signature.hex });
+              scheduleAudioRecovery("container_header_missing");
+              return;
+            }
+            awaitingContainerHeaderRef.current = false;
+          }
           const chunk = {
             audio: event.data,
             audioLevel,
             chunkMs: audioChunkMsRef.current,
             capturedAt,
-            mimeType: recorderMimeType
+            mimeType: recorderMimeType,
+            streamGeneration: audioStreamGenerationRef.current,
+            containerHeader: isGenerationHeader
           };
+          if (isGenerationHeader || sequenceRef.current % 25 === 0) {
+            console.info("[AUDIO_CHUNK_CAPTURED]", { sessionId: clientSessionIdRef.current, sequence: sequenceRef.current + 1, streamGeneration: audioStreamGenerationRef.current, bytes: event.data.size, chunkIntervalMs: elapsedSinceLastChunk, mimeType: recorderMimeType, containerHeader: isGenerationHeader, signature: signature.hex });
+          }
+          if (isGenerationHeader) {
+            sendCapturedChunk(chunk);
+            return;
+          }
           if (dubbingTransmissionGatedRef.current) return;
           const vadState = vadControllerRef.current.getState();
           if (vadState === "speaking" || vadState === "soft-pause" || vadState === "finalizing") {
@@ -3378,6 +3436,16 @@ export default function App() {
       };
 
       recorder.onstop = () => {
+        if (recorderGenerationRestartRef.current && recordingRef.current) {
+          recorderGenerationRestartRef.current = false;
+          audioStreamGenerationRef.current = pendingAudioStreamGenerationRef.current;
+          sequenceRef.current = 0;
+          pendingSpeechChunksRef.current = [];
+          awaitingContainerHeaderRef.current = true;
+          recorder.start(audioChunkMsRef.current);
+          setMediaRecorderActive(true);
+          return;
+        }
         if (recordingRef.current && status !== "stopping") {
           scheduleAudioRecovery("recorder_stopped");
         }

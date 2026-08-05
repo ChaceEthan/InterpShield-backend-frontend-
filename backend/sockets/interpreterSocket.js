@@ -236,6 +236,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     let session = null;
     let sessionTimer = null;
     let lastSequence = -1;
+    let lastAudioStreamGeneration = 0;
     let audioPipeline = null;
     let roomMetadata = null;
     let heartbeatTimer = null;
@@ -335,6 +336,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       targetLanguages = [],
       shouldTranslate = true,
       twoWay = false,
+      mimeType = "",
       roomId = "",
       participantId = ""
     } = {}) =>
@@ -343,6 +345,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         targetLanguages,
         shouldTranslate,
         twoWay,
+        mimeType,
         roomId,
         participantId
       });
@@ -553,6 +556,13 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       const targetLang = targetLanguages[0];
       const shouldTranslate = payload.translate !== false;
       const twoWay = Boolean(payload.twoWay);
+      const mimeType = String(payload.mimeType || "").trim().toLowerCase();
+      if (!["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"].includes(mimeType)) {
+        const message = "A supported Opus WebM/Ogg microphone format is required.";
+        ack?.({ ok: false, error: message });
+        socket.emit("session_error", { message });
+        return;
+      }
       const roomId = String(payload.roomId || payload.callRoomId || "").trim();
       const participantId = String(payload.participantId || socket.id).trim();
       const configSignature = sessionConfigSignature({
@@ -560,6 +570,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         targetLanguages,
         shouldTranslate,
         twoWay,
+        mimeType,
         roomId,
         participantId
       });
@@ -674,6 +685,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         session = await createInterpreterSession({
           env,
           sourceLang,
+          mimeType,
           userPlan: ["admin", "super_admin"].includes(authenticatedUser.role) ? "team" : authenticatedUser.plan || "free",
           preferredProvider: payload.preferredProvider || "auto",
           targetLang,
@@ -696,6 +708,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
             getActiveSocket().emit("provider_health", health);
           },
           onClosed: () => getActiveSocket().emit("warning", { message: "Provider stream closed; reconnecting if session is active." }),
+          onAudioStreamReset: ({ generation }) => getActiveSocket().emit("deepgram_stream_reset", { generation }),
           onResult: emitInterpreterResult
         });
         socket.data.interpreterSession = session;
@@ -735,7 +748,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           participantId,
           sourceLang,
           targetLanguages,
-          mimeType: payload.mimeType || "audio/webm",
+          mimeType,
           audioProfile: payload.audioProfile || {}
         });
         socket.data.audioPipeline = audioPipeline.getSnapshot();
@@ -799,17 +812,25 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
       try {
         const sequence = Number(payload?.sequence);
+        const streamGeneration = Number(payload?.streamGeneration);
+        if (!Number.isFinite(streamGeneration) || streamGeneration < 1 || streamGeneration < lastAudioStreamGeneration) return;
+        if (streamGeneration > lastAudioStreamGeneration) {
+          lastAudioStreamGeneration = streamGeneration;
+          lastSequence = -1;
+        }
         if (Number.isFinite(sequence) && sequence <= lastSequence) return;
         if (Number.isFinite(sequence)) lastSequence = sequence;
 
         const audioBuffer = audioPayloadToBuffer(payload);
         if (audioBuffer.length < 64) return;
 
-        const processedAudio = audioPipeline?.preprocessAudioChunk(audioBuffer, {
-          sequence: Number.isFinite(sequence) ? sequence : undefined,
-          audioLevel: Number(payload?.audioLevel),
-          receivedAt: Number(payload?.capturedAt) || Date.now()
-        }) || { accepted: true, buffer: audioBuffer };
+        const processedAudio = payload.containerHeader
+          ? { accepted: true, buffer: audioBuffer }
+          : audioPipeline?.preprocessAudioChunk(audioBuffer, {
+              sequence: Number.isFinite(sequence) ? sequence : undefined,
+              audioLevel: Number(payload?.audioLevel),
+              receivedAt: Number(payload?.capturedAt) || Date.now()
+            }) || { accepted: true, buffer: audioBuffer };
 
         socketRuntime.totalAudioChunks += 1;
         if (!processedAudio.accepted) {
@@ -828,9 +849,12 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           return;
         }
 
-        session.sendAudio(processedAudio.buffer);
+        session.sendAudio(processedAudio.buffer, {
+          streamGeneration,
+          containerHeader: Boolean(payload.containerHeader)
+        });
         if (process.env.NODE_ENV !== "production" && (sequence === 1 || sequence % 25 === 0)) {
-          console.debug("[AUDIO_CHUNK_ACCEPTED]", { sequence, bytes: processedAudio.buffer.length });
+          console.debug("[AUDIO_CHUNK_ACCEPTED]", { sessionId: session.sessionId, sequence, streamGeneration, bytes: processedAudio.buffer.length, mimeType: payload.mimeType, containerHeader: Boolean(payload.containerHeader), signature: processedAudio.buffer.subarray(0, 16).toString("hex") });
         }
         socket.data.audioPipeline = audioPipeline?.getSnapshot?.() || socket.data.audioPipeline;
         socketRuntime.lastAudioAt = new Date().toISOString();

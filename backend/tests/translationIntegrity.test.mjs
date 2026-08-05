@@ -196,6 +196,10 @@ assert.match(frontendSource, /queueDubbingTranslations\(translationId, nextTrans
 assert.match(frontendSource, /DESKTOP_PIPELINE_REACT_TRANSLATIONS_UPDATE/, "desktop React translation state changes are diagnosable");
 assert.match(socketSource, /DESKTOP_PIPELINE_TRANSLATION_RESULT/, "backend translation completion and socket emission are diagnosable");
 assert.match(socketSource, /DESKTOP_PIPELINE_SOCKET_EMIT/, "each compatibility translation event emission is diagnosable");
+assert.match(frontendSource, /selectDeepgramMediaRecorderMimeType/, "desktop capture explicitly selects a supported Deepgram container");
+assert.match(frontendSource, /mimeType:\s*recorderMimeType/, "the actual recorder MIME type is sent in the session payload");
+assert.match(frontendSource, /streamGeneration:\s*audioStreamGenerationRef\.current/, "browser audio carries Deepgram generation ownership");
+assert.match(socketSource, /deepgram_stream_reset/, "Deepgram reconnect requests a fresh browser container generation");
 assert.match(frontendSource, /STALE_TRANSLATION_STATE_MS/);
 assert.match(frontendSource, /latestTranslationSequenceRef/);
 assert.match(frontendSource, /streamingPreview/);
@@ -210,7 +214,7 @@ assert.doesNotMatch(readFileSync(resolve(__dirname, "../services/openai.js"), "u
 assert.match(readFileSync(resolve(__dirname, "../services/gemini.js"), "utf8"), /mergeAbortSignals/);
 assert.match(readFileSync(resolve(__dirname, "../services/gemini.js"), "utf8"), /clearTimeout\(timeout\)/);
 assert.match(readFileSync(resolve(__dirname, "../services/audioPipeline.js"), "utf8"), /DUPLICATE_HASH_WINDOW\s*=\s*24/);
-assert.match(readFileSync(resolve(__dirname, "../services/deepgram.js"), "utf8"), /MAX_QUEUED_CHUNKS\s*=\s*2400/);
+assert.match(readFileSync(resolve(__dirname, "../services/deepgram.js"), "utf8"), /MAX_QUEUED_CHUNKS\s*=\s*120/);
 assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "es" }), "Me puedes dar tu libro, por favor");
 assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "zh" }), "请把你的书给我");
 assert.equal(resolveLocalTranslation({ text: source, sourceLang: "en", targetLang: "rw" }), "urashobora kumpa igitabo cyawe");

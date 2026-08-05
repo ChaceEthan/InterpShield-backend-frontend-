@@ -72,10 +72,12 @@ class FakeDeepgramConnection extends EventEmitter {
 
 const createFakeClientFactory = (options = {}) => {
   const connections = [];
+  const connectOptions = [];
   const factory = () => ({
     listen: {
       v1: {
-        connect: async () => {
+        connect: async (deepgramOptions) => {
+          connectOptions.push(deepgramOptions);
           const connection = new FakeDeepgramConnection(options.connectionOptions?.(connections.length) || {});
           connections.push(connection);
           return connection;
@@ -84,8 +86,56 @@ const createFakeClientFactory = (options = {}) => {
     }
   });
   factory.connections = connections;
+  factory.connectOptions = connectOptions;
   return factory;
 };
+
+{
+  const factory = createFakeClientFactory();
+  const generations = [];
+  const transcripts = [];
+  const session = createDeepgramSession({
+    apiKey: "test-key",
+    sourceLang: "en",
+    mimeType: "audio/webm;codecs=opus",
+    clientFactory: factory,
+    onGenerationChange: (event) => generations.push(event.generation),
+    onTranscript: (event) => transcripts.push(event.text)
+  });
+  const webmHeader = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, ...new Array(124).fill(1)]);
+  const webmCluster = Buffer.from([0x1f, 0x43, 0xb6, 0x75, ...new Array(124).fill(2)]);
+
+  await session.start();
+  await wait(10);
+  session.sendAudio(webmHeader, { streamGeneration: 1, containerHeader: true });
+  session.sendAudio(webmCluster, { streamGeneration: 1 });
+  assert.equal(factory.connections[0].sentMedia.length, 2);
+  assert.equal(factory.connectOptions[0].encoding, undefined, "container audio must not force a raw encoding");
+  assert.equal(factory.connectOptions[0].sample_rate, undefined, "container audio must supply its own sample rate");
+  assert.equal(factory.connectOptions[0].channels, undefined, "container audio must supply its own channel count");
+  assert.equal(factory.connectOptions[0].model, "nova-3");
+
+  factory.connections[0].close();
+  for (let index = 0; index < 180; index += 1) {
+    session.sendAudio(Buffer.from([0x1f, 0x43, 0xb6, index & 0xff, ...new Array(124).fill(index & 0xff)]), { streamGeneration: 1 });
+  }
+  assert.ok(session.getHealth().queuedChunks <= session.getHealth().maxQueuedChunks, "container backlog must remain bounded");
+  await wait(650);
+  assert.equal(factory.connections.length, 2, "one close callback must create one replacement socket");
+  assert.deepEqual(generations, [2]);
+  assert.equal(factory.connections[1].sentMedia.length, 0, "old-generation WebM clusters must not be replayed into a fresh socket");
+  session.sendAudio(webmCluster, { streamGeneration: 1 });
+  session.sendAudio(webmCluster, { streamGeneration: 2 });
+  assert.equal(factory.connections[1].sentMedia.length, 0, "a fresh generation must reject stale chunks and middle-container chunks");
+  session.sendAudio(webmHeader, { streamGeneration: 2, containerHeader: true });
+  session.sendAudio(webmCluster, { streamGeneration: 2 });
+  assert.equal(factory.connections[1].sentMedia.length, 2);
+  assert.deepEqual(factory.connections[1].sentMedia[0].subarray(0, 4), webmHeader.subarray(0, 4));
+  factory.connections[1].emitTranscript("desktop stream healthy", { isFinal: false, speechFinal: false });
+  assert.deepEqual(transcripts, ["desktop stream healthy"]);
+  assert.equal(session.getHealth().reconnectAttempt, 0, "transcript activity must clear the stalled reconnect condition");
+  session.stop();
+}
 
 {
   const pipeline = createAudioPipelineSession({ sessionId: "vad-silence-test" });
@@ -205,7 +255,7 @@ const createFakeClientFactory = (options = {}) => {
   factory.connections[0].close();
   await wait(650);
   assert.ok(session.getHealth().queuedChunks >= 1, "failed flush should roll the audio chunk back into the queue");
-  await wait(650);
+  await wait(1150);
   assert.equal(session.getHealth().queuedChunks, 0, "rolled-back queued audio should flush on the next reconnect");
   session.stop();
 }

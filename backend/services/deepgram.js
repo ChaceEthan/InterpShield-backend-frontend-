@@ -3,9 +3,10 @@ import { DeepgramClient } from "@deepgram/sdk";
 import { normalizeLanguageCode } from "../../shared/languages.mjs";
 
 const createClient = (apiKey) => new DeepgramClient({ apiKey });
-const MAX_QUEUED_CHUNKS = 2400;
+const MAX_QUEUED_CHUNKS = 120;
 const MAX_RECENT_AUDIO_CHUNKS = 18;
 const MAX_RECONNECT_DELAY_MS = 15000;
+const MAX_RECONNECT_ATTEMPTS = 5;
 const DEEPGRAM_KEEPALIVE_MS = 8000;
 const DEEPGRAM_HEALTH_CHECK_MS = 5000;
 const DEEPGRAM_STALL_MS = 45000;
@@ -30,6 +31,14 @@ const isConnectionOpen = (connection) => {
   return readyState === 1 || readyState === "OPEN";
 };
 
+const normalizeContainerMimeType = (mimeType = "") => String(mimeType || "").split(";")[0].trim().toLowerCase();
+const isContainerHeader = (buffer, mimeType) => {
+  const container = normalizeContainerMimeType(mimeType);
+  if (container === "audio/webm") return buffer?.length >= 4 && buffer[0] === 0x1a && buffer[1] === 0x45 && buffer[2] === 0xdf && buffer[3] === 0xa3;
+  if (container === "audio/ogg") return buffer?.length >= 4 && buffer[0] === 0x4f && buffer[1] === 0x67 && buffer[2] === 0x67 && buffer[3] === 0x53;
+  return true;
+};
+
 const audioFingerprint = (buffer) => {
   if (!buffer?.length) return "";
   let hash = 2166136261;
@@ -46,12 +55,14 @@ const audioFingerprint = (buffer) => {
 export const createDeepgramSession = ({
   apiKey,
   sourceLang,
+  mimeType = "",
   clientFactory = createClient,
   onOpen,
   onTranscript,
   onSpeechSignal,
   onError,
-  onClose
+  onClose,
+  onGenerationChange
 }) => {
   if (!apiKey) {
     throw new Error("Missing Deepgram API key");
@@ -66,10 +77,13 @@ export const createDeepgramSession = ({
   let reconnecting = false;
   let connecting = false;
   let reconnectAttempt = 0;
+  let terminalFailureEmitted = false;
   let connectionGeneration = 0;
+  let headerGeneration = 0;
   const queuedAudio = [];
   const queuedAudioFingerprints = new Set();
   const recentAudio = [];
+  const containerAudio = ["audio/webm", "audio/ogg"].includes(normalizeContainerMimeType(mimeType));
   const maxQueuedChunks = MAX_QUEUED_CHUNKS;
   const health = {
     state: "idle",
@@ -93,7 +107,10 @@ export const createDeepgramSession = ({
     lastAudioQueuedAt: 0,
     lastKeepAliveAt: 0,
     lastError: "",
-    stallDetectedAt: 0
+    stallDetectedAt: 0,
+    connectionGeneration: 0,
+    bufferedBytes: 0,
+    mimeType
   };
 
   const updateQueueHealth = () => {
@@ -102,6 +119,8 @@ export const createDeepgramSession = ({
     health.isOpen = isOpen && isConnectionOpen(connection);
     health.reconnecting = reconnecting || connecting;
     health.reconnectAttempt = reconnectAttempt;
+    health.connectionGeneration = connectionGeneration;
+    health.bufferedBytes = queuedAudio.reduce((total, chunk) => total + chunk.length, 0);
   };
 
   const clearKeepAlive = () => {
@@ -202,6 +221,16 @@ export const createDeepgramSession = ({
   const scheduleReconnect = (reason = "stream_closed") => {
     if (stopped || reconnecting || connecting) return;
 
+    if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+      health.state = "failed";
+      health.lastError = `Deepgram stream failed after ${MAX_RECONNECT_ATTEMPTS} reconnect attempts (${reason}).`;
+      if (!terminalFailureEmitted) {
+        terminalFailureEmitted = true;
+        onError?.("Live captions stopped because the speech stream could not recover. Please restart the microphone.");
+      }
+      return;
+    }
+
     reconnecting = true;
     reconnectAttempt += 1;
     health.state = "reconnecting";
@@ -247,7 +276,7 @@ export const createDeepgramSession = ({
     health.restarts += 1;
     health.state = "restarting";
     health.lastError = reason;
-    enqueueRecentAudioForResend();
+    if (!containerAudio) enqueueRecentAudioForResend();
     invalidateAndCloseConnection();
     clearKeepAlive();
     scheduleReconnect(reason);
@@ -292,9 +321,18 @@ export const createDeepgramSession = ({
     };
 
     Object.assign(options, normalizeDeepgramLanguage(sourceLang));
+    // WebM/Ogg are self-describing containers. Deepgram must infer encoding,
+    // sample rate, and channels from the initialization header.
 
     const generation = connectionGeneration + 1;
     connectionGeneration = generation;
+    headerGeneration = 0;
+    if (reconnect && containerAudio) {
+      queuedAudio.length = 0;
+      queuedAudioFingerprints.clear();
+      recentAudio.length = 0;
+      onGenerationChange?.({ generation, reconnect: true, mimeType });
+    }
     const staleConnection = connection;
     connection = null;
     isOpen = false;
@@ -316,12 +354,11 @@ export const createDeepgramSession = ({
       clearReconnect();
       isOpen = true;
       connecting = false;
-      reconnectAttempt = 0;
       reconnecting = false;
       health.state = "open";
       health.lastOpenAt = Date.now();
       health.lastError = "";
-      console.info("[DEEPGRAM_OPEN]", { reconnect, queuedAudio: queuedAudio.length });
+      console.info("[DEEPGRAM_OPEN]", { reconnect, generation, queuedAudio: queuedAudio.length, bufferedBytes: health.bufferedBytes, mimeType });
       keepAliveTimer = setInterval(() => {
         if (isOpen && isConnectionOpen(connection) && connection?.sendKeepAlive) {
           connection.sendKeepAlive({ type: "KeepAlive" });
@@ -336,6 +373,9 @@ export const createDeepgramSession = ({
     connection.on("message", (message) => {
       if (!isCurrentConnectionEvent()) return;
       health.lastMessageAt = Date.now();
+      reconnectAttempt = 0;
+      terminalFailureEmitted = false;
+      updateQueueHealth();
       if (message?.type === "SpeechStarted" || message?.type === "UtteranceEnd") {
         onSpeechSignal?.({
           type: message.type === "SpeechStarted" ? "speech_started" : "utterance_end",
@@ -378,7 +418,7 @@ export const createDeepgramSession = ({
       health.state = "error";
       health.lastError = error?.message || String(error);
       onError?.(error?.message || "Deepgram streaming error");
-      enqueueRecentAudioForResend();
+      if (!containerAudio) enqueueRecentAudioForResend();
       scheduleReconnect(error?.message || "provider_error");
     });
 
@@ -390,7 +430,7 @@ export const createDeepgramSession = ({
       health.lastCloseAt = Date.now();
       clearKeepAlive();
       if (!stopped) {
-        enqueueRecentAudioForResend();
+        if (!containerAudio) enqueueRecentAudioForResend();
         scheduleReconnect("stream_closed");
         return;
       }
@@ -412,8 +452,26 @@ export const createDeepgramSession = ({
     }
   };
 
-  const sendAudio = (buffer) => {
+  const sendAudio = (buffer, { streamGeneration = connectionGeneration, containerHeader = false } = {}) => {
     if (!buffer?.length) return;
+
+    const incomingGeneration = Number(streamGeneration);
+    if (incomingGeneration !== connectionGeneration) {
+      health.droppedChunks += 1;
+      health.lastError = `Rejected audio from stale generation ${incomingGeneration}; active generation is ${connectionGeneration}.`;
+      updateQueueHealth();
+      return;
+    }
+
+    if (containerAudio && headerGeneration !== connectionGeneration) {
+      if (!containerHeader || !isContainerHeader(buffer, mimeType)) {
+        health.droppedChunks += 1;
+        health.lastError = `Generation ${connectionGeneration} is waiting for a valid ${normalizeContainerMimeType(mimeType)} header.`;
+        updateQueueHealth();
+        return;
+      }
+      headerGeneration = connectionGeneration;
+    }
 
     if (!isOpen || !isConnectionOpen(connection)) {
       enqueueAudio(buffer);
