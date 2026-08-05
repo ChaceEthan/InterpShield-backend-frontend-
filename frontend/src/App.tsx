@@ -2490,10 +2490,12 @@ export default function App() {
     const handleReconnectAttempt = () => {
       updateSocketAuth();
       logFrontendDebug("socket", "SOCKET_RECONNECT_ATTEMPT", {});
+      console.info("[DESKTOP_PIPELINE_SOCKET_RECONNECT]", { state: "attempt" });
       if (recordingRef.current) setSocketReconnecting(true);
     };
     const handleReconnect = () => {
       logFrontendDebug("socket", "SOCKET_RECONNECTED", {});
+      console.info("[DESKTOP_PIPELINE_SOCKET_RECONNECT]", { state: "connected" });
       setSocketReconnecting(false);
     };
     const handleReconnectError = () => {
@@ -2610,6 +2612,7 @@ export default function App() {
       if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
       captionWatchdogTimerRef.current = null;
       logFrontendDebug("audio", "TRANSCRIPT_FINAL_RECEIVED", { chars: originalText.length, sequence, jobId });
+      console.info("[DESKTOP_PIPELINE_SPEECH_FINAL]", { sessionId, jobId, sequence, chars: originalText.length });
       const transcriptEventKey = `${sessionId || "session"}:${jobId ?? "job"}:${sequence ?? "sequence"}`;
       if (!originalText || transcriptEventKey === lastFinalTranscriptEventKeyRef.current) return;
       if (detectedLanguage) setDetectedLanguage(detectedLanguage);
@@ -2625,15 +2628,17 @@ export default function App() {
         subtitleThrottleTimerRef.current = null;
       }
       const pendingTargetLanguages = normalizeTargetLanguages(eventTargetLanguages, eventTargetLang || targetLangRef.current);
-      drainPendingLanguagesRef.current = new Set(modeRef.current === "transcribe" ? [] : pendingTargetLanguages);
-      if (drainPendingLanguagesRef.current.size > 0) setStatus("translating");
-      const timestamp = new Date().toISOString();
       const lastTranslationOriginal = lastTranslationOriginalRef.current;
       const normalizedFinalOriginal = originalText.toLowerCase().replace(/\s+/g, " ").trim();
       const normalizedTranslationOriginal = lastTranslationOriginal.toLowerCase().replace(/\s+/g, " ").trim();
       const keepStreamingTranslation =
         normalizedTranslationOriginal &&
         (normalizedFinalOriginal.includes(normalizedTranslationOriginal) || normalizedTranslationOriginal.includes(normalizedFinalOriginal));
+      const alreadyTranslatedLanguages = new Set(keepStreamingTranslation ? Object.keys(finalTranslationsRef.current) : []);
+      const pendingLanguages = pendingTargetLanguages.filter((language) => !alreadyTranslatedLanguages.has(language));
+      drainPendingLanguagesRef.current = new Set(modeRef.current === "transcribe" ? [] : pendingLanguages);
+      if (drainPendingLanguagesRef.current.size > 0) setStatus("translating");
+      const timestamp = new Date().toISOString();
       const transcriptSequence = Number(sequence);
       const translationId = `${timestamp}-${originalText.slice(0, 48)}`;
       const pendingEntry: PendingTranscriptEntry = {
@@ -2658,7 +2663,7 @@ export default function App() {
       if (Number.isFinite(transcriptSequence)) {
         latestTranslationSequenceRef.current = transcriptSequence;
       }
-      updateTranslationStatuses(Object.fromEntries(pendingTargetLanguages.map((language) => [language, "queued"])));
+      updateTranslationStatuses(Object.fromEntries(pendingLanguages.map((language) => [language, "queued"])));
       setInterimOriginal("");
       setLiveText("");
       setFinalText((current) => appendTextWindow(current, originalText));
@@ -2694,6 +2699,7 @@ export default function App() {
       const updateOriginal = original?.trim() || "";
       const previewJob = typeof jobId === "string" && jobId.startsWith("preview-");
       const streamingPreview = Boolean(streaming || previewJob);
+      console.info("[DESKTOP_PIPELINE_TRANSLATION_RECEIVED]", { sessionId, jobId, sequence, original: updateOriginal, languages: Object.keys(translations || {}), status, partial, complete });
 
       if (sessionId && activeBackendSessionIdRef.current && sessionId !== activeBackendSessionIdRef.current) {
         return;
@@ -2711,8 +2717,17 @@ export default function App() {
             sequence: Number.isFinite(incomingSequence) ? incomingSequence : undefined,
             original: updateOriginal
           }) || currentPendingTranscript;
+      const preFinalTranslation = Boolean(
+        !streamingPreview &&
+        updateOriginal &&
+        !matchedPendingTranscript &&
+        !currentPendingTranscript &&
+        ((Number.isFinite(incomingSequence) && incomingSequence > latestTranslationSequenceRef.current) ||
+          (!Number.isFinite(incomingSequence) && Boolean(jobId) && !activeBackendTranslationJobIdRef.current))
+      );
       const isCurrentLiveTranslation = Boolean(
         streamingPreview ||
+          preFinalTranslation ||
           (jobId && activeBackendTranslationJobIdRef.current && String(jobId) === String(activeBackendTranslationJobIdRef.current)) ||
           (matchedPendingTranscript && currentPendingTranscript && matchedPendingTranscript.translationId === currentPendingTranscript.translationId) ||
           (!jobId && updateOriginal && updateOriginal === lastFinalOriginalRef.current)
@@ -2725,10 +2740,10 @@ export default function App() {
       if (matchedPendingTranscript && updateOriginal && updateOriginal !== matchedPendingTranscript.original) {
         return;
       }
-      if (!streamingPreview && !matchedPendingTranscript && updateOriginal && lastFinalOriginalRef.current && updateOriginal !== lastFinalOriginalRef.current) {
+      if (!streamingPreview && !preFinalTranslation && !matchedPendingTranscript && updateOriginal && lastFinalOriginalRef.current && updateOriginal !== lastFinalOriginalRef.current) {
         return;
       }
-      if (!streamingPreview && jobId && activeBackendTranslationJobIdRef.current && String(jobId) !== String(activeBackendTranslationJobIdRef.current) && !matchedPendingTranscript) {
+      if (!streamingPreview && !preFinalTranslation && jobId && activeBackendTranslationJobIdRef.current && String(jobId) !== String(activeBackendTranslationJobIdRef.current) && !matchedPendingTranscript) {
         return;
       }
 
@@ -2818,7 +2833,9 @@ export default function App() {
         diagnosticUpdates[language] = "";
       }
       const hasStatusUpdate = Object.keys(nextStatusUpdates).length > 0;
-      const translationId = matchedPendingTranscript?.translationId || (shouldUpdateLiveTranslation ? activeTranslationIdRef.current : "") || matchedPendingTranscript?.timestamp || "current";
+      const translationId = matchedPendingTranscript?.translationId ||
+        (preFinalTranslation ? `backend-${sessionId || "session"}-${jobId ?? "job"}-${sequence ?? "sequence"}` : "") ||
+        (shouldUpdateLiveTranslation ? activeTranslationIdRef.current : "") || matchedPendingTranscript?.timestamp || "current";
       const completedSignature = isComplete
         ? `${translationId}|${mergedTranslationSignature}`
         : "";
@@ -2829,6 +2846,7 @@ export default function App() {
       }
       if (hasStatusUpdate && shouldUpdateLiveTranslation) {
         updateTranslationStatuses(nextStatusUpdates);
+        console.info("[DESKTOP_PIPELINE_REACT_STATUS_UPDATE]", { jobId, sequence, updates: nextStatusUpdates, preFinalTranslation });
         if (!streamingPreview && Number.isFinite(incomingSequence)) {
           latestTranslationSequenceRef.current = Math.max(latestTranslationSequenceRef.current, incomingSequence);
         }
@@ -2859,6 +2877,7 @@ export default function App() {
         lastFinalTranslationRef.current = mergedTranslationSignature;
         finalTranslationsRef.current = mergedTranslations;
         setFinalTranslations(mergedTranslations);
+        console.info("[DESKTOP_PIPELINE_REACT_TRANSLATIONS_UPDATE]", { jobId, sequence, languages: Object.keys(mergedTranslations), preFinalTranslation });
         if (!streamingPreview && isComplete) queueDubbingTranslations(translationId, nextTranslations);
       }
 
@@ -2903,9 +2922,12 @@ export default function App() {
       }
     };
 
-    socket.on("translation_update", handleTranslationUpdate);
-    socket.on("translation_result", handleTranslationUpdate);
-    socket.on("translated_text", handleTranslationUpdate);
+    const onTranslationUpdate = (payload: Parameters<typeof handleTranslationUpdate>[0]) => { console.info("[DESKTOP_PIPELINE_SOCKET_EVENT]", { event: "translation_update" }); handleTranslationUpdate(payload); };
+    const onTranslationResult = (payload: Parameters<typeof handleTranslationUpdate>[0]) => { console.info("[DESKTOP_PIPELINE_SOCKET_EVENT]", { event: "translation_result" }); handleTranslationUpdate(payload); };
+    const onTranslatedText = (payload: Parameters<typeof handleTranslationUpdate>[0]) => { console.info("[DESKTOP_PIPELINE_SOCKET_EVENT]", { event: "translated_text" }); handleTranslationUpdate(payload); };
+    socket.on("translation_update", onTranslationUpdate);
+    socket.on("translation_result", onTranslationResult);
+    socket.on("translated_text", onTranslatedText);
 
     return () => {
       if (interimTimerRef.current) {
@@ -2917,6 +2939,9 @@ export default function App() {
         subtitleThrottleTimerRef.current = null;
       }
       pendingPartialTranscriptRef.current = null;
+      socket.off("translation_update", onTranslationUpdate);
+      socket.off("translation_result", onTranslationResult);
+      socket.off("translated_text", onTranslatedText);
       socket.disconnect();
       stopClientHeartbeat();
       socket.io.off("reconnect_attempt", handleReconnectAttempt);

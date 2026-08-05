@@ -372,6 +372,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     const emitInterpreterResult = (result) => {
       const emitTranslationPayload = (payload) => {
         const activeSocket = getActiveSocket();
+        const diagnostic = { sessionId: payload.sessionId, jobId: payload.jobId, sequence: payload.sequence, status: payload.status, languages: Object.keys(payload.translations || {}), complete: payload.complete };
+        console.info("[DESKTOP_PIPELINE_TRANSLATION_RESULT]", diagnostic);
         logSocketTranslationEvent("SOCKET_TRANSLATION_EMIT", {
           socketId: activeSocket.id,
           sourceLang: payload.sourceLang,
@@ -392,9 +394,10 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         if (activeHealth) {
           activeHealth.translationHealth = session?.getTranslationHealth?.() || activeHealth.translationHealth;
         }
-        activeSocket.emit("translation_update", payload);
-        activeSocket.emit("translation_result", payload);
-        activeSocket.emit("translated_text", payload);
+        for (const event of ["translation_update", "translation_result", "translated_text"]) {
+          console.info("[DESKTOP_PIPELINE_SOCKET_EMIT]", { event, socketId: activeSocket.id, ...diagnostic });
+          activeSocket.emit(event, payload);
+        }
         const speechRoutes = audioPipeline?.queueTranslatedSpeech?.({
           original: payload.original,
           translations: payload.translations,
@@ -427,6 +430,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           utteranceEnd: Boolean(result.utteranceEnd),
           speechStarted: Boolean(result.speechStarted)
         });
+        if (result.speechFinal) console.info("[DESKTOP_PIPELINE_SPEECH_FINAL]", { stage: "stt_complete", socketId: activeSocket.id, chars: String(result.originalText || "").length });
         activeSocket.emit("result", result);
         return;
       }
@@ -468,6 +472,10 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       }
 
       const activeSocket = getActiveSocket();
+      console.info("[DESKTOP_PIPELINE_SPEECH_FINAL]", { stage: "transcript_final_emit", socketId: activeSocket.id, sessionId: result.sessionId, jobId: result.jobId, sequence: result.sequence, chars: String(result.originalText || "").length });
+      if (result.isTranscriptOnly) {
+        console.info("[DESKTOP_PIPELINE_TRANSLATION_START]", { socketId: activeSocket.id, sessionId: result.sessionId, jobId: result.jobId, sequence: result.sequence, targetLanguages: result.targetLanguages || [result.targetLang] });
+      }
       if (process.env.NODE_ENV !== "production") {
         console.debug("[TRANSCRIPT_FINAL_EMITTED]", { sequence: result.sequence, jobId: result.jobId, chars: String(result.originalText || "").length });
       }
