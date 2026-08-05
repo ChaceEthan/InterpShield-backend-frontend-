@@ -26,9 +26,10 @@ assert.match(adminDashboardSource, /e\.status === 401\) onUnauthorized/, "admin 
 assert.match(adminDashboardSource, /e\.status === 403\) onForbidden/, "admin API authorization failures are handled");
 assert.match(adminDashboardSource, /Promote to admin/, "super admins receive a clear promotion action");
 assert.match(adminDashboardSource, /Remove admin role/, "super admins receive a clear role-removal action");
-assert.match(appSource, /socket\.on\("disconnect",[\s\S]*?stopDubbingPlayback\(true\)/, "socket reconnect cleanup clears queued dubbing");
+assert.doesNotMatch(appSource, /socket\.on\("disconnect",[\s\S]{0,300}?stopDubbingPlayback/, "socket reconnect does not cancel valid dubbing");
 assert.match(appSource, /dubbingLanguageSignature[\s\S]*?stopDubbingPlayback\(true\)/, "language changes clear queued dubbing");
 assert.match(appSource, /void loadSpeechVoices\(\)\.then/, "voices are requested before dubbing jobs are queued");
+assert.match(appSource, /primeSpeechSynthesis\(\)/, "the microphone gesture primes browser speech synthesis");
 assert.match(appSource, /speechSynthesis\.speak\(utterance\)/, "completed translations invoke browser speech playback");
 assert.match(appSource, /Dubbing is unavailable: \$\{unavailableReason\}/, "unsupported automatic dubbing reports an exact reason");
 assert.match(appSource, /EXPECTED_SPEECH_CANCELLATIONS = new Set\(\["interrupted", "canceled", "cancelled"\]\)/, "intentional browser speech cancellations are classified as expected");
@@ -36,10 +37,15 @@ assert.match(appSource, /if \(isExpectedSpeechCancellation\(reason\)\)[\s\S]*?on
 assert.match(appSource, /const createdAt = Date\.now\(\)/, "completed translations are fresh when submitted to speech synthesis");
 assert.doesNotMatch(appSource, /recordingRef\.current = isRecording/, "dubbing UI status cannot reactivate a stopped microphone");
 assert.match(appSource, /recordingRef\.current = true;\s*recorder\.start/, "actual MediaRecorder startup activates the microphone ref");
-assert.match(appSource, /completeListeningSession\(modeRef\.current !== "transcribe"\)/, "a finalized utterance automatically releases microphone capture while preserving pending translation");
-assert.match(appSource, /const speakTranslatedCaption[\s\S]*?stopDubbingPlayback\(true\)/, "manual translated-card replay stops current speech first");
+assert.match(appSource, /cleanupMedia\(\{ preserveTranslationPipeline: true \}\)/, "auto-stop releases capture while preserving the translation pipeline");
+assert.match(appSource, /const speakTranslatedCaption[\s\S]*?stopDubbingPlayback\(false\)/, "manual translated-card replay stops current speech without erasing automatic deduplication");
 assert.match(transcriptAreaSource, /onSpeakTranslation\?\.\(entry\.language, entry\.text\)/, "translated cards replay their own language and text");
+assert.match(appSource, /translationId: `manual-\$\{createdAt\}-\$\{language\}`,[\s\S]*?language,[\s\S]*?text: spokenText/, "Chinese and French card replay retain the selected card language");
 assert.match(transcriptAreaSource, /Speak \$\{entry\.label\} translation/, "translated cards expose an accessible speaker action");
+assert.equal((appSource.match(/const socket = io\(/g) || []).length, 1, "reconnect handling retains one application socket instance");
+assert.match(appSource, /reconnectionAttempts: MAX_SOCKET_RECONNECT_ATTEMPTS/, "socket reconnect uses a bounded attempt count");
+assert.match(appSource, /queuedAudioChunksRef\.current = \[\][\s\S]*?recorder\.pause\(\)/, "disconnect drops dead-session audio and pauses capture before a fresh interpreter session");
+assert.match(appSource, /recorder\?\.state === "paused"[\s\S]*?recorder\.resume\(\)/, "fresh interpreter readiness resumes the existing capture safely");
 
 const plays = [];
 const prepared = [];
@@ -60,10 +66,11 @@ const lifecycle = createDubbingLifecycle({
 assert.equal(lifecycle.enqueue({ translationId: "utterance-1", language: "fr", text: "Bonjour" }), true);
 assert.equal(plays.length, 1, "first utterance dubs");
 assert.equal(lifecycle.enqueue({ translationId: "utterance-2", language: "fr", text: "Bonjour" }), true);
-assert.equal(plays.length, 2, "second TTS is prepared and submitted while the first is playing");
+assert.equal(plays.length, 1, "second TTS waits behind the first playback");
 assert.deepEqual(prepared.slice(0, 2), ["utterance-1", "utterance-2"], "TTS preparation preserves translation order");
 assert.equal(lifecycle.enqueue({ translationId: "utterance-2", language: "fr", text: "Bonjour" }), false, "duplicate socket aliases do not submit TTS twice");
 plays.shift().onEnd();
+assert.equal(plays.length, 1, "the next prepared translation starts after the prior language finishes");
 assert.equal(lifecycle.snapshot().gated, true, "microphone remains gated while prepared speech is queued");
 plays.shift().onEnd();
 assert.equal(lifecycle.snapshot().gated, false, "microphone gating ends after all playback");
@@ -77,8 +84,9 @@ assert.equal(lifecycle.enqueue({ translationId: "stale", language: "fr", text: "
 
 lifecycle.enqueue({ translationId: "utterance-4", language: "fr", text: "Français" });
 lifecycle.enqueue({ translationId: "utterance-4", language: "ru", text: "Русский" });
-assert.equal(plays.length, 2, "target languages maintain independent queues");
+assert.equal(plays.length, 1, "target languages preserve playback order");
 plays.find(({ job }) => job.language === "fr").onError();
+assert.equal(plays.length, 2, "the next target starts after the first target settles");
 assert.equal(lifecycle.snapshot().gated, true, "one target failure does not ungate another active target");
 plays.find(({ job }) => job.language === "ru").onEnd();
 assert.equal(lifecycle.snapshot().gated, false, "all target completion releases gating");
@@ -110,11 +118,10 @@ assert.equal(lifecycle.snapshot().queued, 0);
 assert.equal(lifecycle.snapshot().gated, false);
 plays.length = 0;
 
-lifecycle.enqueue({ translationId: "fresh-then-delayed", language: "zh", text: "延迟", createdAt: 1000 });
-testNow = 1600;
-plays.shift().onStart();
-assert.equal(cancels, 2, "speech that became stale in the browser queue is cancelled before playback");
-assert.equal(lifecycle.snapshot().gated, false, "stale queue cancellation releases microphone gating");
+testNow = 1000;
+lifecycle.enqueue({ translationId: "auto-after-manual", language: "zh", text: "继续", createdAt: 1000 });
+assert.equal(plays.length, 1, "automatic dubbing still starts after a manual cancellation");
+plays.shift().onEnd();
 
 assert.equal(PLAN_CATALOG.pro_lite.monthlyPrice, 3, "Starter is $3 monthly");
 assert.equal(PLAN_CATALOG.creator.monthlyPrice, 7);

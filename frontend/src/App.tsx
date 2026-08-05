@@ -52,7 +52,7 @@ import {
 
 type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin-login" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
-type SessionStatus = "idle" | "connecting" | "calibrating" | "listening" | "speaking" | "soft-pause" | "finalizing" | "dubbing" | "listening-after-dubbing" | "paused" | "stopping" | "error";
+type SessionStatus = "idle" | "connecting" | "calibrating" | "listening" | "speaking" | "soft-pause" | "finalizing" | "draining" | "translating" | "paused" | "stopping" | "error";
 type TranslationLifecycleState = "ready" | "queued" | "processing" | "translating" | "retrying" | "translated" | "done" | "failed" | "stale" | "cancelled";
 type TranslationProviderDiagnostic = {
   language?: string;
@@ -272,6 +272,8 @@ const MIN_MEDIA_CHUNK_BYTES = 96;
 const MIN_AUDIO_CHUNK_INTERVAL_MS = 45;
 const VAD_POLL_INTERVAL_MS = 30;
 const FINAL_CHUNK_ACK_TIMEOUT_MS = 2500;
+const RECORDING_DRAIN_TIMEOUT_MS = 8000;
+const MAX_SOCKET_RECONNECT_ATTEMPTS = 8;
 const CAPTION_WATCHDOG_MS = 12000;
 const MAX_QUEUED_AUDIO_CHUNKS = 240;
 const MAX_PENDING_FINAL_TRANSCRIPTS = 16;
@@ -681,6 +683,13 @@ const loadSpeechVoices = () => {
     window.setTimeout(finish, 1200);
   });
   return speechVoicesReadyPromise;
+};
+
+const primeSpeechSynthesis = () => {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  window.speechSynthesis.getVoices();
+  if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+  void loadSpeechVoices();
 };
 
 const selectSpeechVoice = (language: string) => {
@@ -1410,6 +1419,12 @@ export default function App() {
   const [privateMode, setPrivateMode] = useState(true);
   const [shareableMode, setShareableMode] = useState(false);
   const [status, setStatus] = useState<SessionStatus>("idle");
+  const [microphoneActive, setMicrophoneActive] = useState(false);
+  const [mediaRecorderActive, setMediaRecorderActive] = useState(false);
+  const [awaitingFinalTranscript, setAwaitingFinalTranscript] = useState(false);
+  const [translationsPending, setTranslationsPending] = useState<string[]>([]);
+  const [dubbingPlaying, setDubbingPlaying] = useState(false);
+  const [dubbingQueued, setDubbingQueued] = useState(0);
   const [socketConnected, setSocketConnected] = useState(false);
   const [socketReconnecting, setSocketReconnecting] = useState(false);
   const [originalSegments, setOriginalSegments] = useState<string[]>([]);
@@ -1492,6 +1507,10 @@ export default function App() {
   const audioRecoveryTimerRef = useRef<number | null>(null);
   const audioRestartAttemptsRef = useRef(0);
   const silenceTimerRef = useRef<number | null>(null);
+  const drainTimeoutRef = useRef<number | null>(null);
+  const awaitingFinalTranscriptRef = useRef(false);
+  const drainPendingLanguagesRef = useRef<Set<string>>(new Set());
+  const finishDrainRef = useRef<(reason: "processed" | "timeout") => void>(() => undefined);
   const lastServerHeartbeatAtRef = useRef(0);
   const sessionStartedAtRef = useRef<number | null>(null);
   const lastInterimRef = useRef("");
@@ -1532,12 +1551,12 @@ export default function App() {
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro" || isAdminRole(user?.role);
-  const isRecording = ["connecting", "calibrating", "listening", "speaking", "soft-pause", "finalizing", "paused"].includes(status);
+  const isRecording = microphoneActive || mediaRecorderActive || ["connecting", "calibrating", "draining", "translating"].includes(status);
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
-  const isTranslationActive = mode !== "transcribe" && Object.values(translationStatuses).some((translationState) =>
+  const isTranslationActive = translationsPending.length > 0 || (mode !== "transcribe" && Object.values(translationStatuses).some((translationState) =>
     ["queued", "processing", "translating", "retrying"].includes(translationState as string)
-  );
+  ));
   const connectionState: SocketConnectionState =
     socketReconnecting || (!socketConnected && isRecording)
       ? "reconnecting"
@@ -1564,7 +1583,9 @@ export default function App() {
     [visibleHistory]
   );
   const maxSessionSeconds = config?.maxSessionSeconds || 3600;
-  const statusLabel = status === "stopping"
+  const statusLabel = status === "idle" && (dubbingPlaying || dubbingQueued > 0)
+    ? "Dubbing…"
+    : status === "stopping"
     ? "Stopping"
     : status === "error"
       ? "Attention"
@@ -1574,10 +1595,10 @@ export default function App() {
           ? "Waiting for more speech…"
       : status === "finalizing"
           ? "Finishing caption…"
-        : status === "dubbing"
-          ? "Dubbing…"
-        : status === "listening-after-dubbing"
-          ? "Waiting for more speech…"
+        : status === "draining"
+          ? "Finishing recording…"
+        : status === "translating"
+          ? "Finishing translations…"
           : status === "paused"
             ? "Paused — start speaking"
             : status === "idle"
@@ -1652,14 +1673,12 @@ export default function App() {
       cancel: () => window.speechSynthesis.cancel(),
       onGateChange: (gated: boolean) => {
         dubbingTransmissionGatedRef.current = gated;
-        if (gated) {
-          setStatus("dubbing");
-          setAudioDiagnostic((current) => ({ ...current, message: "Dubbing" }));
-        }
+        setDubbingPlaying(gated);
+        setDubbingQueued(dubbingLifecycleRef.current?.snapshot().queued || 0);
       },
       onIdle: () => {
-        setStatus(recordingRef.current ? "listening-after-dubbing" : "idle");
-        setAudioDiagnostic((current) => ({ ...current, message: recordingRef.current ? "Listening" : "Microphone ready" }));
+        setDubbingPlaying(false);
+        setDubbingQueued(0);
       },
       maxAgeMs: DUBBING_UTTERANCE_TTL_MS
     });
@@ -1676,9 +1695,16 @@ export default function App() {
     void loadSpeechVoices().then(() => {
       if (requestGeneration !== dubbingRequestGenerationRef.current || modeRef.current !== "dubbing") return;
       const createdAt = Date.now();
-      for (const [language, text] of Object.entries(translations)) {
+      const orderedLanguages = [...targetLanguagesRef.current, ...Object.keys(translations).filter((language) => !targetLanguagesRef.current.includes(language))];
+      for (const language of orderedLanguages) {
+        const text = translations[language];
         if (!isVisibleTranslationText(text)) continue;
-        dubbingLifecycleRef.current?.enqueue({ translationId, language, text, createdAt });
+        if (dubbingLifecycleRef.current?.enqueue({ translationId, language, text, createdAt })) {
+          drainPendingLanguagesRef.current.delete(language);
+          setTranslationsPending([...drainPendingLanguagesRef.current]);
+          setDubbingQueued(dubbingLifecycleRef.current.snapshot().queued);
+          if (!awaitingFinalTranscriptRef.current && drainPendingLanguagesRef.current.size === 0) finishDrainRef.current("processed");
+        }
       }
     });
   }, []);
@@ -1686,7 +1712,7 @@ export default function App() {
   const speakTranslatedCaption = useCallback((language: string, text: string) => {
     const spokenText = text.trim();
     if (!spokenText) return;
-    stopDubbingPlayback(true);
+    stopDubbingPlayback(false);
     const unavailableReason = speechSynthesisUnavailableReason();
     if (unavailableReason) {
       setAlert(`Speech playback is unavailable: ${unavailableReason}.`);
@@ -2122,8 +2148,10 @@ export default function App() {
       audioRestartAttemptsRef.current = 0;
     }
     recordingRef.current = false;
+    setMicrophoneActive(false);
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") recorder.stop();
+    setMediaRecorderActive(false);
     mediaRecorderRef.current = null;
     processedStreamRef.current?.getTracks().forEach((track) => track.stop());
     processedStreamRef.current = null;
@@ -2131,8 +2159,10 @@ export default function App() {
     streamRef.current = null;
     void audioContextRef.current?.close().catch(() => undefined);
     audioContextRef.current = null;
-    activeSessionPayloadRef.current = null;
-    shouldRestartSessionOnReconnectRef.current = false;
+    if (!options.preserveTranslationPipeline) {
+      activeSessionPayloadRef.current = null;
+      shouldRestartSessionOnReconnectRef.current = false;
+    }
     sessionStartedAtRef.current = null;
     lastAudioChunkSentAtRef.current = 0;
     if (!options.preserveTranslationPipeline) {
@@ -2158,6 +2188,39 @@ export default function App() {
     }
     pendingPartialTranscriptRef.current = null;
   }, [stopDubbingPlayback, stopSilenceMonitor]);
+
+  const finishDrain = useCallback((reason: "processed" | "timeout") => {
+    if (drainTimeoutRef.current) window.clearTimeout(drainTimeoutRef.current);
+    drainTimeoutRef.current = null;
+    awaitingFinalTranscriptRef.current = false;
+    setAwaitingFinalTranscript(false);
+    drainPendingLanguagesRef.current.clear();
+    setTranslationsPending([]);
+    socketRef.current?.emit("end_session", { reason });
+    activeSessionPayloadRef.current = null;
+    activeBackendSessionIdRef.current = "";
+    activeBackendTranslationJobIdRef.current = "";
+    sessionActionInFlightRef.current = false;
+    setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
+    setStatus("idle");
+  }, []);
+  finishDrainRef.current = finishDrain;
+
+  const beginDrain = useCallback(() => {
+    if (!recordingRef.current || awaitingFinalTranscriptRef.current) return;
+    awaitingFinalTranscriptRef.current = true;
+    setAwaitingFinalTranscript(true);
+    drainPendingLanguagesRef.current = new Set(modeRef.current === "transcribe" ? [] : targetLanguagesRef.current);
+    setTranslationsPending([...drainPendingLanguagesRef.current]);
+    setStatus("draining");
+    setAudioDiagnostic((current) => ({ ...current, state: "ready", message: "Finishing recording" }));
+    const recorder = mediaRecorderRef.current;
+    if (recorder?.state === "recording") {
+      try { recorder.requestData(); } catch { /* MediaRecorder may already be stopping. */ }
+    }
+    cleanupMedia({ preserveTranslationPipeline: true });
+    drainTimeoutRef.current = window.setTimeout(() => finishDrain("timeout"), RECORDING_DRAIN_TIMEOUT_MS);
+  }, [cleanupMedia, finishDrain]);
 
   const scheduleAudioRecovery = useCallback((reason: string) => {
     if (!recordingRef.current || status === "stopping") return;
@@ -2243,6 +2306,12 @@ export default function App() {
     sessionActionInFlightRef.current = true;
     setStatus("stopping");
     cleanupMedia();
+    if (drainTimeoutRef.current) window.clearTimeout(drainTimeoutRef.current);
+    drainTimeoutRef.current = null;
+    awaitingFinalTranscriptRef.current = false;
+    setAwaitingFinalTranscript(false);
+    drainPendingLanguagesRef.current.clear();
+    setTranslationsPending([]);
     socketRef.current?.emit("end_session");
     sessionActionInFlightRef.current = false;
     setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
@@ -2316,7 +2385,7 @@ export default function App() {
       transports: [...SOCKET_TRANSPORTS],
       withCredentials: true,
       reconnection: true,
-      reconnectionAttempts: Infinity,
+      reconnectionAttempts: MAX_SOCKET_RECONNECT_ATTEMPTS,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 10000,
       randomizationFactor: 0.35,
@@ -2357,11 +2426,24 @@ export default function App() {
 
     socket.on("disconnect", () => {
       logFrontendDebug("socket", "SOCKET_DISCONNECTED", { recording: recordingRef.current });
-      stopDubbingPlayback(true);
-      dubbingLifecycleRef.current?.resetSeen();
       stopClientHeartbeat();
       setSocketConnected(false);
       if (recordingRef.current) {
+        // Audio captured for the old backend session must never be replayed
+        // into the fresh interpreter session created after reconnect.
+        queuedAudioChunksRef.current = [];
+        queuedAudioDroppedRef.current = 0;
+        const recorder = mediaRecorderRef.current;
+        if (recorder?.state === "recording") {
+          try {
+            recorder.pause();
+            setMediaRecorderActive(false);
+          } catch (error) {
+            logFrontendDebug("audio", "RECORDER_PAUSE_ON_DISCONNECT_FAILED", {
+              message: error instanceof Error ? error.message : String(error)
+            });
+          }
+        }
         setSocketReconnecting(true);
         shouldRestartSessionOnReconnectRef.current = true;
         setStatus("connecting");
@@ -2431,6 +2513,12 @@ export default function App() {
       if (recorder?.state === "inactive") {
         recordingRef.current = true;
         recorder.start(audioChunkMsRef.current);
+        setMicrophoneActive(true);
+        setMediaRecorderActive(true);
+      } else if (recorder?.state === "paused") {
+        recorder.resume();
+        setMicrophoneActive(true);
+        setMediaRecorderActive(true);
       }
       const previousStartedAt = sessionStartedAtRef.current;
       sessionStartedAtRef.current = stableSessionStartTime(previousStartedAt);
@@ -2531,6 +2619,8 @@ export default function App() {
         subtitleThrottleTimerRef.current = null;
       }
       const pendingTargetLanguages = normalizeTargetLanguages(eventTargetLanguages, eventTargetLang || targetLangRef.current);
+      drainPendingLanguagesRef.current = new Set(modeRef.current === "transcribe" ? [] : pendingTargetLanguages);
+      if (drainPendingLanguagesRef.current.size > 0) setStatus("translating");
       const timestamp = new Date().toISOString();
       const lastTranslationOriginal = lastTranslationOriginalRef.current;
       const normalizedFinalOriginal = originalText.toLowerCase().replace(/\s+/g, " ").trim();
@@ -2578,9 +2668,13 @@ export default function App() {
       if (modeRef.current === "transcribe") {
         forgetPendingFinalTranscript(pendingEntry);
         pendingFinalTranscriptRef.current = null;
+        finishDrain("processed");
+      } else if (awaitingFinalTranscriptRef.current) {
+        awaitingFinalTranscriptRef.current = false;
+        setAwaitingFinalTranscript(false);
+        setStatus("translating");
+        setAudioDiagnostic((current) => ({ ...current, state: "ready", message: "Finishing translations" }));
       }
-
-      completeListeningSession(modeRef.current !== "transcribe");
     });
 
     socket.on("result", (payload: any) => {
@@ -2734,11 +2828,6 @@ export default function App() {
         }
         if (!streamingPreview && jobId) activeBackendTranslationJobIdRef.current = jobId;
       }
-      if (isComplete && !recordingRef.current) {
-        socketRef.current?.emit("end_session");
-        activeBackendSessionIdRef.current = "";
-        activeBackendTranslationJobIdRef.current = "";
-      }
       if (!incomingTranslation || !mergedTranslation) return;
       if (shouldUpdateLiveTranslation && !isComplete && mergedTranslationSignature === lastFinalTranslationRef.current && !hasStatusUpdate) return;
       if (isComplete && completedTranslationSignaturesRef.current.has(completedSignature)) return;
@@ -2764,7 +2853,7 @@ export default function App() {
         lastFinalTranslationRef.current = mergedTranslationSignature;
         finalTranslationsRef.current = mergedTranslations;
         setFinalTranslations(mergedTranslations);
-        if (!streamingPreview) queueDubbingTranslations(translationId, nextTranslations);
+        if (!streamingPreview && isComplete) queueDubbingTranslations(translationId, nextTranslations);
       }
 
       if (isComplete) {
@@ -2792,6 +2881,19 @@ export default function App() {
         if (matchedPendingTranscript && currentPendingTranscript && matchedPendingTranscript.translationId === currentPendingTranscript.translationId) {
           pendingFinalTranscriptRef.current = null;
         }
+        if (modeRef.current !== "dubbing") {
+          for (const language of Object.keys(nextTranslations)) drainPendingLanguagesRef.current.delete(language);
+        }
+        for (const language of failedLanguages || []) drainPendingLanguagesRef.current.delete(language);
+        for (const [language, languageStatus] of Object.entries(nextStatusUpdates)) {
+          if (["failed", "stale", "cancelled"].includes(languageStatus) || (modeRef.current !== "dubbing" && ["translated", "done"].includes(languageStatus))) {
+            drainPendingLanguagesRef.current.delete(language);
+          }
+        }
+        setTranslationsPending([...drainPendingLanguagesRef.current]);
+        if (!recordingRef.current && !awaitingFinalTranscriptRef.current && drainPendingLanguagesRef.current.size === 0) {
+          finishDrain("processed");
+        }
       }
     };
 
@@ -2818,7 +2920,7 @@ export default function App() {
       setSocketConnected(false);
       setSocketReconnecting(false);
     };
-  }, [isAuthed, completeListeningSession, queueDubbingTranslations, updateSocketAuth, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript]);
+  }, [isAuthed, completeListeningSession, finishDrain, queueDubbingTranslations, updateSocketAuth, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript]);
 
   useEffect(() => {
     const reconnectSocket = () => {
@@ -2965,6 +3067,7 @@ export default function App() {
     if (token) await requestApi("/api/auth/logout", { method: "POST" }, token).catch(() => undefined);
 
     clearSessionStorage();
+    stopDubbingPlayback(true);
     setToken(null);
     setUser(null);
     setStatus("idle");
@@ -3007,6 +3110,8 @@ export default function App() {
   const startSession = useCallback(async () => {
     if (sessionActionInFlightRef.current || recordingRef.current) return;
 
+    primeSpeechSynthesis();
+
     if (!isAuthed) {
       navigate("login");
       return;
@@ -3044,7 +3149,6 @@ export default function App() {
     latestTranslationSequenceRef.current = 0;
     finalTranslationsRef.current = {};
     dubbingLifecycleRef.current?.resetSeen();
-    stopDubbingPlayback(true);
     pendingPartialTranscriptRef.current = null;
     if (subtitleThrottleTimerRef.current) {
       window.clearTimeout(subtitleThrottleTimerRef.current);
@@ -3294,18 +3398,7 @@ export default function App() {
         if (action.type === "finalize") {
           setStatus("finalizing");
           setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Finishing caption" }));
-          const requested = utteranceBoundaryRef.current?.request({
-            sequence: sequenceRef.current,
-            capturedAt: Date.now(),
-            speechThreshold: action.speech
-          });
-          if (requested && recorder.state === "recording") {
-            try {
-              recorder.requestData();
-            } catch (error) {
-              logFrontendDebug("audio", "FINAL_CHUNK_REQUEST_DELAYED", { message: error instanceof Error ? error.message : String(error) });
-            }
-          }
+          beginDrain();
         }
       }, VAD_POLL_INTERVAL_MS);
 
@@ -3376,7 +3469,7 @@ export default function App() {
 
       setAlert(message);
     }
-  }, [autoGainControl, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, scheduleAudioRecovery, shareableMode, sourceLang, stopDubbingPlayback, targetLang, targetLanguages, user?.id, user?.plan, status]);
+  }, [autoGainControl, beginDrain, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, scheduleAudioRecovery, shareableMode, sourceLang, targetLang, targetLanguages, user?.id, user?.plan, status]);
 
   useEffect(() => {
     startSessionRef.current = startSession;

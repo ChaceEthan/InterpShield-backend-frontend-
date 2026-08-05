@@ -90,8 +90,8 @@ for (const phrase of ["Thank you", "Murakoze"]) {
   assert.equal(vad.getState(), "speaking");
 }
 
-assert.ok(getDynamicSilenceHoldMs("one word") >= 2800);
-assert.ok(getDynamicSilenceHoldMs("We have enough words to make this complete.", { speechFinal: true }) <= 2400);
+assert.ok(getDynamicSilenceHoldMs("one word") >= 1300 && getDynamicSilenceHoldMs("one word") <= 1750);
+assert.ok(getDynamicSilenceHoldMs("We have enough words to make this complete.", { speechFinal: true }) <= 1500);
 assert.ok(getDynamicSilenceHoldMs("I would like to") > getDynamicSilenceHoldMs("I understand."));
 
 {

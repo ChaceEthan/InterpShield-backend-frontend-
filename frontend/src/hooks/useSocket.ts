@@ -59,13 +59,13 @@ export const useSocket = (options: UseSocketOptions = {}) => {
 
   // Initialize socket
   const initSocket = useCallback(() => {
-    if (!enabled || !url || socketRef.current?.connected) return;
+    if (!enabled || !url || socketRef.current) return;
 
     try {
       socketRef.current = io(url, {
         transports: [...SOCKET_TRANSPORTS],
         reconnection: true,
-        reconnectionAttempts: Infinity,
+        reconnectionAttempts: 8,
         reconnectionDelay: 1000,
         reconnectionDelayMax: 10000,
         timeout: 20000,
@@ -111,7 +111,7 @@ export const useSocket = (options: UseSocketOptions = {}) => {
       });
 
       // Reconnecting
-      socketRef.current.on('reconnect_attempt', () => {
+      socketRef.current.io.on('reconnect_attempt', () => {
         attemptCountRef.current += 1;
         setStatus((prev) => ({
           ...prev,

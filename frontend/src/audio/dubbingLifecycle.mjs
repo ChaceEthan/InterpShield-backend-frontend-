@@ -14,6 +14,8 @@ export const createDubbingLifecycle = ({
   const seen = new Set();
   let gated = false;
   let generation = 0;
+  let activeKey = null;
+  const queue = [];
 
   const updateGate = () => {
     const next = pending.size > 0;
@@ -30,7 +32,25 @@ export const createDubbingLifecycle = ({
     const languageCount = (pendingByLanguage.get(job.language) || 1) - 1;
     if (languageCount > 0) pendingByLanguage.set(job.language, languageCount);
     else pendingByLanguage.delete(job.language);
+    if (activeKey === key) activeKey = null;
     updateGate();
+    playNext();
+  };
+
+  const playNext = () => {
+    if (activeKey || queue.length === 0) return;
+    const key = queue.shift();
+    const item = pending.get(key);
+    if (!item) return playNext();
+    const { job, prepared, queuedGeneration } = item;
+    if (queuedGeneration !== generation || (Number.isFinite(job.createdAt) && now() - job.createdAt > maxAgeMs)) {
+      settle(key, queuedGeneration);
+      return;
+    }
+    activeKey = key;
+    const finish = () => settle(key, queuedGeneration);
+    try { play(prepared, job, () => {}, finish, finish); }
+    catch { seen.delete(key); finish(); }
   };
 
   return {
@@ -48,29 +68,11 @@ export const createDubbingLifecycle = ({
 
       seen.add(key);
       const queuedGeneration = generation;
-      pending.set(key, { job, prepared });
+      pending.set(key, { job, prepared, queuedGeneration });
       pendingByLanguage.set(job.language, (pendingByLanguage.get(job.language) || 0) + 1);
+      queue.push(key);
       updateGate();
-
-      const start = () => {
-        if (queuedGeneration !== generation || !pending.has(key)) return;
-        if (!Number.isFinite(job.createdAt) || now() - job.createdAt <= maxAgeMs) return;
-        generation += 1;
-        cancel?.();
-        pending.clear();
-        pendingByLanguage.clear();
-        updateGate();
-      };
-      const finish = () => settle(key, queuedGeneration);
-      try {
-        // Submit immediately. Browser speech synthesis can prepare this queued
-        // utterance while the preceding utterance is still playing.
-        play(prepared, job, start, finish, finish);
-      } catch {
-        seen.delete(key);
-        finish();
-        return false;
-      }
+      playNext();
       return true;
     },
     stop({ clearQueue = true } = {}) {
@@ -78,6 +80,8 @@ export const createDubbingLifecycle = ({
       if (pending.size > 0) cancel?.();
       pending.clear();
       pendingByLanguage.clear();
+      queue.length = 0;
+      activeKey = null;
       if (clearQueue) seen.clear();
       updateGate();
     },

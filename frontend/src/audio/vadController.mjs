@@ -9,7 +9,7 @@ export const DEFAULT_VAD_CONFIG = Object.freeze({
   preSpeechBufferMs: 900,
   postSpeechBufferMs: 700,
   shortPauseGraceMs: 1500,
-  hardFinalizeMs: 4500,
+  hardFinalizeMs: 1750,
   maximumUtteranceMs: 55000,
   transcriptChangeGraceMs: 650,
   noiseFloorMultiplier: 2.4
@@ -48,13 +48,10 @@ export const analyzeTranscriptCompleteness = (text = "") => {
 
 export const getDynamicSilenceHoldMs = (text = "", signals = {}) => {
   const analysis = analyzeTranscriptCompleteness(text);
-  let hold = analysis.wordCount <= 3 ? 3200 : analysis.wordCount <= 10 ? 2600 : 2300;
-  if (analysis.wordCount > 10 && analysis.punctuated) hold = 2100;
-  if (analysis.punctuated) hold -= 250;
-  if (analysis.incomplete) hold += 700;
-  if (analysis.completeShortPhrase) hold = 1800;
-  if (signals.speechFinal || signals.utteranceEnd) hold -= 200;
-  return clamp(hold, 1800, 3500);
+  let hold = analysis.punctuated || analysis.completeShortPhrase ? 1400 : 1550;
+  if (analysis.incomplete) hold += 200;
+  if (signals.speechFinal || signals.utteranceEnd) hold -= 100;
+  return clamp(hold, 1300, 1750);
 };
 
 /** @param {MediaTrackSupportedConstraints} [supported] @param {string | Record<string, unknown>} [microphoneOrOptions] */

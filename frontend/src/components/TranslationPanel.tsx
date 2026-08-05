@@ -4,7 +4,7 @@ import { MicButton } from "./MicButton";
 import { StatusBar } from "./StatusBar";
 import { TranscriptArea, type TranscriptTranslationEntry } from "./TranscriptArea";
 
-type SessionStatus = "idle" | "connecting" | "calibrating" | "listening" | "speaking" | "soft-pause" | "finalizing" | "dubbing" | "listening-after-dubbing" | "paused" | "stopping" | "error";
+type SessionStatus = "idle" | "connecting" | "calibrating" | "listening" | "speaking" | "soft-pause" | "finalizing" | "draining" | "translating" | "paused" | "stopping" | "error";
 type ToolMode = "transcribe" | "translate" | "dubbing";
 type ConnectionState = "ready" | "connecting" | "connected" | "listening" | "translating" | "reconnecting";
 
