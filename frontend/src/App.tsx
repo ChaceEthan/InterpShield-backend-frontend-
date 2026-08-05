@@ -2840,7 +2840,7 @@ export default function App() {
       });
       const refreshed = await requestApi<{ token?: string; user: AppUser }>("/api/auth/me", {}, session.token);
       const verifiedSession = { token: refreshed.token || session.token, user: refreshed.user };
-      const destination = view === "admin-login" && isAdminRole(refreshed.user.role) ? "admin" : "dashboard";
+      const destination = isAdminRole(refreshed.user.role) ? "admin" : "dashboard";
       applyAuthSession(verifiedSession, destination);
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Authentication failed.");
@@ -2863,7 +2863,10 @@ export default function App() {
         body: JSON.stringify({ credential })
       });
       const refreshed = await requestApi<{ token?: string; user: AppUser }>("/api/auth/me", {}, session.token);
-      applyAuthSession({ token: refreshed.token || session.token, user: refreshed.user });
+      applyAuthSession(
+        { token: refreshed.token || session.token, user: refreshed.user },
+        isAdminRole(refreshed.user.role) ? "admin" : "dashboard"
+      );
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Google sign-in failed.");
     } finally {
@@ -2871,6 +2874,15 @@ export default function App() {
       setAuthProvider(null);
     }
   }, []);
+
+  const handleAdminUnauthorized = useCallback(() => {
+    clearSessionStorage();
+    setToken(null);
+    setUser(null);
+    navigate("admin-login");
+  }, [navigate]);
+
+  const handleAdminForbidden = useCallback(() => navigate("dashboard"), [navigate]);
 
   const logout = async () => {
     if (token) await requestApi("/api/auth/logout", { method: "POST" }, token).catch(() => undefined);
@@ -4030,6 +4042,12 @@ export default function App() {
               <p className="mt-1 text-gray-500">{user?.email}</p>
               <p className="mt-3 w-fit rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-black uppercase tracking-widest text-blue-700">{user?.plan || "free"} plan</p>
             </div>
+            {isAdminRole(user?.role) && (
+              <button onClick={() => navigate("admin")} className="flex w-full items-center justify-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 font-bold text-blue-700 hover:bg-blue-100">
+                <Shield className="h-4 w-4" />
+                Admin Dashboard
+              </button>
+            )}
             <button onClick={() => void logout()} className="flex w-full items-center justify-center gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 font-bold text-red-100 hover:bg-red-500/15">
               <LogOut className="h-4 w-4" />
               Logout
@@ -4049,7 +4067,7 @@ export default function App() {
       {view === "admin-login" && <AdminLogin api={API} error={authError} busy={authProvider === "manual"} onLogin={(email, password) => void handleAuthSubmit({ email, password })} />}
       {view === "dashboard" && isAuthed && renderDashboard()}
       {view === "pricing" && renderPricing()}
-      {view === "admin" && token && isAdminRole(user?.role) && <AdminDashboard api={API} token={token} currentUser={user as any} onLogout={() => void logout()} />}
+      {view === "admin" && token && isAdminRole(user?.role) && <AdminDashboard api={API} token={token} currentUser={user as any} onLogout={() => void logout()} onUnauthorized={handleAdminUnauthorized} onForbidden={handleAdminForbidden} />}
       {view === "history" && isAuthed && renderHistory()}
       {view === "help" && renderHelp()}
       {view === "settings" && isAuthed && renderSettings()}

@@ -9,12 +9,6 @@ const rawFrontendEnv = {
   GOOGLE_CLIENT_ID: import.meta.env.VITE_GOOGLE_CLIENT_ID || ""
 };
 
-console.log({
-  API_URL: import.meta.env.VITE_API_URL,
-  SOCKET_URL: import.meta.env.VITE_SOCKET_URL,
-  WS_URL: import.meta.env.VITE_WS_URL
-});
-
 const placeholderHostPattern = /your-?backend/i;
 const disallowedHostPatterns = [/^your-?backend\.onrender\.com$/i, /^your-?backend-url\.com$/i];
 const localHostPatterns = [new RegExp(`^${["local", "host"].join("")}$`, "i"), /^127(?:\.0){2}\.1$/];

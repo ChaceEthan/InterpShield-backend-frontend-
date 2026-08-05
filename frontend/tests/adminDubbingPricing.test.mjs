@@ -14,10 +14,17 @@ assert.equal(isAdminRole("superadmin"), true);
 assert.equal(isAdminRole("user"), false);
 
 const appSource = fs.readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-const navbarSource = fs.readFileSync(new URL("../src/components/Navbar.tsx", import.meta.url), "utf8");
+const adminDashboardSource = fs.readFileSync(new URL("../src/components/AdminDashboard.tsx", import.meta.url), "utf8");
 assert.match(appSource, /requestApi<\{ token\?: string; user: AppUser \}>\("\/api\/auth\/me"/, "login refreshes the backend profile before routing");
+assert.match(appSource, /const destination = isAdminRole\(refreshed\.user\.role\) \? "admin" : "dashboard"/, "password login routes using the refreshed profile role");
+assert.match(appSource, /isAdminRole\(refreshed\.user\.role\) \? "admin" : "dashboard"\s*\)/, "Google login routes using the refreshed profile role");
 assert.match(appSource, /view === "admin" && token && isAdminRole\(user\?\.role\)/, "admin rendering requires a verified admin role");
-assert.match(navbarSource, /isAdminRole\(user\?\.role\).*onNavigate\("admin"\)/, "admin control is role-gated");
+assert.match(appSource, /isAdminRole\(user\?\.role\)[\s\S]*Admin Dashboard/, "the account panel exposes an admin-only dashboard control");
+assert.match(adminDashboardSource, /Loading administration…/, "admin APIs have a visible loading state");
+assert.match(adminDashboardSource, /e\.status === 401\) onUnauthorized/, "admin API authentication failures are handled");
+assert.match(adminDashboardSource, /e\.status === 403\) onForbidden/, "admin API authorization failures are handled");
+assert.match(adminDashboardSource, /Promote to admin/, "super admins receive a clear promotion action");
+assert.match(adminDashboardSource, /Remove admin role/, "super admins receive a clear role-removal action");
 
 const plays = [];
 const gates = [];

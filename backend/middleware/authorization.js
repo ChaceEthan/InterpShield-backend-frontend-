@@ -19,3 +19,13 @@ export const canManageUser = (actor, target) => {
   if (target?.role === "super_admin" && actor.role !== "super_admin") return false;
   return true;
 };
+
+/**
+ * @param {{role?: string}|null|undefined} actor
+ * @param {{role?: string}|null|undefined} target
+ * @param {string} nextRole
+ */
+export const canChangeUserRole = (actor, target, nextRole) =>
+  actor?.role === "super_admin" &&
+  target?.role !== "super_admin" &&
+  ["user", "admin"].includes(nextRole);

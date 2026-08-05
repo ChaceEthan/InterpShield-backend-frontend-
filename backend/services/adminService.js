@@ -4,7 +4,7 @@ import AuditLog from "../models/AuditLog.js";
 import History from "../models/History.js";
 import User from "../models/User.js";
 import { httpError, safeUser } from "./authService.js";
-import { canManageUser } from "../middleware/authorization.js";
+import { canChangeUserRole, canManageUser } from "../middleware/authorization.js";
 
 /** @typedef {{id: string, role: string}} AdminActor */
 /** @typedef {{search?: unknown, role?: unknown, status?: unknown, plan?: unknown, limit?: unknown}} AdminUserQuery */
@@ -165,10 +165,9 @@ export const resetUserUsage = async ({ actor, targetId, reason, ip }) => {
 /** @param {RoleAction} action */
 export const updateUserRole = async ({ actor, targetId, role, reason, ip }) => {
   if (!ADMIN_ROLES.includes(actor.role)) throw httpError("Access denied.", 403);
-  if (actor.role !== "super_admin" || !["user", "admin"].includes(role)) throw httpError("Super admin access required.", 403);
   const target = await User.findById(targetId);
   if (!target) throw httpError("User not found.", 404);
-  if (target.role === "super_admin") throw httpError("A super admin role cannot be modified here.", 403);
+  if (!canChangeUserRole(actor, target, role)) throw httpError("Super admin access required.", 403);
   const cleanReason = requireReason(reason); target.role = role; await target.save();
   await writeAuditLog({ adminUserId: actor.id, targetUserId: targetId, action: "role_changed", reason: cleanReason, metadata: { role }, ip });
   return adminUserView(target);

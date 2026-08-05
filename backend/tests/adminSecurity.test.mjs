@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import bcrypt from "bcrypt";
 import User from "../models/User.js";
-import { canManageUser, isAccountActive, requireAdmin, requireSuperAdmin } from "../middleware/authorization.js";
+import { canChangeUserRole, canManageUser, isAccountActive, requireAdmin, requireSuperAdmin } from "../middleware/authorization.js";
 import { hashPassword, safeUser, verifyPassword } from "../services/authService.js";
 import { canUseDubbing, checkFeatureAccess, checkMinuteAllowance, hasUnlimitedAccess } from "../utils/featureGating.js";
 import { canMakeTranslationRequest } from "../utils/monetizationUtils.js";
@@ -17,6 +17,11 @@ assert.equal(runMiddleware(requireSuperAdmin, { role: "admin" }).status, 403, "n
 assert.equal(runMiddleware(requireSuperAdmin, { role: "super_admin" }).next, true, "super admins can manage roles");
 assert.equal(canManageUser({ role: "admin" }, { role: "super_admin" }), false, "admins cannot modify super admins");
 assert.equal(canManageUser({ role: "super_admin" }, { role: "admin" }), true);
+assert.equal(canChangeUserRole({ role: "super_admin" }, { role: "user" }, "admin"), true, "super admins can promote users to admin");
+assert.equal(canChangeUserRole({ role: "super_admin" }, { role: "admin" }, "user"), true, "super admins can remove an admin role");
+assert.equal(canChangeUserRole({ role: "admin" }, { role: "user" }, "admin"), false, "normal admins cannot change roles");
+assert.equal(canChangeUserRole({ role: "super_admin" }, { role: "super_admin" }, "user"), false, "the super-admin account cannot be demoted");
+assert.equal(canChangeUserRole({ role: "super_admin" }, { role: "user" }, "super_admin"), false, "dashboard role changes cannot create extra super admins");
 
 for (const role of ["admin", "super_admin"]) {
   const user = { role, plan: "free", dailyUsageMinutes: 999999, credits: 0 };
@@ -37,12 +42,15 @@ const hash = await hashPassword(plaintext);
 assert.notEqual(hash, plaintext); assert.equal(await bcrypt.compare(plaintext, hash), true); assert.equal(await verifyPassword(plaintext, hash), true);
 const safe = safeUser({ _id: "1", name: "Admin", email: "admin@example.test", password: hash, role: "super_admin", status: "active", plan: "free" });
 assert.equal(Object.hasOwn(safe, "password"), false, "passwords are never returned by APIs");
+assert.equal(safe.role, "super_admin", "login-safe users retain the database role");
+assert.equal(safe.status, "active", "login-safe users retain the database status");
 assert.equal(User.schema.path("password").options.select, false, "password remains excluded by default");
 
-const navbar = fs.readFileSync(new URL("../../frontend/src/components/Navbar.tsx", import.meta.url), "utf8");
-assert.match(navbar, /isAdminRole\(user\?\.role\).*onNavigate\("admin"\)/, "admin route is conditionally exposed only to admins");
 const app = fs.readFileSync(new URL("../../frontend/src/App.tsx", import.meta.url), "utf8");
 assert.match(app, /view === "admin" && token && isAdminRole\(user\?\.role\)/, "direct admin rendering requires an authenticated admin role");
+assert.match(app, /isAdminRole\(user\?\.role\)[\s\S]*Admin Dashboard/, "admin control is conditionally exposed only to admins");
+const authRoutes = fs.readFileSync(new URL("../routes/auth.js", import.meta.url), "utf8");
+assert.match(authRoutes, /router\.get\("\/me", requireAuth\(env\), \(req, res\) => \{\s*res\.json\(\{ user: req\.user/, "profile reload returns the authenticated database user");
 const adminService = fs.readFileSync(new URL("../services/adminService.js", import.meta.url), "utf8");
 assert.match(adminService, /action: status === "active" \? "user_reactivated" : `user_\$\{status\}`/, "suspension and reactivation create audit logs");
 assert.match(adminService, /action: "plan_changed"/, "plan changes create audit logs");
