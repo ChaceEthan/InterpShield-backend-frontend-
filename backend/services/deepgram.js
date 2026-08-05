@@ -204,6 +204,7 @@ export const createDeepgramSession = ({
 
       try {
         sendToDeepgram(buffer);
+        console.info("[DEEPGRAM_AUDIO_SENT]", { sequence: null, bytes: buffer.length, socketGeneration: connectionGeneration, buffered: true });
         rememberRecentAudio(buffer);
         health.sentChunks += 1;
         health.lastAudioSentAt = Date.now();
@@ -376,7 +377,9 @@ export const createDeepgramSession = ({
       reconnectAttempt = 0;
       terminalFailureEmitted = false;
       updateQueueHealth();
+      console.info("[DEEPGRAM_MESSAGE_RECEIVED]", { type: message?.type || "unknown", socketGeneration: generation, hasTranscript: Boolean(message?.channel?.alternatives?.[0]?.transcript) });
       if (message?.type === "SpeechStarted" || message?.type === "UtteranceEnd") {
+        if (message.type === "UtteranceEnd") console.info("[DEEPGRAM_UTTERANCE_END]", { socketGeneration: generation });
         onSpeechSignal?.({
           type: message.type === "SpeechStarted" ? "speech_started" : "utterance_end",
           at: Date.now()
@@ -393,6 +396,8 @@ export const createDeepgramSession = ({
       if (!transcript) {
         return;
       }
+
+      console.info(message.is_final ? "[DEEPGRAM_FINAL_TRANSCRIPT]" : "[DEEPGRAM_PARTIAL_TRANSCRIPT]", { socketGeneration: generation, chars: transcript.length, speechFinal: Boolean(message.speech_final) });
 
       if (process.env.NODE_ENV !== "production") {
         console.debug(message.is_final ? "[DEEPGRAM_FINAL_RECEIVED]" : "[DEEPGRAM_INTERIM_RECEIVED]", {
@@ -452,7 +457,7 @@ export const createDeepgramSession = ({
     }
   };
 
-  const sendAudio = (buffer, { streamGeneration = connectionGeneration, containerHeader = false } = {}) => {
+  const sendAudio = (buffer, { streamGeneration = connectionGeneration, containerHeader = false, sequence = null } = {}) => {
     if (!buffer?.length) return;
 
     const incomingGeneration = Number(streamGeneration);
@@ -480,6 +485,7 @@ export const createDeepgramSession = ({
 
     try {
       sendToDeepgram(buffer);
+      console.info("[DEEPGRAM_AUDIO_SENT]", { sequence, bytes: buffer.length, socketGeneration: connectionGeneration, buffered: false });
       if (process.env.NODE_ENV !== "production" && (health.sentChunks === 0 || health.sentChunks % 25 === 0)) {
         console.debug("[DEEPGRAM_AUDIO_SENT]", { bytes: buffer.length, sentChunks: health.sentChunks + 1 });
       }
@@ -500,6 +506,15 @@ export const createDeepgramSession = ({
   const completeUtterance = () => {
     recentAudio.length = 0;
     updateQueueHealth();
+    if (isOpen && isConnectionOpen(connection)) {
+      try {
+        if (connection?.sendFinalize) connection.sendFinalize({ type: "Finalize" });
+        else connection?.socket?.send?.(JSON.stringify({ type: "Finalize" }));
+        console.info("[DEEPGRAM_UTTERANCE_FINALIZE_REQUESTED]", { socketGeneration: connectionGeneration });
+      } catch (error) {
+        health.lastError = error?.message || String(error);
+      }
+    }
   };
 
   const stop = () => {

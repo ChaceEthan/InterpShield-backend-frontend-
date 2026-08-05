@@ -109,6 +109,16 @@ duplicateGuard.start(0);
 duplicateGuard.update(0, 1);
 assert.equal(duplicateGuard.update(0, 2), null, "calibration transition is emitted once");
 
+{
+  const desktopLowVolume = createVadController({ calibrationMs: 0 });
+  desktopLowVolume.start(0);
+  desktopLowVolume.update(0.001, 1);
+  assert.equal(desktopLowVolume.update(0.008, 100)?.type, "speech_candidate");
+  assert.equal(desktopLowVolume.update(0.008, 350)?.type, "speech_started", "calibrated low-volume desktop speech must cross the adaptive threshold");
+  assert.equal(desktopLowVolume.update(0.004, 700), null, "normal low-volume speech must not be classified as silence");
+  assert.equal(desktopLowVolume.getState(), "speaking");
+}
+
 const recorder = {
   state: "paused",
   instances: 1,

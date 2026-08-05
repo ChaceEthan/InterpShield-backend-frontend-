@@ -1,8 +1,8 @@
 export const DEFAULT_VAD_CONFIG = Object.freeze({
   autoFinalize: true,
   calibrationMs: 1000,
-  speechThreshold: 0.014,
-  silenceThreshold: 0.009,
+  speechThreshold: 0.006,
+  silenceThreshold: 0.0035,
   minimumSpeechMs: 220,
   minimumUtteranceMs: 1000,
   speechHangoverMs: 550,

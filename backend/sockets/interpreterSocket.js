@@ -823,6 +823,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
         const audioBuffer = audioPayloadToBuffer(payload);
         if (audioBuffer.length < 64) return;
+        console.info("[BACKEND_AUDIO_RECEIVED]", { sequence, bytes: audioBuffer.length, sessionId: session.sessionId, streamGeneration });
 
         const processedAudio = payload.containerHeader
           ? { accepted: true, buffer: audioBuffer }
@@ -846,13 +847,16 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           if (process.env.NODE_ENV !== "production") {
             console.debug("[AUDIO_CHUNK_REJECTED]", { sequence, reason: processedAudio.reason });
           }
+          console.info("[AUDIO_CHUNK_DROPPED]", { sequence, bytes: audioBuffer.length, sessionId: session.sessionId, reason: processedAudio.reason, audioLevel: Number(payload?.audioLevel) });
           return;
         }
 
         session.sendAudio(processedAudio.buffer, {
           streamGeneration,
-          containerHeader: Boolean(payload.containerHeader)
+          containerHeader: Boolean(payload.containerHeader),
+          sequence
         });
+        console.info("[AUDIO_CHUNK_ACCEPTED]", { sequence, bytes: processedAudio.buffer.length, sessionId: session.sessionId, streamGeneration, audioLevel: Number(payload?.audioLevel) });
         if (process.env.NODE_ENV !== "production" && (sequence === 1 || sequence % 25 === 0)) {
           console.debug("[AUDIO_CHUNK_ACCEPTED]", { sessionId: session.sessionId, sequence, streamGeneration, bytes: processedAudio.buffer.length, mimeType: payload.mimeType, containerHeader: Boolean(payload.containerHeader), signature: processedAudio.buffer.subarray(0, 16).toString("hex") });
         }

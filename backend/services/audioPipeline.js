@@ -93,6 +93,7 @@ export const createAudioPipelineSession = ({
   let acceptedChunks = 0;
   let droppedChunks = 0;
   const translatedSpeechQueue = [];
+  const containerAudio = /audio\/(?:webm|ogg)/i.test(mimeType);
 
   const metadata = {
     sessionId,
@@ -124,7 +125,9 @@ export const createAudioPipelineSession = ({
       buffer.length < MIN_AUDIO_CHUNK_BYTES &&
       silenceConfidence > 0.995;
     const duplicateSpam = duplicateHashCount >= DUPLICATE_HASH_WINDOW && silenceConfidence > 0.995;
-    const sustainedSilence = Number.isFinite(audioLevel) && audioLevel < 0.008 && silenceConfidence > 0.88;
+    // Encoded WebM/Ogg chunks must remain continuous. Browser RMS values are
+    // diagnostic only and are not comparable across desktop and Android.
+    const sustainedSilence = !containerAudio && Number.isFinite(audioLevel) && audioLevel < 0.008 && silenceConfidence > 0.88;
     consecutiveSilentChunks = sustainedSilence ? consecutiveSilentChunks + 1 : 0;
     const silentRun = consecutiveSilentChunks > 2;
 

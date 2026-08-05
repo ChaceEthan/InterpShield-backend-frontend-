@@ -3699,6 +3699,7 @@ export const createInterpreterSession = async ({
       chars: translationInput.length,
       text: sentence
     });
+    console.info("[TRANSLATION_STARTED]", { sessionId, jobId, sequence: jobSequence, chars: translationInput.length, targetLanguages: direction.targets });
 
     enqueueTranslationJob(job);
 

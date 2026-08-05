@@ -50,6 +50,7 @@ class FakeDeepgramConnection extends EventEmitter {
   }
 
   sendKeepAlive() {}
+  sendFinalize() { this.finalizeRequests = (this.finalizeRequests || 0) + 1; }
   sendCloseStream() {}
 
   close() {
@@ -138,7 +139,7 @@ const createFakeClientFactory = (options = {}) => {
 }
 
 {
-  const pipeline = createAudioPipelineSession({ sessionId: "vad-silence-test" });
+  const pipeline = createAudioPipelineSession({ sessionId: "vad-silence-test", mimeType: "audio/pcm" });
   const speech = pipeline.preprocessAudioChunk(Buffer.alloc(256, 23), { sequence: 1, audioLevel: 0.08, receivedAt: 1000 });
   assert.equal(speech.accepted, true, "spoken audio must be accepted even after client-side gating");
   pipeline.preprocessAudioChunk(Buffer.alloc(256, 0), { sequence: 2, audioLevel: 0.001, receivedAt: 1700 });
@@ -150,12 +151,22 @@ const createFakeClientFactory = (options = {}) => {
 }
 
 {
+  const pipeline = createAudioPipelineSession({ sessionId: "desktop-low-volume", mimeType: "audio/webm;codecs=opus" });
+  for (let sequence = 1; sequence <= 12; sequence += 1) {
+    const result = pipeline.preprocessAudioChunk(Buffer.alloc(256, sequence), { sequence, audioLevel: 0.0025, receivedAt: sequence * 700 });
+    assert.equal(result.accepted, true, `desktop container chunk ${sequence} must not be dropped because browser RMS is low`);
+  }
+  assert.equal(pipeline.getSnapshot().acceptedChunks, 12, "multiple low-volume desktop chunks must remain continuous");
+}
+
+{
   const factory = createFakeClientFactory();
   const session = createDeepgramSession({ apiKey: "test-key", sourceLang: "en", clientFactory: factory });
   await session.start();
   await wait(10);
   session.sendAudio(Buffer.alloc(128, 31));
   session.completeUtterance();
+  assert.equal(factory.connections[0].finalizeRequests, 1, "sustained silence must explicitly request Deepgram utterance finalization");
   factory.connections[0].close();
   session.sendAudio(Buffer.alloc(128, 32));
   assert.equal(session.getHealth().queuedChunks, 1, "completed utterance overlap must not be queued for reconnect replay");
