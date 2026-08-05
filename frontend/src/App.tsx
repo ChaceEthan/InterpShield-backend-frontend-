@@ -272,7 +272,6 @@ const MAX_QUEUED_AUDIO_CHUNKS = 240;
 const MAX_PENDING_FINAL_TRANSCRIPTS = 16;
 const CLIENT_HEARTBEAT_MS = 25000;
 const AUTH_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const DUBBING_QUEUE_SETTLE_MS = 180;
 const STALE_TRANSLATION_STATE_MS = 45000;
 const SOCKET_HEARTBEAT_STALE_MS = 75000;
 const MAX_AUDIO_RECOVERY_ATTEMPTS = 2;
@@ -1504,8 +1503,8 @@ export default function App() {
   const historyPersistTimerRef = useRef<number | null>(null);
   const conversationHistoryRef = useRef<HTMLDivElement | null>(null);
   const historyEndRef = useRef<HTMLDivElement | null>(null);
-  const dubbingQueueRef = useRef<DubbingQueueItem[]>([]);
-  const dubbingSpeakingRef = useRef(false);
+  const dubbingQueuesRef = useRef<Record<string, DubbingQueueItem[]>>({});
+  const dubbingActiveLanguagesRef = useRef<Set<string>>(new Set());
   const dubbingTransmissionGatedRef = useRef(false);
   const activeDubbingUtteranceIdRef = useRef("");
   const activeDubbingLanguageRef = useRef("");
@@ -1605,33 +1604,23 @@ export default function App() {
 
   const stopDubbingPlayback = useCallback((clearQueue = true) => {
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
-    if (clearQueue) dubbingQueueRef.current = [];
-    dubbingSpeakingRef.current = false;
+    if (clearQueue) dubbingQueuesRef.current = {};
+    dubbingActiveLanguagesRef.current.clear();
     dubbingTransmissionGatedRef.current = false;
     activeDubbingUtteranceIdRef.current = "";
     activeDubbingLanguageRef.current = "";
   }, []);
 
-  const playNextDubbingUtterance = useCallback(() => {
-    if (!("speechSynthesis" in window) || dubbingSpeakingRef.current) return;
+  const playNextDubbingUtterance = useCallback((language: string) => {
+    if (!("speechSynthesis" in window) || dubbingActiveLanguagesRef.current.has(language)) return;
 
     const now = Date.now();
-    dubbingQueueRef.current = dubbingQueueRef.current
+    const queue = (dubbingQueuesRef.current[language] || [])
       .filter((item) => now - item.createdAt <= DUBBING_UTTERANCE_TTL_MS)
       .slice(-MAX_DUBBING_QUEUE_ITEMS);
-
-    if (!dubbingSpeakingRef.current && (window.speechSynthesis.speaking || window.speechSynthesis.pending)) {
-      window.speechSynthesis.cancel();
-    }
-
-    const nextUtterance = dubbingQueueRef.current.shift();
+    dubbingQueuesRef.current[language] = queue;
+    const nextUtterance = queue.shift();
     if (!nextUtterance) {
-      dubbingTransmissionGatedRef.current = false;
-      if (recordingRef.current) {
-        vadControllerRef.current.markPaused();
-        setStatus("listening-after-dubbing");
-        setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
-      }
       return;
     }
 
@@ -1643,7 +1632,7 @@ export default function App() {
     const utteranceId = `${nextUtterance.translationId}:${nextUtterance.language}:${nextUtterance.createdAt}`;
     activeDubbingUtteranceIdRef.current = utteranceId;
     activeDubbingLanguageRef.current = nextUtterance.language;
-    dubbingSpeakingRef.current = true;
+    dubbingActiveLanguagesRef.current.add(language);
 
     let settled = false;
     const finish = () => {
@@ -1653,9 +1642,10 @@ export default function App() {
         activeDubbingUtteranceIdRef.current = "";
         activeDubbingLanguageRef.current = "";
       }
-      dubbingSpeakingRef.current = false;
+      dubbingActiveLanguagesRef.current.delete(language);
+      if (dubbingActiveLanguagesRef.current.size === 0) dubbingTransmissionGatedRef.current = false;
       const pauseMs = /[.!?]$/.test(nextUtterance.text.trim()) ? 220 : 360;
-      window.setTimeout(() => playNextDubbingUtterance(), pauseMs);
+      window.setTimeout(() => playNextDubbingUtterance(language), pauseMs);
     };
 
     utterance.onstart = () => {
@@ -1674,6 +1664,22 @@ export default function App() {
       finish();
     }
   }, []);
+
+  const queueDubbingTranslations = useCallback((translationId: string, translations: Record<string, string>) => {
+    if (modeRef.current !== "dubbing" || !("speechSynthesis" in window)) return;
+    const now = Date.now();
+    for (const [language, text] of Object.entries(translations)) {
+      if (!isVisibleTranslationText(text)) continue;
+      const dubbingKey = `${translationId}:${language}:${text}`;
+      if (spokenDubbingKeysRef.current.has(dubbingKey)) continue;
+      spokenDubbingKeysRef.current.add(dubbingKey);
+      const queue = dubbingQueuesRef.current[language] || [];
+      queue.push({ translationId, language, text, createdAt: now });
+      dubbingQueuesRef.current[language] = queue.slice(-MAX_DUBBING_QUEUE_ITEMS);
+      playNextDubbingUtterance(language);
+    }
+    spokenDubbingKeysRef.current = compactSetToLimit(spokenDubbingKeysRef.current, MAX_SPOKEN_DUBBING_KEYS);
+  }, [playNextDubbingUtterance]);
 
   const navigate = useCallback(
     (nextView: View) => {
@@ -2071,7 +2077,7 @@ export default function App() {
     }
   }, []);
 
-  const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean } = {}) => {
+  const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean; preserveTranslationPipeline?: boolean } = {}) => {
     if (vadPollTimerRef.current) {
       window.clearInterval(vadPollTimerRef.current);
       vadPollTimerRef.current = null;
@@ -2104,16 +2110,18 @@ export default function App() {
     shouldRestartSessionOnReconnectRef.current = false;
     sessionStartedAtRef.current = null;
     lastAudioChunkSentAtRef.current = 0;
-    stopDubbingPlayback(true);
-    activeDubbingUtteranceIdRef.current = "";
-    activeDubbingLanguageRef.current = "";
-    lastTranslationOriginalRef.current = "";
-    activeBackendSessionIdRef.current = "";
-    activeBackendTranslationJobIdRef.current = "";
-    latestTranslationSequenceRef.current = 0;
-    completedTranslationSignaturesRef.current.clear();
-    pendingFinalTranscriptRef.current = null;
-    pendingFinalTranscriptsRef.current.clear();
+    if (!options.preserveTranslationPipeline) {
+      stopDubbingPlayback(true);
+      activeDubbingUtteranceIdRef.current = "";
+      activeDubbingLanguageRef.current = "";
+      lastTranslationOriginalRef.current = "";
+      activeBackendSessionIdRef.current = "";
+      activeBackendTranslationJobIdRef.current = "";
+      latestTranslationSequenceRef.current = 0;
+      completedTranslationSignaturesRef.current.clear();
+      pendingFinalTranscriptRef.current = null;
+      pendingFinalTranscriptsRef.current.clear();
+    }
     queuedAudioChunksRef.current = [];
     queuedAudioDroppedRef.current = 0;
     stopSilenceMonitor();
@@ -2217,6 +2225,14 @@ export default function App() {
     setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
     setStatus("idle");
   }, [cleanupMedia, status]);
+
+  const completeListeningSession = useCallback((translationsPending: boolean) => {
+    if (!recordingRef.current) return;
+    cleanupMedia({ preserveTranslationPipeline: translationsPending });
+    if (!translationsPending) socketRef.current?.emit("end_session");
+    setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
+    setStatus("idle");
+  }, [cleanupMedia]);
 
   useEffect(() => {
     if (!isAuthed || !tokenRef.current) return undefined;
@@ -2480,7 +2496,6 @@ export default function App() {
 
       lastInterimRef.current = "";
       lastFinalOriginalRef.current = originalText;
-      if (modeRef.current === "dubbing") stopDubbingPlayback(true);
       pendingPartialTranscriptRef.current = null;
       if (subtitleThrottleTimerRef.current) {
         window.clearTimeout(subtitleThrottleTimerRef.current);
@@ -2520,7 +2535,6 @@ export default function App() {
       }
       updateTranslationStatuses(Object.fromEntries(pendingTargetLanguages.map((language) => [language, "queued"])));
       spokenDubbingKeysRef.current = compactSetToLimit(spokenDubbingKeysRef.current, MAX_SPOKEN_DUBBING_KEYS);
-      dubbingQueueRef.current = dubbingQueueRef.current.slice(-Math.ceil(MAX_DUBBING_QUEUE_ITEMS / 2));
       setInterimOriginal("");
       setLiveText("");
       setFinalText((current) => appendTextWindow(current, originalText));
@@ -2538,7 +2552,7 @@ export default function App() {
         pendingFinalTranscriptRef.current = null;
       }
 
-      setStatus("listening");
+      completeListeningSession(modeRef.current !== "transcribe");
     });
 
     socket.on("result", (payload: any) => {
@@ -2692,6 +2706,11 @@ export default function App() {
         }
         if (!streamingPreview && jobId) activeBackendTranslationJobIdRef.current = jobId;
       }
+      if (isComplete && !recordingRef.current) {
+        socketRef.current?.emit("end_session");
+        activeBackendSessionIdRef.current = "";
+        activeBackendTranslationJobIdRef.current = "";
+      }
       if (!incomingTranslation || !mergedTranslation) return;
       if (shouldUpdateLiveTranslation && !isComplete && mergedTranslationSignature === lastFinalTranslationRef.current && !hasStatusUpdate) return;
       if (isComplete && completedTranslationSignaturesRef.current.has(completedSignature)) return;
@@ -2717,6 +2736,7 @@ export default function App() {
         lastFinalTranslationRef.current = mergedTranslationSignature;
         finalTranslationsRef.current = mergedTranslations;
         setFinalTranslations(mergedTranslations);
+        if (!streamingPreview) queueDubbingTranslations(translationId, nextTranslations);
       }
 
       if (isComplete) {
@@ -2770,7 +2790,7 @@ export default function App() {
       setSocketConnected(false);
       setSocketReconnecting(false);
     };
-  }, [isAuthed, stopDubbingPlayback, updateSocketAuth, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript]);
+  }, [isAuthed, completeListeningSession, queueDubbingTranslations, updateSocketAuth, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript]);
 
   useEffect(() => {
     const reconnectSocket = () => {
@@ -2825,40 +2845,11 @@ export default function App() {
   }, [translationStatuses, updateTranslationStatuses]);
 
   useEffect(() => {
-    if (!("speechSynthesis" in window)) return;
-
-    if (mode !== "dubbing") {
-      stopDubbingPlayback(true);
-      lastDubbingTextRef.current = "";
-      spokenDubbingKeysRef.current.clear();
-      return;
-    }
-
-    const entries = orderedTranslationEntries(finalTranslations, targetLanguages).filter(([, translatedText]) => isVisibleTranslationText(translatedText));
-    if (entries.length === 0) return;
-
-    const translationId = activeTranslationIdRef.current || "current";
-    if (!lastCompletedTranslationRef.current.startsWith(`${translationId}|`)) return;
-    const now = Date.now();
-    dubbingQueueRef.current = dubbingQueueRef.current
-      .filter((item) => item.translationId === translationId || now - item.createdAt <= DUBBING_UTTERANCE_TTL_MS)
-      .slice(-MAX_DUBBING_QUEUE_ITEMS);
-
-    for (const [language, translatedText] of entries) {
-      const dubbingKey = `${translationId}:${language}:${translatedText}`;
-      if (spokenDubbingKeysRef.current.has(dubbingKey)) continue;
-      if (dubbingQueueRef.current.some((item) => item.language === language && item.text === translatedText)) continue;
-      spokenDubbingKeysRef.current.add(dubbingKey);
-      dubbingQueueRef.current.push({ translationId, language, text: translatedText, createdAt: now });
-    }
-
-    spokenDubbingKeysRef.current = compactSetToLimit(spokenDubbingKeysRef.current, MAX_SPOKEN_DUBBING_KEYS);
-    dubbingQueueRef.current = dubbingQueueRef.current.slice(-MAX_DUBBING_QUEUE_ITEMS);
-    const nextTextSignature = entries.map(([language, translatedText]) => `${language}:${translatedText}`).join("|");
-    if (nextTextSignature === lastDubbingTextRef.current) return;
-    lastDubbingTextRef.current = nextTextSignature;
-    window.setTimeout(() => playNextDubbingUtterance(), DUBBING_QUEUE_SETTLE_MS);
-  }, [mode, finalTranslations, targetLanguages, playNextDubbingUtterance, stopDubbingPlayback]);
+    if (mode === "dubbing") return;
+    stopDubbingPlayback(true);
+    lastDubbingTextRef.current = "";
+    spokenDubbingKeysRef.current.clear();
+  }, [mode, stopDubbingPlayback]);
 
   const applyAuthSession = (session: { token: string; user: AppUser }) => {
     tokenRef.current = session.token;
