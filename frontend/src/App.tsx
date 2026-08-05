@@ -39,6 +39,9 @@ import { AdminDashboard, AdminLogin } from "./components/AdminDashboard";
 import type { TranscriptTranslationEntry } from "./components/TranscriptArea";
 import { buildProductionAudioConstraints, createVadController, DEFAULT_VAD_CONFIG } from "./audio/vadController.mjs";
 import { createUtteranceBoundaryController, stableSessionStartTime } from "./audio/recorderLifecycle.mjs";
+import { createDubbingLifecycle } from "./audio/dubbingLifecycle.mjs";
+import { isAdminRole, normalizeAuthUser } from "./auth/roles.mjs";
+import { PLAN_CATALOG, PRICING_PLAN_IDS, yearlyMonthlyPrice } from "../../shared/plans.mjs";
 import {
   LANGUAGE_CATALOG,
   LANGUAGE_FLAGS,
@@ -392,39 +395,10 @@ const TOOL_ITEMS: Array<{ mode: Mode; label: string; icon: LucideIcon }> = [
   { mode: "dubbing", label: "Dubbing", icon: Volume2 }
 ];
 
-const PRICING_PLANS = [
-  {
-    name: "FREE",
-    monthly: 0,
-    features: ["10 mins captions/month", "3 mins translation/month", "No dubbing", "Session history", "Watermarked output", "AI Summary: Off"]
-  },
-  {
-    name: "STARTER",
-    monthly: 3,
-    features: ["60 mins captions", "15 mins translation", "Session history", "No dubbing"]
-  },
-  {
-    name: "BASIC",
-    monthly: 5,
-    features: ["180 mins captions", "45 mins translation", "15 mins dubbing", "AI Summary", "Transcript export"]
-  },
-  {
-    name: "STANDARD",
-    monthly: 8,
-    features: ["360 mins captions", "90 mins translation", "30 mins dubbing", "AI Summary", "Transcript export"]
-  },
-  {
-    name: "PRO",
-    monthly: 10,
-    highlighted: true,
-    features: ["720 mins captions", "180 mins translation", "60 mins dubbing", "AI Summary", "Transcript export", "Session sharing", "Priority processing"]
-  },
-  {
-    name: "PREMIUM",
-    monthly: 25,
-    features: ["2400 mins captions", "600 mins translation", "240 mins dubbing", "AI Summary", "Transcript export", "Session sharing", "Glossary", "Priority processing", "Premium support"]
-  }
-];
+const PRICING_PLANS = PRICING_PLAN_IDS.map((planId) => ({
+  ...PLAN_CATALOG[planId],
+  highlighted: planId === "creator"
+}));
 
 const normalizeTargetLanguages = (languages?: unknown, fallback = DEFAULT_TARGET_LANGUAGES[0]) => {
   const requestedLanguages = Array.isArray(languages) ? languages : languages ? [languages] : [fallback];
@@ -715,7 +689,7 @@ const parseStoredUser = () => {
   if (!stored) return null;
 
   try {
-    return JSON.parse(stored) as AppUser;
+    return normalizeAuthUser(JSON.parse(stored)) as AppUser;
   } catch {
     clearSessionStorage();
     return null;
@@ -1489,6 +1463,7 @@ export default function App() {
   const sessionStartedAtRef = useRef<number | null>(null);
   const lastInterimRef = useRef("");
   const lastFinalOriginalRef = useRef("");
+  const lastFinalTranscriptEventKeyRef = useRef("");
   const lastFinalTranslationRef = useRef("");
   const lastCompletedTranslationRef = useRef("");
   const completedTranslationSignaturesRef = useRef<Set<string>>(new Set());
@@ -1516,6 +1491,7 @@ export default function App() {
   const activeDubbingLanguageRef = useRef("");
   const lastDubbingTextRef = useRef("");
   const spokenDubbingKeysRef = useRef<Set<string>>(new Set());
+  const dubbingLifecycleRef = useRef<ReturnType<typeof createDubbingLifecycle> | null>(null);
   const historySignatureRef = useRef("");
   const persistedHistorySignaturesRef = useRef<Set<string>>(new Set());
   const tokenRef = useRef(token);
@@ -1527,7 +1503,7 @@ export default function App() {
   const startSessionRef = useRef<(() => Promise<void>) | null>(null);
 
   const isAuthed = Boolean(user && token);
-  const isPro = user?.plan === "pro" || user?.role === "admin" || user?.role === "super_admin";
+  const isPro = user?.plan === "pro" || isAdminRole(user?.role);
   const isRecording = ["connecting", "calibrating", "listening", "speaking", "soft-pause", "finalizing", "dubbing", "listening-after-dubbing", "paused"].includes(status);
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
@@ -1609,88 +1585,53 @@ export default function App() {
   }, []);
 
   const stopDubbingPlayback = useCallback((clearQueue = true) => {
-    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
-    if (clearQueue) dubbingQueuesRef.current = {};
-    dubbingActiveLanguagesRef.current.clear();
-    dubbingTransmissionGatedRef.current = false;
+    dubbingLifecycleRef.current?.stop({ clearQueue });
     activeDubbingUtteranceIdRef.current = "";
     activeDubbingLanguageRef.current = "";
   }, []);
 
-  const playNextDubbingUtterance = useCallback((language: string) => {
-    if (!("speechSynthesis" in window) || dubbingActiveLanguagesRef.current.has(language)) return;
-
-    const now = Date.now();
-    const queue = (dubbingQueuesRef.current[language] || [])
-      .filter((item) => now - item.createdAt <= DUBBING_UTTERANCE_TTL_MS)
-      .slice(-MAX_DUBBING_QUEUE_ITEMS);
-    dubbingQueuesRef.current[language] = queue;
-    const nextUtterance = queue.shift();
-    if (!nextUtterance) {
-      return;
-    }
-
-    const utterance = new SpeechSynthesisUtterance(nextUtterance.text);
-    utterance.lang = speechLanguage(nextUtterance.language);
-    utterance.rate = nextUtterance.text.length > 140 ? 0.94 : 0.98;
-    utterance.pitch = 1;
-    utterance.volume = 0.92;
-    const utteranceId = `${nextUtterance.translationId}:${nextUtterance.language}:${nextUtterance.createdAt}`;
-    activeDubbingUtteranceIdRef.current = utteranceId;
-    activeDubbingLanguageRef.current = nextUtterance.language;
-    dubbingActiveLanguagesRef.current.add(language);
-
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      if (activeDubbingUtteranceIdRef.current === utteranceId) {
-        activeDubbingUtteranceIdRef.current = "";
-        activeDubbingLanguageRef.current = "";
-      }
-      dubbingActiveLanguagesRef.current.delete(language);
-      if (dubbingActiveLanguagesRef.current.size === 0) dubbingTransmissionGatedRef.current = false;
-      const pauseMs = /[.!?]$/.test(nextUtterance.text.trim()) ? 220 : 360;
-      window.setTimeout(() => playNextDubbingUtterance(language), pauseMs);
-    };
-
-    utterance.onstart = () => {
-      dubbingTransmissionGatedRef.current = true;
-      if (recordingRef.current) {
-        setStatus("dubbing");
-        setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Dubbing" }));
-      }
-    };
-    utterance.onend = finish;
-    utterance.onerror = finish;
-
-    try {
-      window.speechSynthesis.speak(utterance);
-    } catch {
-      finish();
-    }
-  }, []);
+  if (!dubbingLifecycleRef.current && typeof window !== "undefined" && "speechSynthesis" in window) {
+    dubbingLifecycleRef.current = createDubbingLifecycle({
+      play: (job: DubbingQueueItem, onEnd: () => void, onError: () => void) => {
+        const utterance = new SpeechSynthesisUtterance(job.text);
+        utterance.lang = speechLanguage(job.language);
+        utterance.rate = job.text.length > 140 ? 0.94 : 0.98;
+        utterance.pitch = 1;
+        utterance.volume = 0.92;
+        utterance.onend = onEnd;
+        utterance.onerror = onError;
+        window.speechSynthesis.speak(utterance);
+      },
+      cancel: () => window.speechSynthesis.cancel(),
+      onGateChange: (gated: boolean) => {
+        dubbingTransmissionGatedRef.current = gated;
+        if (gated) {
+          setStatus("dubbing");
+          setAudioDiagnostic((current) => ({ ...current, message: "Dubbing" }));
+        }
+      },
+      onIdle: () => {
+        setStatus(recordingRef.current ? "listening-after-dubbing" : "idle");
+        setAudioDiagnostic((current) => ({ ...current, message: recordingRef.current ? "Listening" : "Microphone ready" }));
+      },
+      schedule: (callback: () => void, delay: number) => window.setTimeout(callback, delay),
+      pauseMs: (job: DubbingQueueItem) => /[.!?]$/.test(job.text.trim()) ? 220 : 360
+    });
+  }
 
   const queueDubbingTranslations = useCallback((translationId: string, translations: Record<string, string>) => {
     if (modeRef.current !== "dubbing" || !("speechSynthesis" in window)) return;
     const now = Date.now();
     for (const [language, text] of Object.entries(translations)) {
       if (!isVisibleTranslationText(text)) continue;
-      const dubbingKey = `${translationId}:${language}:${text}`;
-      if (spokenDubbingKeysRef.current.has(dubbingKey)) continue;
-      spokenDubbingKeysRef.current.add(dubbingKey);
-      const queue = dubbingQueuesRef.current[language] || [];
-      queue.push({ translationId, language, text, createdAt: now });
-      dubbingQueuesRef.current[language] = queue.slice(-MAX_DUBBING_QUEUE_ITEMS);
-      playNextDubbingUtterance(language);
+      dubbingLifecycleRef.current?.enqueue({ translationId, language, text, createdAt: now });
     }
-    spokenDubbingKeysRef.current = compactSetToLimit(spokenDubbingKeysRef.current, MAX_SPOKEN_DUBBING_KEYS);
-  }, [playNextDubbingUtterance]);
+  }, []);
 
   const navigate = useCallback(
     (nextView: View) => {
       const guarded = PROTECTED_VIEWS.has(nextView);
-      const isAdmin = user?.role === "admin" || user?.role === "super_admin";
+      const isAdmin = isAdminRole(user?.role);
       const resolvedView = nextView === "admin" && !isAdmin ? (isAuthed ? "dashboard" : "admin-login") : guarded && !isAuthed ? "login" : nextView;
       setView(resolvedView);
       window.history.replaceState(null, "", `#${resolvedView}`);
@@ -1785,10 +1726,11 @@ export default function App() {
           sessionStorage.removeItem("interp_shield_token");
           updateSocketAuth(data.token);
         }
-        setUser(data.user);
-        localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
+        const normalizedUser = normalizeAuthUser(data.user) as AppUser;
+        setUser(normalizedUser);
+        localStorage.setItem("interp_shield_user", JSON.stringify(normalizedUser));
         sessionStorage.removeItem("interp_shield_user");
-        applyUserSettings(data.user.settings);
+        applyUserSettings(normalizedUser.settings);
       } catch {
         clearSessionStorage();
         setToken(null);
@@ -1807,8 +1749,9 @@ export default function App() {
         method: "PATCH",
         body: JSON.stringify(settings)
       }, token);
-      setUser(data.user);
-      localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
+      const normalizedUser = normalizeAuthUser(data.user) as AppUser;
+      setUser(normalizedUser);
+      localStorage.setItem("interp_shield_user", JSON.stringify(normalizedUser));
     } catch {
       setAlert("Unable to save settings.");
     }
@@ -1835,9 +1778,10 @@ export default function App() {
         const data = await requestApi<{ token: string; user: AppUser }>("/api/auth/refresh", { method: "POST" }, activeToken);
         tokenRef.current = data.token;
         setToken(data.token);
-        setUser(data.user);
+        const normalizedUser = normalizeAuthUser(data.user) as AppUser;
+        setUser(normalizedUser);
         localStorage.setItem("interp_shield_token", data.token);
-        localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
+        localStorage.setItem("interp_shield_user", JSON.stringify(normalizedUser));
         sessionStorage.removeItem("interp_shield_token");
         sessionStorage.removeItem("interp_shield_user");
         updateSocketAuth(data.token);
@@ -1867,7 +1811,7 @@ export default function App() {
 
   useEffect(() => {
     if (PROTECTED_VIEWS.has(view) && !isAuthed) navigate("login");
-    if (view === "admin" && user?.role !== "admin" && user?.role !== "super_admin") navigate(isAuthed ? "dashboard" : "admin-login");
+    if (view === "admin" && !isAdminRole(user?.role)) navigate(isAuthed ? "dashboard" : "admin-login");
   }, [isAuthed, navigate, user?.role, view]);
 
   useEffect(() => {
@@ -2366,9 +2310,10 @@ export default function App() {
           .then((data) => {
             tokenRef.current = data.token;
             setToken(data.token);
-            setUser(data.user);
+            const normalizedUser = normalizeAuthUser(data.user) as AppUser;
+            setUser(normalizedUser);
             localStorage.setItem("interp_shield_token", data.token);
-            localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
+            localStorage.setItem("interp_shield_user", JSON.stringify(normalizedUser));
             sessionStorage.removeItem("interp_shield_token");
             sessionStorage.removeItem("interp_shield_user");
             updateSocketAuth(data.token);
@@ -2497,13 +2442,15 @@ export default function App() {
       if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
       captionWatchdogTimerRef.current = null;
       logFrontendDebug("audio", "TRANSCRIPT_FINAL_RECEIVED", { chars: originalText.length, sequence, jobId });
-      if (!originalText || originalText === lastFinalOriginalRef.current) return;
+      const transcriptEventKey = `${sessionId || "session"}:${jobId ?? "job"}:${sequence ?? "sequence"}`;
+      if (!originalText || transcriptEventKey === lastFinalTranscriptEventKeyRef.current) return;
       if (detectedLanguage) setDetectedLanguage(detectedLanguage);
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
       trackLatency(latencyMs, provider);
 
       lastInterimRef.current = "";
       lastFinalOriginalRef.current = originalText;
+      lastFinalTranscriptEventKeyRef.current = transcriptEventKey;
       pendingPartialTranscriptRef.current = null;
       if (subtitleThrottleTimerRef.current) {
         window.clearTimeout(subtitleThrottleTimerRef.current);
@@ -2857,17 +2804,20 @@ export default function App() {
     stopDubbingPlayback(true);
     lastDubbingTextRef.current = "";
     spokenDubbingKeysRef.current.clear();
+    dubbingLifecycleRef.current?.resetSeen();
   }, [mode, stopDubbingPlayback]);
 
-  const applyAuthSession = (session: { token: string; user: AppUser }) => {
+  const applyAuthSession = (session: { token: string; user: AppUser }, destination: View = "dashboard") => {
+    const normalizedUser = normalizeAuthUser(session.user) as AppUser;
     tokenRef.current = session.token;
     setToken(session.token);
-    setUser(session.user);
-    saveSession(session.token, session.user);
+    setUser(normalizedUser);
+    saveSession(session.token, normalizedUser);
     updateSocketAuth(session.token);
-    applyUserSettings(session.user.settings);
+    applyUserSettings(normalizedUser.settings);
     setAuthError(null);
-    navigate("dashboard");
+    setView(destination);
+    window.history.replaceState(null, "", destination === "admin" ? "/admin" : `#${destination}`);
   };
 
   const handleAuthSubmit = async (payload: { name?: string; email: string; password: string }) => {
@@ -2888,8 +2838,10 @@ export default function App() {
         method: "POST",
         body: JSON.stringify(body)
       });
-      applyAuthSession(session);
-      if (view === "admin-login") navigate("admin");
+      const refreshed = await requestApi<{ token?: string; user: AppUser }>("/api/auth/me", {}, session.token);
+      const verifiedSession = { token: refreshed.token || session.token, user: refreshed.user };
+      const destination = view === "admin-login" && isAdminRole(refreshed.user.role) ? "admin" : "dashboard";
+      applyAuthSession(verifiedSession, destination);
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Authentication failed.");
     } finally {
@@ -2910,7 +2862,8 @@ export default function App() {
         method: "POST",
         body: JSON.stringify({ credential })
       });
-      applyAuthSession(session);
+      const refreshed = await requestApi<{ token?: string; user: AppUser }>("/api/auth/me", {}, session.token);
+      applyAuthSession({ token: refreshed.token || session.token, user: refreshed.user });
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Google sign-in failed.");
     } finally {
@@ -2937,8 +2890,9 @@ export default function App() {
 
     try {
       const data = await requestApi<{ user: AppUser }>("/api/user/upgrade", { method: "POST" }, token);
-      setUser(data.user);
-      localStorage.setItem("interp_shield_user", JSON.stringify(data.user));
+      const normalizedUser = normalizeAuthUser(data.user) as AppUser;
+      setUser(normalizedUser);
+      localStorage.setItem("interp_shield_user", JSON.stringify(normalizedUser));
       setAlert("Plan updated. Pro features are active.");
       navigate("dashboard");
     } catch (error) {
@@ -2989,6 +2943,7 @@ export default function App() {
     sequenceRef.current = 0;
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
+    lastFinalTranscriptEventKeyRef.current = "";
     lastFinalTranslationRef.current = "";
     lastCompletedTranslationRef.current = "";
     completedTranslationSignaturesRef.current.clear();
@@ -3000,6 +2955,7 @@ export default function App() {
     latestTranslationSequenceRef.current = 0;
     finalTranslationsRef.current = {};
     spokenDubbingKeysRef.current.clear();
+    dubbingLifecycleRef.current?.resetSeen();
     lastDubbingTextRef.current = "";
     stopDubbingPlayback(true);
     pendingPartialTranscriptRef.current = null;
@@ -3379,6 +3335,7 @@ export default function App() {
     setDetectedLanguage(null);
     lastInterimRef.current = "";
     lastFinalOriginalRef.current = "";
+    lastFinalTranscriptEventKeyRef.current = "";
     lastFinalTranslationRef.current = "";
     lastCompletedTranslationRef.current = "";
     completedTranslationSignaturesRef.current.clear();
@@ -3391,6 +3348,7 @@ export default function App() {
     pendingFinalTranscriptRef.current = null;
     pendingFinalTranscriptsRef.current.clear();
     spokenDubbingKeysRef.current.clear();
+    dubbingLifecycleRef.current?.resetSeen();
     lastDubbingTextRef.current = "";
     stopDubbingPlayback(true);
     pendingPartialTranscriptRef.current = null;
@@ -3769,7 +3727,8 @@ export default function App() {
 
   const renderPricing = () => {
     const yearly = billingCycle === "yearly";
-    const priceFor = (monthly: number) => Math.round(monthly * (yearly ? 0.8 : 1));
+    const priceFor = (monthly: number) => yearly ? yearlyMonthlyPrice(monthly) : monthly;
+    const formatPrice = (price: number) => Number.isInteger(price) ? String(price) : price.toFixed(2);
 
     return (
       <main className="mx-auto w-full max-w-7xl px-5 py-10">
@@ -3787,8 +3746,8 @@ export default function App() {
           {PRICING_PLANS.map((plan) => (
             <GlassPanel key={plan.name} className={`p-5 ${plan.highlighted ? "border-blue-500/35" : ""}`}>
               {plan.highlighted && <span className="mb-3 inline-flex rounded-full bg-blue-600 px-3 py-1 text-xs font-black uppercase tracking-wider text-white">Popular</span>}
-              <p className="text-xl font-black text-gray-950">{plan.name}</p>
-              <p className="mt-4 text-4xl font-black text-gray-950">${priceFor(plan.monthly)}<span className="text-sm text-gray-500">/mo</span></p>
+              <p className="text-xl font-black text-gray-950">{plan.name.toUpperCase()}</p>
+              <p className="mt-4 text-4xl font-black text-gray-950">${formatPrice(priceFor(plan.monthlyPrice))}<span className="text-sm text-gray-500">/mo</span></p>
               <ul className="mt-5 space-y-3 text-sm text-gray-600">
                 {plan.features.map((feature) => (
                   <li key={feature} className="flex items-start gap-2">
@@ -4090,7 +4049,7 @@ export default function App() {
       {view === "admin-login" && <AdminLogin api={API} error={authError} busy={authProvider === "manual"} onLogin={(email, password) => void handleAuthSubmit({ email, password })} />}
       {view === "dashboard" && isAuthed && renderDashboard()}
       {view === "pricing" && renderPricing()}
-      {view === "admin" && token && (user?.role === "admin" || user?.role === "super_admin") && <AdminDashboard api={API} token={token} currentUser={user as any} onLogout={() => void logout()} />}
+      {view === "admin" && token && isAdminRole(user?.role) && <AdminDashboard api={API} token={token} currentUser={user as any} onLogout={() => void logout()} />}
       {view === "history" && isAuthed && renderHistory()}
       {view === "help" && renderHelp()}
       {view === "settings" && isAuthed && renderSettings()}

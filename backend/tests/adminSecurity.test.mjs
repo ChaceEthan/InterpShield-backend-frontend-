@@ -40,9 +40,9 @@ assert.equal(Object.hasOwn(safe, "password"), false, "passwords are never return
 assert.equal(User.schema.path("password").options.select, false, "password remains excluded by default");
 
 const navbar = fs.readFileSync(new URL("../../frontend/src/components/Navbar.tsx", import.meta.url), "utf8");
-assert.match(navbar, /user\?\.role === "admin" \|\| user\?\.role === "super_admin"/, "admin route is conditionally exposed only to admins");
+assert.match(navbar, /isAdminRole\(user\?\.role\).*onNavigate\("admin"\)/, "admin route is conditionally exposed only to admins");
 const app = fs.readFileSync(new URL("../../frontend/src/App.tsx", import.meta.url), "utf8");
-assert.match(app, /view === "admin" && token && \(user\?\.role === "admin" \|\| user\?\.role === "super_admin"\)/, "direct admin rendering requires an authenticated admin role");
+assert.match(app, /view === "admin" && token && isAdminRole\(user\?\.role\)/, "direct admin rendering requires an authenticated admin role");
 const adminService = fs.readFileSync(new URL("../services/adminService.js", import.meta.url), "utf8");
 assert.match(adminService, /action: status === "active" \? "user_reactivated" : `user_\$\{status\}`/, "suspension and reactivation create audit logs");
 assert.match(adminService, /action: "plan_changed"/, "plan changes create audit logs");

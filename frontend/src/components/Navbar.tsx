@@ -1,9 +1,10 @@
 import { Crown, HelpCircle, LogIn, LogOut, Settings, Shield, Sparkles } from "lucide-react";
+import { isAdminRole } from "../auth/roles.mjs";
 
 export type NavTarget = "dashboard" | "help" | "pricing" | "settings" | "login" | "admin";
 
 interface NavbarProps {
-  user?: { name: string; email: string; plan: string; role?: "user" | "admin" | "super_admin" } | null;
+  user?: { name: string; email: string; plan: string; role?: string } | null;
   isAuthed?: boolean;
   onNavigate: (target: NavTarget) => void;
   onLogout?: () => void;
@@ -51,7 +52,7 @@ export function Navbar({ user, isAuthed = false, onNavigate, onLogout }: NavbarP
 
           {isAuthed ? (
             <>
-              {(user?.role === "admin" || user?.role === "super_admin") && <button type="button" onClick={() => onNavigate("admin")} className="hidden rounded-full border border-blue-100 bg-blue-50 px-3 py-2 text-xs font-bold text-blue-700 sm:block">Admin</button>}
+              {isAdminRole(user?.role) && <button type="button" onClick={() => onNavigate("admin")} className="rounded-full border border-blue-100 bg-blue-50 px-3 py-2 text-xs font-bold text-blue-700">Admin</button>}
               <button
                 type="button"
                 onClick={() => onNavigate("settings")}
@@ -80,7 +81,7 @@ export function Navbar({ user, isAuthed = false, onNavigate, onLogout }: NavbarP
             </button>
           )}
 
-          {user?.role !== "admin" && user?.role !== "super_admin" && <button
+          {!isAdminRole(user?.role) && <button
             type="button"
             onClick={() => onNavigate("pricing")}
             className="inline-flex items-center gap-2 rounded-full bg-blue-600 px-3.5 py-2 text-sm font-semibold text-white shadow-sm shadow-blue-200 transition hover:bg-blue-700"

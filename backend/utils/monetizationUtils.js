@@ -1,11 +1,12 @@
 // Monetization and plan utilities
+import { PLAN_CATALOG } from "../../shared/plans.mjs";
 
 // Plan definitions with feature limits
 export const PLAN_DEFINITIONS = {
   free: {
-    name: "Free",
-    price: 0,
-    dailyMinutesLimit: 15,
+    ...PLAN_CATALOG.free,
+    price: PLAN_CATALOG.free.monthlyPrice,
+    dailyMinutesLimit: PLAN_CATALOG.free.captionMinutes,
     maxTargetLanguages: 2,
     features: {
       captions: true,
@@ -18,15 +19,15 @@ export const PLAN_DEFINITIONS = {
     }
   },
   pro_lite: {
-    name: "Pro Lite",
-    price: 5,
-    dailyMinutesLimit: 120,
+    ...PLAN_CATALOG.pro_lite,
+    price: PLAN_CATALOG.pro_lite.monthlyPrice,
+    dailyMinutesLimit: PLAN_CATALOG.pro_lite.captionMinutes,
     maxTargetLanguages: 3,
     features: {
       captions: true,
       basicTranslation: true,
-      dubbing: false,
-      exports: false,
+      dubbing: true,
+      exports: true,
       advancedTranslation: true,
       multiRoomCalls: false,
       savedHistory: true,
@@ -34,9 +35,9 @@ export const PLAN_DEFINITIONS = {
     }
   },
   creator: {
-    name: "Creator",
-    price: 10,
-    dailyMinutesLimit: 480,
+    ...PLAN_CATALOG.creator,
+    price: PLAN_CATALOG.creator.monthlyPrice,
+    dailyMinutesLimit: PLAN_CATALOG.creator.captionMinutes,
     maxTargetLanguages: 3,
     features: {
       captions: true,
@@ -51,9 +52,9 @@ export const PLAN_DEFINITIONS = {
     }
   },
   business: {
-    name: "Business",
-    price: 20,
-    dailyMinutesLimit: 1440,
+    ...PLAN_CATALOG.business,
+    price: PLAN_CATALOG.business.monthlyPrice,
+    dailyMinutesLimit: PLAN_CATALOG.business.captionMinutes,
     maxTargetLanguages: 3,
     features: {
       captions: true,
