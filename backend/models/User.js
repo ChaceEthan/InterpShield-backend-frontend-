@@ -61,6 +61,31 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: "password"
     },
+    role: {
+      type: String,
+      enum: ["user", "admin", "super_admin"],
+      default: "user",
+      index: true
+    },
+    status: {
+      type: String,
+      enum: ["active", "suspended", "deactivated"],
+      default: "active",
+      index: true
+    },
+    planOverride: {
+      type: String,
+      enum: ["free", "starter", "pro", "unlimited"],
+      default: undefined
+    },
+    accessOverrideEndsAt: Date,
+    suspendedAt: Date,
+    suspendedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    suspensionReason: { type: String, default: "", maxlength: 500 },
+    deactivatedAt: Date,
+    lastActiveAt: Date,
+    lastLoginAt: Date,
+    mustChangePassword: { type: Boolean, default: false },
     plan: {
       type: String,
       enum: ["free", "pro_lite", "creator", "business", "team"],
@@ -95,6 +120,10 @@ const userSchema = new mongoose.Schema(
       default: 0,
       min: 0
     },
+    totalCaptionMinutes: { type: Number, default: 0, min: 0 },
+    totalTranslationMinutes: { type: Number, default: 0, min: 0 },
+    totalDubbingJobs: { type: Number, default: 0, min: 0 },
+    sessionCount: { type: Number, default: 0, min: 0 },
     translationRequestsThisMonth: {
       type: Number,
       default: 0,

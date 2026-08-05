@@ -35,6 +35,7 @@ import { Navbar } from "./components/Navbar";
 import { ToolTabs } from "./components/ToolTabs";
 import { TranslationOptions } from "./components/TranslationOptions";
 import { TranslationPanel } from "./components/TranslationPanel";
+import { AdminDashboard, AdminLogin } from "./components/AdminDashboard";
 import type { TranscriptTranslationEntry } from "./components/TranscriptArea";
 import { buildProductionAudioConstraints, createVadController, DEFAULT_VAD_CONFIG } from "./audio/vadController.mjs";
 import { createUtteranceBoundaryController, stableSessionStartTime } from "./audio/recorderLifecycle.mjs";
@@ -46,7 +47,7 @@ import {
   normalizeLanguageCode as normalizeSharedLanguageCode
 } from "../../shared/languages.mjs";
 
-type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin";
+type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin-login" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
 type SessionStatus = "idle" | "connecting" | "calibrating" | "listening" | "speaking" | "soft-pause" | "finalizing" | "dubbing" | "listening-after-dubbing" | "paused" | "stopping" | "error";
 type TranslationLifecycleState = "ready" | "queued" | "processing" | "translating" | "retrying" | "translated" | "done" | "failed" | "stale" | "cancelled";
@@ -115,7 +116,10 @@ interface AppUser {
   picture?: string;
   plan: Plan;
   provider: string;
-  role?: "admin" | "user";
+  role?: "super_admin" | "admin" | "user";
+  status?: "active" | "suspended" | "deactivated";
+  planOverride?: "free" | "starter" | "pro" | "unlimited";
+  mustChangePassword?: boolean;
   settings?: UserSettings;
 }
 
@@ -278,8 +282,8 @@ const MAX_AUDIO_RECOVERY_ATTEMPTS = 2;
 const AUDIO_RECOVERY_DELAY_MS = 900;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
 const AUDIO_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
-const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings"];
-const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings"]);
+const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings", "admin-login", "admin"];
+const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings", "admin"]);
 
 const readViteBoolean = (value?: string) => ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
 const CLIENT_SESSION_STORAGE_KEY = "interp_shield_client_session_id";
@@ -937,6 +941,8 @@ const formatHistoryTimestamp = (timestamp: string) => {
 };
 
 const initialView = (): View => {
+  if (window.location.pathname === "/admin/login") return "admin-login";
+  if (window.location.pathname === "/admin") return "admin";
   const hashView = window.location.hash.replace("#", "") as View;
   return VIEWS.includes(hashView) ? hashView : "landing";
 };
@@ -1521,7 +1527,7 @@ export default function App() {
   const startSessionRef = useRef<(() => Promise<void>) | null>(null);
 
   const isAuthed = Boolean(user && token);
-  const isPro = user?.plan === "pro";
+  const isPro = user?.plan === "pro" || user?.role === "admin" || user?.role === "super_admin";
   const isRecording = ["connecting", "calibrating", "listening", "speaking", "soft-pause", "finalizing", "dubbing", "listening-after-dubbing", "paused"].includes(status);
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
@@ -1684,12 +1690,13 @@ export default function App() {
   const navigate = useCallback(
     (nextView: View) => {
       const guarded = PROTECTED_VIEWS.has(nextView);
-      const resolvedView = guarded && !isAuthed ? "login" : nextView;
+      const isAdmin = user?.role === "admin" || user?.role === "super_admin";
+      const resolvedView = nextView === "admin" && !isAdmin ? (isAuthed ? "dashboard" : "admin-login") : guarded && !isAuthed ? "login" : nextView;
       setView(resolvedView);
       window.history.replaceState(null, "", `#${resolvedView}`);
       setSettingsOpen(false);
     },
-    [isAuthed]
+    [isAuthed, user?.role]
   );
 
   const fetchConfig = useCallback(async () => {
@@ -1860,7 +1867,8 @@ export default function App() {
 
   useEffect(() => {
     if (PROTECTED_VIEWS.has(view) && !isAuthed) navigate("login");
-  }, [isAuthed, navigate, view]);
+    if (view === "admin" && user?.role !== "admin" && user?.role !== "super_admin") navigate(isAuthed ? "dashboard" : "admin-login");
+  }, [isAuthed, navigate, user?.role, view]);
 
   useEffect(() => {
     modeRef.current = mode;
@@ -2875,12 +2883,13 @@ export default function App() {
         email: payload.email.trim(),
         password: payload.password
       };
-      const path = view === "signup" ? "/api/auth/signup" : "/api/auth/login";
+      const path = view === "signup" ? "/api/auth/signup" : view === "admin-login" ? "/api/admin/login" : "/api/auth/login";
       const session = await requestApi<{ token: string; user: AppUser }>(path, {
         method: "POST",
         body: JSON.stringify(body)
       });
       applyAuthSession(session);
+      if (view === "admin-login") navigate("admin");
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Authentication failed.");
     } finally {
@@ -3483,7 +3492,7 @@ export default function App() {
     );
   };
 
-  const handleNavbarNavigate = (target: "dashboard" | "help" | "pricing" | "settings" | "login") => {
+  const handleNavbarNavigate = (target: "dashboard" | "help" | "pricing" | "settings" | "login" | "admin") => {
     if (target === "dashboard") {
       navigate(isAuthed ? "dashboard" : "landing");
       return;
@@ -4078,9 +4087,10 @@ export default function App() {
       {view === "landing" && renderLanding()}
       {view === "login" && <AuthPage mode="login" authProvider={authProvider} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleError={setAuthError} onNavigate={navigate} />}
       {view === "signup" && <AuthPage mode="signup" authProvider={authProvider} error={authError} onSubmit={handleAuthSubmit} onGoogle={handleGoogleLogin} onGoogleError={setAuthError} onNavigate={navigate} />}
+      {view === "admin-login" && <AdminLogin api={API} error={authError} busy={authProvider === "manual"} onLogin={(email, password) => void handleAuthSubmit({ email, password })} />}
       {view === "dashboard" && isAuthed && renderDashboard()}
       {view === "pricing" && renderPricing()}
-      {view === "admin" && user?.role === 'admin' && renderAdmin()}
+      {view === "admin" && token && (user?.role === "admin" || user?.role === "super_admin") && <AdminDashboard api={API} token={token} currentUser={user as any} onLogout={() => void logout()} />}
       {view === "history" && isAuthed && renderHistory()}
       {view === "help" && renderHelp()}
       {view === "settings" && isAuthed && renderSettings()}

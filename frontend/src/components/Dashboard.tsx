@@ -1,7 +1,7 @@
 import { HeroSection } from "./HeroSection";
 import { LanguageSelector } from "./LanguageSelector";
 import { ModeTabs, type PrivacyMode } from "./ModeTabs";
-import { Navbar } from "./Navbar";
+import { Navbar, type NavTarget } from "./Navbar";
 import { ToolTabs, type ToolType } from "./ToolTabs";
 import { TranslationOptions } from "./TranslationOptions";
 import { TranslationPanel } from "./TranslationPanel";
@@ -30,7 +30,7 @@ interface DashboardProps {
   onThreeWayToggle?: (enabled: boolean) => void;
   onToolChange: (tool: ToolType) => void;
   onModeChange: (mode: PrivacyMode) => void;
-  onNavigate?: (target: "dashboard" | "help" | "pricing" | "settings" | "login") => void;
+  onNavigate?: (target: NavTarget) => void;
   onLogout?: () => void;
 }
 

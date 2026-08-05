@@ -2,10 +2,14 @@
 
 import { hasPlanFeature, getDailyMinutesLimit, calculateDailyUsagePercentage, hasEnoughCredits } from "./monetizationUtils.js";
 
+export const hasUnlimitedAccess = (user = {}) => ["admin", "super_admin"].includes(user.role) ||
+  (user.planOverride === "unlimited" && (!user.accessOverrideEndsAt || new Date(user.accessOverrideEndsAt) > new Date()));
+
 /**
  * Check if user has access to a feature
  */
 export const checkFeatureAccess = (user = {}, feature = "") => {
+  if (hasUnlimitedAccess(user)) return { allowed: true, unlimited: true };
   if (!feature) return true;
 
   const planId = user.plan || "free";
@@ -28,6 +32,7 @@ export const checkFeatureAccess = (user = {}, feature = "") => {
  * Check if user has sufficient daily minutes
  */
 export const checkMinuteAllowance = (user = {}, requestedMinutes = 0) => {
+  if (hasUnlimitedAccess(user)) return { allowed: true, minutesRemaining: Infinity, unlimited: true };
   const planId = user.plan || "free";
   const dailyLimit = getDailyMinutesLimit(planId);
 
@@ -100,6 +105,7 @@ export const checkOperationAccess = (user = {}, operation = {}) => {
  * Check if user has enough credits
  */
 export const checkCreditsAvailability = (user = {}, requiredCredits = 0) => {
+  if (hasUnlimitedAccess(user)) return { allowed: true, creditsAvailable: Infinity, unlimited: true };
   const userCredits = user.credits || 0;
 
   if (userCredits < requiredCredits) {
@@ -165,6 +171,7 @@ export const addCredits = (user = {}, amountToAdd = 0, reason = "manual_addition
  * Get user's access level for a feature (simplified)
  */
 export const getFeatureAccessLevel = (user = {}, feature = "") => {
+  if (hasUnlimitedAccess(user)) return { level: "unlimited", requiresUpgrade: false };
   const planId = user.plan || "free";
 
   if (!hasPlanFeature(planId, feature)) {
@@ -209,6 +216,7 @@ export const canUseMultiRoomCalls = (user = {}) => {
  * Get rate limiting tier for user
  */
 export const getRateLimitTier = (user = {}) => {
+  if (hasUnlimitedAccess(user)) return { requestsPerMinute: 1000, requestsPerHour: 10000 };
   const planId = user.plan || "free";
 
   const tiers = {

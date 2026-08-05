@@ -23,11 +23,11 @@ const requireJwtSecret = (env) => {
   }
 };
 
-const hashPassword = (password) => bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+export const hashPassword = (password) => bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
 
 const isBcryptHash = (storedHash) => storedHash?.startsWith("$2a$") || storedHash?.startsWith("$2b$") || storedHash?.startsWith("$2y$");
 
-const verifyPassword = async (password, storedHash) => {
+export const verifyPassword = async (password, storedHash) => {
   if (!storedHash) return false;
   if (!isBcryptHash(storedHash)) return false;
   return bcrypt.compare(password, storedHash);
@@ -43,6 +43,11 @@ export const safeUser = (user) => ({
   picture: user.picture || user.avatar || "",
   plan: user.plan || "free",
   provider: user.provider || "password",
+  role: user.role || "user",
+  status: user.status || "active",
+  planOverride: user.planOverride,
+  accessOverrideEndsAt: user.accessOverrideEndsAt?.toISOString?.() || user.accessOverrideEndsAt,
+  mustChangePassword: Boolean(user.mustChangePassword),
   settings: user.settings || {
     privateMode: true,
     shareableMode: false,
@@ -123,6 +128,13 @@ export const loginUser = async ({ email, password } = {}, env) => {
     throw httpError("Invalid email or password", 401);
   }
 
+  if ((user.status || "active") !== "active") {
+    throw httpError("Your account has been suspended. Contact support.", 403);
+  }
+  user.lastLoginAt = new Date();
+  user.lastActiveAt = user.lastLoginAt;
+  await user.save();
+
   return createSession(user, env);
 };
 
@@ -186,6 +198,10 @@ export const loginWithGoogle = async ({ credential } = {}, env) => {
     await user.save();
   }
 
+  if ((user.status || "active") !== "active") {
+    throw httpError("Your account has been suspended. Contact support.", 403);
+  }
+
   return createSession(user, env);
 };
 
@@ -197,6 +213,10 @@ export const getUserByToken = async (token, env) => {
 
   if (!user) {
     throw new Error("User not found");
+  }
+
+  if ((user.status || "active") !== "active") {
+    throw httpError("Your account has been suspended. Contact support.", 403);
   }
 
   return safeUser(user);

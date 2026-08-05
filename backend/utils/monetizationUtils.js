@@ -135,6 +135,7 @@ export const calculateDailyUsagePercentage = (minutesUsed = 0, planId = "free") 
  * Check if user can make a translation request
  */
 export const canMakeTranslationRequest = (user = {}) => {
+  if (["admin", "super_admin"].includes(user.role) || (user.planOverride === "unlimited" && (!user.accessOverrideEndsAt || new Date(user.accessOverrideEndsAt) > new Date()))) return true;
   const planId = user.plan || "free";
   const plan = getPlanDefinition(planId);
   const dailyLimit = getDailyMinutesLimit(planId);

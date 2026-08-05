@@ -462,3 +462,19 @@ After deploying these improvements:
 **Status:** ✅ Production Ready
 
 👉 **[START HERE: Read DELIVERY_SUMMARY.md →](DELIVERY_SUMMARY.md)**
+# Secure admin bootstrap
+
+The private admin API and dashboard use the existing JWT authentication plus database-backed `admin` and `super_admin` roles. To initialize the owner account, set these server-only Render environment variables:
+
+```text
+ADMIN_EMAIL=
+ADMIN_PASSWORD_HASH=
+```
+
+`ADMIN_PASSWORD_HASH` must be a bcrypt hash. Generate it in a trusted local password tool or secret manager without placing the plaintext password in a shell command, source file, or Git history. Then run the idempotent seed once from the repository root:
+
+```text
+npm run seed:admin --workspace backend
+```
+
+The seed creates the configured account only when absent; an existing matching account is promoted without duplication. It assigns `super_admin`, unlimited access, and `mustChangePassword`, and never prints a password or hash. Remove the bootstrap hash from the runtime environment after successful initialization if operational policy permits. Admin login is available at `/admin/login`; the dashboard is `/admin`.

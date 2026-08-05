@@ -6,6 +6,7 @@ import { Server } from "socket.io";
 import { connectDatabase, getDatabaseStatus } from "./config/database.js";
 import { env, getConfigDiagnostics, getPublicConfig, validateStartupConfig, warnAboutMissingConfig } from "./config/env.js";
 import { createAuthRouter } from "./routes/auth.js";
+import { createAdminRouter } from "./routes/admin.js";
 import { createUserRouter } from "./routes/user.js";
 import { getGeminiHealth } from "./services/gemini.js";
 import { getInterpreterSessionHistory } from "./services/interpreter.js";
@@ -169,6 +170,7 @@ app.get("/api/history/:sessionId", (req, res) => {
 });
 
 app.use("/api/auth", createAuthRouter(env));
+app.use("/api/admin", createAdminRouter(env));
 app.use("/api/user", createUserRouter(env));
 
 app.use((req, res) => {

@@ -125,6 +125,8 @@ export const env = {
   hasJwtSecret: Boolean(readSecret(process.env.JWT_SECRET)),
   jwtSecret: readSecret(process.env.JWT_SECRET),
   adminWebhookUrl: readSecret(process.env.ADMIN_WEBHOOK_URL),
+  adminEmail: String(process.env.ADMIN_EMAIL || "").trim().toLowerCase(),
+  adminPasswordHash: readSecret(process.env.ADMIN_PASSWORD_HASH),
   paths: projectPaths,
   runtimePathStatus,
   maxSessionSeconds: readMaxSessionSeconds(),

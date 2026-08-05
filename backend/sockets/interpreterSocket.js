@@ -1,5 +1,7 @@
 // @ts-nocheck
 import { verifyToken } from "../services/authService.js";
+import User from "../models/User.js";
+import { isAccountActive } from "../middleware/authorization.js";
 import { createInterpreterSession, isTranslationDisplayable } from "../services/interpreter.js";
 import {
   createAudioPipelineSession,
@@ -404,7 +406,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
       };
 
       if (result?.type === "admin_stats") {
-        getActiveSocket().emit("result", result);
+        if (["admin", "super_admin"].includes(socket.data.userRole)) getActiveSocket().emit("result", result);
         return;
       }
 
@@ -519,6 +521,14 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     };
 
     const handleStartSession = async (payload = {}, ack) => {
+      const authenticatedUser = await User.findById(authenticatedUserId).lean();
+      if (!isAccountActive(authenticatedUser)) {
+        const message = "Your account has been suspended. Contact support.";
+        socket.emit("session_error", { message });
+        ack?.(null, { ok: false, error: message });
+        return;
+      }
+      socket.data.userRole = authenticatedUser.role || "user";
       const requestedClientSessionId =
         normalizeClientSessionId(payload.clientSessionId || socket.handshake.auth?.clientSessionId || socket.handshake.auth?.sessionId) ||
         clientSessionId ||
@@ -652,7 +662,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         session = await createInterpreterSession({
           env,
           sourceLang,
-          userPlan: payload.userPlan || "free",
+          userPlan: ["admin", "super_admin"].includes(authenticatedUser.role) ? "team" : authenticatedUser.plan || "free",
           preferredProvider: payload.preferredProvider || "auto",
           targetLang,
           targetLanguages,
