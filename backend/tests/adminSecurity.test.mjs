@@ -7,6 +7,7 @@ import { hashPassword, safeUser, verifyPassword } from "../services/authService.
 import { canUseDubbing, checkFeatureAccess, checkMinuteAllowance, hasUnlimitedAccess } from "../utils/featureGating.js";
 import { canMakeTranslationRequest } from "../utils/monetizationUtils.js";
 import { seedAdmin } from "../scripts/seedAdmin.mjs";
+import { runStartupAdminBootstrap } from "../services/adminBootstrap.js";
 
 const runMiddleware = (middleware, user) => { let next = false; let status = 200; let body; middleware({ user }, { status(code) { status = code; return this; }, json(value) { body = value; } }, () => { next = true; }); return { next, status, body }; };
 assert.equal(runMiddleware(requireAdmin, null).status, 403, "unauthenticated requests cannot access admin APIs");
@@ -92,4 +93,39 @@ await seedAdmin({ config: { ...seedConfig, adminPasswordHash: replacementHash },
 assert.equal(existingModel.state.createCalls, 0, "repeated seeds do not create duplicate users");
 await assert.rejects(() => seedAdmin({ config: { ...seedConfig, adminPasswordHash: "" }, UserModel: newModel }), /valid bcrypt/);
 await assert.rejects(() => seedAdmin({ config: { ...seedConfig, adminPasswordHash: "not-a-bcrypt-hash" }, UserModel: newModel }), /valid bcrypt/);
+
+const bootstrapMessages = { info: [], error: [] };
+const bootstrapLogger = {
+  info(message) { bootstrapMessages.info.push(message); },
+  error(message) { bootstrapMessages.error.push(message); }
+};
+let bootstrapCalls = 0;
+const bootstrapSeed = async ({ config }) => {
+  bootstrapCalls += 1;
+  assert.equal(config.adminResetPasswordOnSeed, true);
+};
+const enabledBootstrap = await runStartupAdminBootstrap({
+  config: { ...seedConfig, adminResetPasswordOnSeed: true },
+  seed: bootstrapSeed,
+  logger: bootstrapLogger
+});
+assert.equal(enabledBootstrap, true, "startup bootstrap runs when all values are present and reset is enabled");
+assert.equal(bootstrapCalls, 1);
+assert.deepEqual(bootstrapMessages.info, ["Super admin account initialized securely."]);
+
+await runStartupAdminBootstrap({ config: seedConfig, seed: bootstrapSeed, logger: bootstrapLogger });
+await runStartupAdminBootstrap({ config: { ...seedConfig, adminEmail: "", adminResetPasswordOnSeed: true }, seed: bootstrapSeed, logger: bootstrapLogger });
+await runStartupAdminBootstrap({ config: { ...seedConfig, adminPasswordHash: "", adminResetPasswordOnSeed: true }, seed: bootstrapSeed, logger: bootstrapLogger });
+assert.equal(bootstrapCalls, 1, "disabled or incomplete bootstrap configuration never invokes the seed");
+
+const safeErrors = [];
+const sensitiveValues = [seedConfig.adminEmail, seedConfig.adminPasswordHash];
+const failedBootstrap = await runStartupAdminBootstrap({
+  config: { ...seedConfig, adminResetPasswordOnSeed: true },
+  seed: async () => { throw new Error(`unsafe details ${sensitiveValues.join(" ")}`); },
+  logger: { info() {}, error(message) { safeErrors.push(message); } }
+});
+assert.equal(failedBootstrap, false, "bootstrap failure does not escape and block startup");
+assert.deepEqual(safeErrors, ["Super admin initialization failed securely."]);
+assert.equal(sensitiveValues.some((value) => safeErrors[0].includes(value)), false, "bootstrap errors do not expose configuration values");
 console.log("Admin security regression tests passed.");

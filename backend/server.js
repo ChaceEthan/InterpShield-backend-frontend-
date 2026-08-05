@@ -11,6 +11,7 @@ import { createUserRouter } from "./routes/user.js";
 import { getGeminiHealth } from "./services/gemini.js";
 import { getInterpreterSessionHistory } from "./services/interpreter.js";
 import { getOpenAIHealth } from "./services/openai.js";
+import { runStartupAdminBootstrap } from "./services/adminBootstrap.js";
 import { getInterpreterSocketHealth, registerInterpreterSocket } from "./sockets/interpreterSocket.js";
 
 validateStartupConfig();
@@ -199,6 +200,7 @@ const connectDatabaseSafely = async () => {
 const startServer = async () => {
   try {
     await connectDatabaseSafely();
+    await runStartupAdminBootstrap({ config: env });
 
     if (env.mongoUri) {
       const retryDatabaseConnection = setInterval(() => {
