@@ -69,7 +69,7 @@ const userSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["active", "suspended", "deactivated"],
+      enum: ["active", "expired", "suspended", "deactivated"],
       default: "active",
       index: true
     },
@@ -136,7 +136,24 @@ const userSchema = new mongoose.Schema(
     },
     upgradedAt: Date,
     subscriptionStartedAt: Date,
-    subscriptionEndsAt: Date
+    subscriptionEndsAt: Date,
+    trialStartAt: Date,
+    trialEndsAt: Date,
+    subscriptionStatus: { type: String, enum: ["active", "expired", "cancelled", "past_due", "unlimited"], default: "active", index: true },
+    subscriptionType: { type: String, enum: ["none", "trial", "monthly", "quarterly", "yearly", "enterprise", "unlimited"], default: "none", index: true },
+    subscriptionStartsAt: Date,
+    isTrial: { type: Boolean, default: false },
+    isUnlimited: { type: Boolean, default: false },
+    paymentProvider: { type: String, enum: ["none", "mtn_momo", "airtel_money", "stripe", "equity_bank", "flutterwave", "paypal", "manual"], default: "none" },
+    paymentReference: { type: String, default: "" },
+    transactionId: { type: String, default: "" },
+    bankReference: { type: String, default: "" },
+    accountReference: { type: String, default: "" },
+    providerResponse: { type: mongoose.Schema.Types.Mixed, default: null },
+    lastPaymentAt: Date,
+    nextRenewalAt: Date,
+    daysRemaining: { type: Number, default: null },
+    subscriptionNotifications: [{ type: { type: String }, sentAt: Date }]
   },
   {
     timestamps: true

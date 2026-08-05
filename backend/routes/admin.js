@@ -3,7 +3,7 @@ import User from "../models/User.js";
 import { requireAuth } from "./auth.js";
 import { requireAdmin } from "../middleware/authorization.js";
 import { createSession, hashPassword, httpError, verifyPassword } from "../services/authService.js";
-import { getAdminOverview, getAdminUser, listAdminUsers, listAuditLogs, resetUserUsage, updateUserPlan, updateUserRole, updateUserStatus, writeAuditLog } from "../services/adminService.js";
+import { getAdminOverview, getAdminUser, listAdminUsers, listAuditLogs, resetUserUsage, updateUserPlan, updateUserRole, updateUserStatus, updateUserSubscription, writeAuditLog } from "../services/adminService.js";
 
 const attempts = new Map(); const WINDOW_MS = 900000; const MAX_ATTEMPTS = 5;
 /** @param {import("express").Request} req */
@@ -30,6 +30,7 @@ export const createAdminRouter = (env) => {
   router.patch("/users/:id/plan", async (req, res, next) => { try { res.json({ user: await updateUserPlan({ actor: req.user, targetId: req.params.id, planOverride: req.body?.planOverride, accessOverrideEndsAt: req.body?.accessOverrideEndsAt, reason: req.body?.reason, ip: clientKey(req) }) }); } catch (e) { next(e); } });
   router.patch("/users/:id/usage", async (req, res, next) => { try { res.json({ user: await resetUserUsage({ actor: req.user, targetId: req.params.id, reason: req.body?.reason, ip: clientKey(req) }) }); } catch (e) { next(e); } });
   router.patch("/users/:id/role", async (req, res, next) => { try { res.json({ user: await updateUserRole({ actor: req.user, targetId: req.params.id, role: req.body?.role, reason: req.body?.reason, ip: clientKey(req) }) }); } catch (e) { next(e); } });
+  router.patch("/users/:id/subscription", async (req, res, next) => { try { res.json({ user: await updateUserSubscription({ actor: req.user, targetId: req.params.id, action: req.body?.action, days: req.body?.days, type: req.body?.type, reason: req.body?.reason, ip: clientKey(req) }) }); } catch (e) { next(e); } });
   router.get("/audit-logs", async (req, res, next) => { try { res.json({ logs: await listAuditLogs(req.query.limit) }); } catch (e) { next(e); } });
   router.post("/change-password", async (req, res, next) => { try { const current = String(req.body?.currentPassword || ""); const nextPassword = String(req.body?.newPassword || ""); if (nextPassword.length < 10) throw httpError("New password must be at least 10 characters.", 400); const user = await User.findById(req.user.id).select("+password"); if (!user || !await verifyPassword(current, user.password)) throw httpError("Invalid credentials.", 401); user.password = await hashPassword(nextPassword); user.mustChangePassword = false; await user.save(); await writeAuditLog({ adminUserId: user._id, action: "admin_password_changed", reason: "self_service", ip: clientKey(req) }); res.json({ ok: true }); } catch (e) { next(e); } });
   router.get("/session", (req, res) => res.json({ user: req.user }));

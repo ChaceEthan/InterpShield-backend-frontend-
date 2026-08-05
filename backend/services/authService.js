@@ -3,6 +3,7 @@ import { OAuth2Client } from "google-auth-library";
 import jwt from "jsonwebtoken";
 import { requireDatabase } from "../config/database.js";
 import User from "../models/User.js";
+import { initializeTrial, normalizeSubscription, subscriptionSnapshot } from "./subscriptionService.js";
 
 const MIN_PASSWORD_LENGTH = 6;
 const BCRYPT_SALT_ROUNDS = 12;
@@ -62,7 +63,8 @@ export const safeUser = (user) => ({
     preferredSourceLang: "en",
     preferredTargetLang: "es"
   },
-  createdAt: user.createdAt?.toISOString?.() || user.createdAt
+  createdAt: user.createdAt?.toISOString?.() || user.createdAt,
+  subscription: subscriptionSnapshot(user)
 });
 
 /** @param {any} user @param {any} env */
@@ -101,12 +103,16 @@ export const registerUser = async ({ name, email, password } = {}, env) => {
   requireDatabase(env);
 
   try {
-    const user = await User.create({
+    const trialUser = initializeTrial({
       name: cleanName,
       email: normalizedEmail,
       password: await hashPassword(password),
-      provider: "password"
+      provider: "password",
+      role: "user",
+      plan: "free",
+      status: "active"
     });
+    const user = await User.create(trialUser);
 
     return createSession(user, env);
   } catch (error) {
@@ -141,7 +147,7 @@ export const loginUser = async ({ email, password } = {}, env) => {
     throw httpError("Invalid email or password", 401);
   }
 
-  if ((user.status || "active") !== "active") {
+  if (["suspended", "deactivated"].includes(user.status || "active")) {
     throw httpError("Your account has been suspended. Contact support.", 403);
   }
   user.lastLoginAt = new Date();
@@ -196,14 +202,15 @@ export const loginWithGoogle = async ({ credential } = {}, env) => {
   user ||= await User.findOne({ email: normalizedEmail });
 
   if (!user) {
-    user = await User.create({
+    const trialUser = initializeTrial({
       name: googleProfile.name || normalizedEmail.split("@")[0],
       email: normalizedEmail,
       googleId: googleProfile.googleId || undefined,
       avatar: googleProfile.picture || "",
       picture: googleProfile.picture || "",
-      provider: "google"
+      provider: "google", role: "user", plan: "free", status: "active"
     });
+    user = await User.create(trialUser);
   } else {
     user.name = googleProfile.name || user.name;
     user.googleId = googleProfile.googleId || user.googleId;
@@ -213,7 +220,7 @@ export const loginWithGoogle = async ({ credential } = {}, env) => {
     await user.save();
   }
 
-  if ((user.status || "active") !== "active") {
+  if (["suspended", "deactivated"].includes(user.status || "active")) {
     throw httpError("Your account has been suspended. Contact support.", 403);
   }
 
@@ -231,9 +238,14 @@ export const getUserByToken = async (token, env) => {
     throw new Error("User not found");
   }
 
-  if ((user.status || "active") !== "active") {
+  if (["suspended", "deactivated"].includes(user.status || "active")) {
     throw httpError("Your account has been suspended. Contact support.", 403);
   }
+
+  const before = `${user.status}|${user.subscriptionStatus}|${user.subscriptionType}|${user.isTrial}|${user.isUnlimited}`;
+  normalizeSubscription(user);
+  const after = `${user.status}|${user.subscriptionStatus}|${user.subscriptionType}|${user.isTrial}|${user.isUnlimited}`;
+  if (before !== after) await user.save();
 
   return safeUser(user);
 };

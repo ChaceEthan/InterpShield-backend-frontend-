@@ -50,7 +50,7 @@ import {
   normalizeLanguageCode as normalizeSharedLanguageCode
 } from "../../shared/languages.mjs";
 
-type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "history" | "help" | "settings" | "admin-login" | "admin";
+type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "subscription" | "history" | "help" | "settings" | "admin-login" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
 type SessionStatus = "idle" | "connecting" | "calibrating" | "listening" | "speaking" | "soft-pause" | "finalizing" | "draining" | "translating" | "paused" | "stopping" | "error";
 type TranslationLifecycleState = "ready" | "queued" | "processing" | "translating" | "retrying" | "translated" | "done" | "failed" | "stale" | "cancelled";
@@ -120,7 +120,8 @@ interface AppUser {
   plan: Plan;
   provider: string;
   role?: "super_admin" | "admin" | "user";
-  status?: "active" | "suspended" | "deactivated";
+  status?: "active" | "expired" | "suspended" | "deactivated";
+  subscription?: { planLabel: string; subscriptionStatus: string; subscriptionType: string; trialEndsAt?: string | null; subscriptionEndsAt?: string | null; daysRemaining?: number | null; isTrial: boolean; isUnlimited: boolean; canUseInterpreter: boolean; nextRenewalAt?: string | null };
   planOverride?: "free" | "starter" | "pro" | "unlimited";
   mustChangePassword?: boolean;
   settings?: UserSettings;
@@ -285,8 +286,8 @@ const MAX_AUDIO_RECOVERY_ATTEMPTS = 2;
 const AUDIO_RECOVERY_DELAY_MS = 900;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
 const AUDIO_MIME_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
-const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "history", "help", "settings", "admin-login", "admin"];
-const PROTECTED_VIEWS = new Set<View>(["dashboard", "history", "settings", "admin"]);
+const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "subscription", "history", "help", "settings", "admin-login", "admin"];
+const PROTECTED_VIEWS = new Set<View>(["dashboard", "subscription", "history", "settings", "admin"]);
 
 const readViteBoolean = (value?: string) => ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
 const CLIENT_SESSION_STORAGE_KEY = "interp_shield_client_session_id";
@@ -1108,6 +1109,11 @@ const TypingSubtitle = ({ text, muted = false, empty = "Waiting for speech..." }
       {visibleText.length < text.trim().length && <span className="ml-1 inline-block h-5 w-1 animate-pulse rounded-full bg-blue-500 align-middle" />}
     </span>
   );
+};
+
+const SubscriptionPage = ({ user }: { user: AppUser | null }) => {
+  const subscription = user?.subscription; const plans = ["Free Trial", "Monthly", "Quarterly", "Yearly", "Enterprise"];
+  return <main className="mx-auto min-h-[70vh] w-full max-w-5xl px-5 py-10"><h1 className="text-3xl font-black">Subscription</h1><p className="mt-2 text-gray-600">Payment processing is not enabled yet. Your account is ready for a future provider.</p>{subscription && <section className="mt-6 grid gap-3 rounded-2xl border bg-white p-5 sm:grid-cols-2 lg:grid-cols-4"><div><b>Current plan</b><p>{subscription.planLabel}</p></div><div><b>Remaining days</b><p>{subscription.daysRemaining == null ? "Never" : subscription.daysRemaining}</p></div><div><b>Expiration date</b><p>{subscription.subscriptionEndsAt || subscription.trialEndsAt ? new Date(subscription.subscriptionEndsAt || subscription.trialEndsAt || "").toLocaleDateString() : "Never expires"}</p></div><div><b>Renewal date</b><p>{subscription.nextRenewalAt ? new Date(subscription.nextRenewalAt).toLocaleDateString() : "Not scheduled"}</p></div></section>}<section className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">{plans.map((plan) => <article key={plan} className="rounded-xl border bg-white p-4"><h2 className="font-black">{plan}</h2><p className="mt-2 text-sm text-gray-500">Provider-ready plan</p></article>)}</section><section className="mt-6 rounded-xl border bg-white p-5"><h2 className="font-black">Payment history</h2><p className="mt-2 text-sm text-gray-500">No payment history yet.</p></section></main>;
 };
 
 const LanguageSelect = ({
@@ -3117,6 +3123,12 @@ export default function App() {
       return;
     }
 
+    if (user?.role === "user" && user.subscription && !user.subscription.canUseInterpreter) {
+      setAlert("Your free trial has expired. Please purchase a subscription to continue using InterpShield.");
+      navigate("subscription");
+      return;
+    }
+
     if (!FRONTEND_CONFIG_DIAGNOSTICS.ok) {
       setStatus("error");
       setAlert(FRONTEND_CONFIG_DIAGNOSTICS.errors[0] || "Frontend environment configuration is invalid.");
@@ -4215,6 +4227,7 @@ export default function App() {
                 Admin Dashboard
               </button>
             )}
+            <button onClick={() => navigate("subscription")} className="flex w-full items-center justify-center gap-2 rounded-lg border border-blue-200 bg-white px-4 py-3 font-bold text-blue-700">Subscription</button>
             <button onClick={() => void logout()} className="flex w-full items-center justify-center gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 font-bold text-red-100 hover:bg-red-500/15">
               <LogOut className="h-4 w-4" />
               Logout
@@ -4234,6 +4247,7 @@ export default function App() {
       {view === "admin-login" && <AdminLogin api={API} error={authError} busy={authProvider === "manual"} onLogin={(email, password) => void handleAuthSubmit({ email, password })} />}
       {view === "dashboard" && isAuthed && renderDashboard()}
       {view === "pricing" && renderPricing()}
+      {view === "subscription" && isAuthed && <SubscriptionPage user={user} />}
       {view === "admin" && token && isAdminRole(user?.role) && <AdminDashboard api={API} token={token} currentUser={user as any} onLogout={() => void logout()} onUnauthorized={handleAdminUnauthorized} onForbidden={handleAdminForbidden} />}
       {view === "history" && isAuthed && renderHistory()}
       {view === "help" && renderHelp()}

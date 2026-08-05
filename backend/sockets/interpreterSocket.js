@@ -2,6 +2,7 @@
 import { verifyToken } from "../services/authService.js";
 import User from "../models/User.js";
 import { isAccountActive } from "../middleware/authorization.js";
+import { EXPIRED_ACCESS_MESSAGE, normalizeSubscription, subscriptionSnapshot } from "../services/subscriptionService.js";
 import { createInterpreterSession, isTranslationDisplayable } from "../services/interpreter.js";
 import {
   createAudioPipelineSession,
@@ -522,8 +523,11 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
     const handleStartSession = async (payload = {}, ack) => {
       const authenticatedUser = await User.findById(authenticatedUserId).lean();
+      normalizeSubscription(authenticatedUser);
       if (!isAccountActive(authenticatedUser)) {
-        const message = "Your account has been suspended. Contact support.";
+        const message = subscriptionSnapshot(authenticatedUser).canUseInterpreter
+          ? "Your account has been suspended. Contact support."
+          : EXPIRED_ACCESS_MESSAGE;
         socket.emit("session_error", { message });
         ack?.(null, { ok: false, error: message });
         return;

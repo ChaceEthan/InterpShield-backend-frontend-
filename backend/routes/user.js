@@ -2,6 +2,7 @@
 import express from "express";
 import { requireAuth } from "./auth.js";
 import { listHistory, saveHistoryItem, updateUserSettings, upgradeUserPlan } from "../services/userService.js";
+import subscriptionRepository from "../services/subscriptionRepository.js";
 
 export const createUserRouter = (env) => {
   const router = express.Router();
@@ -11,6 +12,11 @@ export const createUserRouter = (env) => {
 
   router.get("/profile", (req, res) => {
     res.json({ user: req.user });
+  });
+
+  router.get("/subscription", async (req, res, next) => {
+    try { res.json({ subscription: req.user.subscription, paymentHistory: await subscriptionRepository.listPaymentHistory(req.user.id) }); }
+    catch (error) { next(error); }
   });
 
   router.patch("/settings", async (req, res, next) => {

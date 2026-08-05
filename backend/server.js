@@ -12,6 +12,7 @@ import { getGeminiHealth } from "./services/gemini.js";
 import { getInterpreterSessionHistory } from "./services/interpreter.js";
 import { getOpenAIHealth } from "./services/openai.js";
 import { runStartupAdminBootstrap } from "./services/adminBootstrap.js";
+import { runSubscriptionExpirationCheck } from "./services/subscriptionJobs.js";
 import { getInterpreterSocketHealth, registerInterpreterSocket } from "./sockets/interpreterSocket.js";
 
 validateStartupConfig();
@@ -201,6 +202,9 @@ const startServer = async () => {
   try {
     await connectDatabaseSafely();
     await runStartupAdminBootstrap({ config: env });
+    await runSubscriptionExpirationCheck().catch((error) => console.warn("Subscription check unavailable:", error?.message || error));
+    const subscriptionTimer = setInterval(() => void runSubscriptionExpirationCheck().catch((error) => console.warn("Subscription check failed:", error?.message || error)), 24 * 60 * 60 * 1000);
+    subscriptionTimer.unref?.();
 
     if (env.mongoUri) {
       const retryDatabaseConnection = setInterval(() => {
