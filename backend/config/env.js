@@ -127,6 +127,7 @@ export const env = {
   adminWebhookUrl: readSecret(process.env.ADMIN_WEBHOOK_URL),
   adminEmail: String(process.env.ADMIN_EMAIL || "").trim().toLowerCase(),
   adminPasswordHash: readSecret(process.env.ADMIN_PASSWORD_HASH),
+  adminResetPasswordOnSeed: readBoolean(process.env.ADMIN_RESET_PASSWORD_ON_SEED),
   paths: projectPaths,
   runtimePathStatus,
   maxSessionSeconds: readMaxSessionSeconds(),

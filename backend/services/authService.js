@@ -9,10 +9,13 @@ const BCRYPT_SALT_ROUNDS = 12;
 
 let googleClient = null;
 
+/** @param {string|undefined|null} email */
 const normalizeEmail = (email) => email?.trim().toLowerCase();
 
+/** @param {string} message @param {number} [statusCode] @returns {Error & {statusCode: number}} */
 export const httpError = (message, statusCode = 400) => {
-  const error = new Error(message);
+  /** @type {Error & {statusCode: number}} */
+  const error = /** @type {any} */ (new Error(message));
   error.statusCode = statusCode;
   return error;
 };
@@ -23,18 +26,23 @@ const requireJwtSecret = (env) => {
   }
 };
 
+/** @param {string} password */
 export const hashPassword = (password) => bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
 
+/** @param {string|undefined|null} storedHash */
 const isBcryptHash = (storedHash) => storedHash?.startsWith("$2a$") || storedHash?.startsWith("$2b$") || storedHash?.startsWith("$2y$");
 
+/** @param {string} password @param {string|undefined|null} storedHash */
 export const verifyPassword = async (password, storedHash) => {
   if (!storedHash) return false;
   if (!isBcryptHash(storedHash)) return false;
   return bcrypt.compare(password, storedHash);
 };
 
+/** @param {any} value */
 const toId = (value) => value?._id?.toString?.() || value?.id || value?.toString?.() || "";
 
+/** @param {any} user */
 export const safeUser = (user) => ({
   id: toId(user),
   name: user.name,
@@ -57,23 +65,27 @@ export const safeUser = (user) => ({
   createdAt: user.createdAt?.toISOString?.() || user.createdAt
 });
 
+/** @param {any} user @param {any} env */
 export const signToken = (user, env) => {
   requireJwtSecret(env);
 
   return jwt.sign({ userId: toId(user) }, env.jwtSecret, { expiresIn: "30d" });
 };
 
+/** @param {string} token @param {any} env */
 export const verifyToken = (token, env) => {
   requireJwtSecret(env);
 
   return jwt.verify(token, env.jwtSecret);
 };
 
+/** @param {any} user @param {any} env */
 export const createSession = (user, env) => ({
   user: safeUser(user),
   token: signToken(user, env)
 });
 
+/** @param {{name?: string, email?: string, password?: string}} [credentials] @param {any} [env] */
 export const registerUser = async ({ name, email, password } = {}, env) => {
   const normalizedEmail = normalizeEmail(email);
   const cleanName = name?.trim() || normalizedEmail?.split("@")[0] || "Interpreter";
@@ -106,6 +118,7 @@ export const registerUser = async ({ name, email, password } = {}, env) => {
   }
 };
 
+/** @param {{email?: string, password?: string}} [credentials] @param {any} [env] */
 export const loginUser = async ({ email, password } = {}, env) => {
   const normalizedEmail = normalizeEmail(email);
 
@@ -138,6 +151,7 @@ export const loginUser = async ({ email, password } = {}, env) => {
   return createSession(user, env);
 };
 
+/** @param {{credential?: string}} credentials @param {any} env */
 const verifyGoogleCredential = async ({ credential }, env) => {
   if (!credential) {
     throw httpError("Missing Google credential", 400);
@@ -167,6 +181,7 @@ const verifyGoogleCredential = async ({ credential }, env) => {
   }
 };
 
+/** @param {{credential?: string}} [credentials] @param {any} [env] */
 export const loginWithGoogle = async ({ credential } = {}, env) => {
   const googleProfile = await verifyGoogleCredential({ credential }, env);
   const normalizedEmail = normalizeEmail(googleProfile.email);
@@ -205,6 +220,7 @@ export const loginWithGoogle = async ({ credential } = {}, env) => {
   return createSession(user, env);
 };
 
+/** @param {string} token @param {any} env */
 export const getUserByToken = async (token, env) => {
   requireDatabase(env);
 
@@ -222,6 +238,7 @@ export const getUserByToken = async (token, env) => {
   return safeUser(user);
 };
 
+/** @param {string} token @param {any} env */
 export const refreshSessionByToken = async (token, env) => {
   const user = await getUserByToken(token, env);
   return createSession(user, env);

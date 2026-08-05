@@ -9,4 +9,7 @@ const auditLogSchema = new mongoose.Schema({
   ipHash: { type: String, default: "", select: false }
 }, { timestamps: true, versionKey: false });
 
-export default mongoose.models.AuditLog || mongoose.model("AuditLog", auditLogSchema);
+/** @type {mongoose.Model<any>} */
+const AuditLog = mongoose.models.AuditLog || mongoose.model("AuditLog", auditLogSchema);
+
+export default AuditLog;

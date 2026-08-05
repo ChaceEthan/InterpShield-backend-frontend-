@@ -6,12 +6,23 @@ import User from "../models/User.js";
 import { httpError, safeUser } from "./authService.js";
 import { canManageUser } from "../middleware/authorization.js";
 
+/** @typedef {{id: string, role: string}} AdminActor */
+/** @typedef {{search?: unknown, role?: unknown, status?: unknown, plan?: unknown, limit?: unknown}} AdminUserQuery */
+/** @typedef {{actor: AdminActor, targetId: string, reason: unknown, ip?: string}} AdminAction */
+/** @typedef {AdminAction & {status: string}} StatusAction */
+/** @typedef {AdminAction & {planOverride: string, accessOverrideEndsAt?: unknown}} PlanAction */
+/** @typedef {AdminAction & {role: string}} RoleAction */
+/** @typedef {{adminUserId?: unknown, action: unknown, targetUserId?: unknown, reason?: unknown, metadata?: Record<string, unknown>, ip?: string}} AuditEntry */
+
 export const ADMIN_ROLES = ["admin", "super_admin"];
 export const USER_STATUSES = ["active", "suspended", "deactivated"];
 export const ACCESS_PLANS = ["free", "starter", "pro", "unlimited"];
+/** @param {unknown} value @param {number} [max] */
 const safeText = (value, max = 500) => String(value || "").trim().slice(0, max);
-const validId = (id) => mongoose.isValidObjectId(id);
+/** @param {unknown} id */
+const validId = (id) => mongoose.isValidObjectId(/** @type {any} */ (id));
 
+/** @param {AuditEntry} entry */
 export const writeAuditLog = async ({ adminUserId, action, targetUserId, reason, metadata = {}, ip = "" }) =>
   AuditLog.create({
     adminUserId: validId(adminUserId) ? adminUserId : undefined,
@@ -22,6 +33,7 @@ export const writeAuditLog = async ({ adminUserId, action, targetUserId, reason,
     ipHash: ip ? crypto.createHash("sha256").update(ip).digest("hex") : ""
   });
 
+/** @param {any} user */
 export const adminUserView = (user) => ({
   ...safeUser(user),
   status: user.status || "active",
@@ -54,6 +66,7 @@ export const getAdminOverview = async () => {
     User.find({ lastActiveAt: { $ne: null } }).sort({ lastActiveAt: -1 }).limit(10).lean()
   ]);
   const allUsers = groups.reduce((sum, item) => sum + item.count, 0);
+  /** @param {(item: any) => boolean} predicate */
   const count = (predicate) => groups.filter(predicate).reduce((sum, item) => sum + item.count, 0);
   return {
     totalUsers: allUsers,
@@ -74,17 +87,20 @@ export const getAdminOverview = async () => {
   };
 };
 
+/** @param {AdminUserQuery} [query] */
 export const listAdminUsers = async (query = {}) => {
+  /** @type {Record<string, any>} */
   const filter = {};
   if (query.search) filter.$or = ["name", "email"].map((field) => ({ [field]: { $regex: safeText(query.search, 100).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" } }));
-  if (["user", ...ADMIN_ROLES].includes(query.role)) filter.role = query.role;
-  if (USER_STATUSES.includes(query.status)) filter.status = query.status;
-  if (["free", "pro_lite", "creator", "business", "team"].includes(query.plan)) filter.plan = query.plan;
+  if (["user", ...ADMIN_ROLES].includes(String(query.role))) filter.role = String(query.role);
+  if (USER_STATUSES.includes(String(query.status))) filter.status = String(query.status);
+  if (["free", "pro_lite", "creator", "business", "team"].includes(String(query.plan))) filter.plan = String(query.plan);
   const limit = Math.min(100, Math.max(1, Number(query.limit) || 50));
   const users = await User.find(filter).sort({ createdAt: -1 }).limit(limit);
   return users.map(adminUserView);
 };
 
+/** @param {string} id */
 export const getAdminUser = async (id) => {
   if (!validId(id)) throw httpError("User not found.", 404);
   const user = await User.findById(id);
@@ -92,12 +108,14 @@ export const getAdminUser = async (id) => {
   return adminUserView(user);
 };
 
+/** @param {unknown} reason */
 const requireReason = (reason) => {
   const clean = safeText(reason);
   if (clean.length < 3) throw httpError("A reason is required.", 400);
   return clean;
 };
 
+/** @param {StatusAction} action */
 export const updateUserStatus = async ({ actor, targetId, status, reason, ip }) => {
   if (!USER_STATUSES.includes(status)) throw httpError("Invalid account status.", 400);
   const target = await User.findById(targetId);
@@ -115,6 +133,7 @@ export const updateUserStatus = async ({ actor, targetId, status, reason, ip }) 
   return adminUserView(target);
 };
 
+/** @param {PlanAction} action */
 export const updateUserPlan = async ({ actor, targetId, planOverride, accessOverrideEndsAt, reason, ip }) => {
   if (!ACCESS_PLANS.includes(planOverride)) throw httpError("Invalid access plan.", 400);
   const target = await User.findById(targetId);
@@ -122,14 +141,16 @@ export const updateUserPlan = async ({ actor, targetId, planOverride, accessOver
   if (!canManageUser(actor, target)) throw httpError("Access denied.", 403);
   const cleanReason = requireReason(reason);
   target.planOverride = planOverride;
+  /** @type {Record<string, string>} */
   const effectivePlans = { free: "free", starter: "pro_lite", pro: "creator" };
   if (effectivePlans[planOverride]) target.plan = effectivePlans[planOverride];
-  target.accessOverrideEndsAt = accessOverrideEndsAt ? new Date(accessOverrideEndsAt) : undefined;
+  target.accessOverrideEndsAt = accessOverrideEndsAt ? new Date(String(accessOverrideEndsAt)) : undefined;
   await target.save();
   await writeAuditLog({ adminUserId: actor.id, targetUserId: targetId, action: "plan_changed", reason: cleanReason, metadata: { planOverride }, ip });
   return adminUserView(target);
 };
 
+/** @param {AdminAction} action */
 export const resetUserUsage = async ({ actor, targetId, reason, ip }) => {
   const target = await User.findById(targetId);
   if (!target) throw httpError("User not found.", 404);
@@ -141,6 +162,7 @@ export const resetUserUsage = async ({ actor, targetId, reason, ip }) => {
   return adminUserView(target);
 };
 
+/** @param {RoleAction} action */
 export const updateUserRole = async ({ actor, targetId, role, reason, ip }) => {
   if (!ADMIN_ROLES.includes(actor.role)) throw httpError("Access denied.", 403);
   if (actor.role !== "super_admin" || !["user", "admin"].includes(role)) throw httpError("Super admin access required.", 403);
@@ -152,4 +174,5 @@ export const updateUserRole = async ({ actor, targetId, role, reason, ip }) => {
   return adminUserView(target);
 };
 
+/** @param {unknown} [limit] */
 export const listAuditLogs = async (limit = 100) => AuditLog.find({}).select("-ipHash").sort({ createdAt: -1 }).limit(Math.min(200, Number(limit) || 100)).lean();

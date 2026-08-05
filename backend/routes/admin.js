@@ -1,4 +1,3 @@
-// @ts-nocheck
 import express from "express";
 import User from "../models/User.js";
 import { requireAuth } from "./auth.js";
@@ -7,9 +6,12 @@ import { createSession, hashPassword, httpError, verifyPassword } from "../servi
 import { getAdminOverview, getAdminUser, listAdminUsers, listAuditLogs, resetUserUsage, updateUserPlan, updateUserRole, updateUserStatus, writeAuditLog } from "../services/adminService.js";
 
 const attempts = new Map(); const WINDOW_MS = 900000; const MAX_ATTEMPTS = 5;
+/** @param {import("express").Request} req */
 const clientKey = (req) => String(req.ip || req.socket?.remoteAddress || "unknown");
+/** @param {any} req @param {import("express").Response} res @param {import("express").NextFunction} next */
 const loginRateLimit = (req, res, next) => { const key = clientKey(req); const now = Date.now(); const entry = attempts.get(key) || { count: 0, resetAt: now + WINDOW_MS }; if (now > entry.resetAt) { entry.count = 0; entry.resetAt = now + WINDOW_MS; } if (entry.count >= MAX_ATTEMPTS) return res.status(429).json({ error: "Too many login attempts. Try again later." }); req.adminAttempt = entry; req.adminAttemptKey = key; next(); };
 
+/** @param {any} env */
 export const createAdminRouter = (env) => {
   const router = express.Router();
   router.post("/login", loginRateLimit, async (req, res, next) => { try {
