@@ -38,7 +38,7 @@ assert.match(appSource, /const createdAt = Date\.now\(\)/, "completed translatio
 assert.doesNotMatch(appSource, /recordingRef\.current = isRecording/, "dubbing UI status cannot reactivate a stopped microphone");
 assert.match(appSource, /recordingRef\.current = true;\s*recorder\.start/, "actual MediaRecorder startup activates the microphone ref");
 assert.match(appSource, /socketRef\.current\?\.emit\("audio_utterance_end"/, "auto-stop requests finalization while keeping capture alive for the drain window");
-assert.match(appSource, /cleanupMedia\(\{ preserveTranslationPipeline: reason === "processed" \}\)/, "capture is released only when drain processing finishes or times out");
+assert.match(appSource, /cleanupMedia\(\{ preserveTranslationPipeline: reason === "processed", stopReason: `drain_\$\{reason\}` \}\)/, "capture is released once with an explicit reason when drain processing finishes or times out");
 assert.match(appSource, /const speakTranslatedCaption[\s\S]*?stopDubbingPlayback\(false\)/, "manual translated-card replay stops current speech without erasing automatic deduplication");
 assert.match(transcriptAreaSource, /onSpeakTranslation\?\.\(entry\.language, entry\.text\)/, "translated cards replay their own language and text");
 assert.match(appSource, /translationId: `manual-\$\{createdAt\}-\$\{language\}`,[\s\S]*?language,[\s\S]*?text: spokenText/, "Chinese and French card replay retain the selected card language");

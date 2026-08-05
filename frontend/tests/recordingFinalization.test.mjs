@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { createRecordingStateMachine } from "../src/audio/recordingStateMachine.mjs";
+import { readFileSync } from "node:fs";
+import { createRecorderGenerationController, createRecordingStateMachine } from "../src/audio/recordingStateMachine.mjs";
 
 const timers = new Map();
 let timerId = 0;
@@ -51,3 +52,41 @@ assert.equal(sessionClosed, 2);
 
 assert.deepEqual(phases.slice(0, 4), ["listening", "draining", "translating", "idle"]);
 console.log("Recording auto-stop and drain state-machine regression tests passed.");
+
+const recorderStarts = [], recorderStops = [];
+const recorder = createRecorderGenerationController({
+  onStart(event) { recorderStarts.push(event); },
+  onStop(event) { recorderStops.push(event); }
+});
+const firstGeneration = recorder.explicitStart();
+assert.equal(firstGeneration, 1, "one microphone press creates one recording generation");
+assert.equal(recorder.explicitStart(), null, "a pending start cannot be duplicated");
+assert.equal(recorder.sessionReady(firstGeneration), true);
+assert.equal(recorder.sessionReady(firstGeneration), false, "duplicate session ACK cannot start MediaRecorder twice");
+assert.equal(recorder.sessionReady(firstGeneration - 1), false, "a stale ACK cannot restart an old generation");
+assert.equal(recorderStarts.length, 1, "one microphone press creates exactly one MediaRecorder start");
+assert.equal(recorder.reconnect(), false, "socket reconnect does not create a MediaRecorder");
+assert.equal(recorderStarts.length, 1);
+assert.equal(recorder.streamGenerationChanged(2), true, "one confirmed Deepgram generation boundary may be handled");
+assert.equal(recorder.streamGenerationChanged(2), false, "duplicate generation resets are ignored");
+assert.equal(recorder.snapshot().phase, "listening", "short pauses do not alter recorder ownership");
+assert.equal(recorder.beginDrain(), true, "sustained silence enters draining once");
+assert.equal(recorder.beginDrain(), false);
+assert.equal(recorder.finish("drain_timeout"), true);
+assert.equal(recorder.finish("drain_timeout"), false, "drain timeout stops once without restart");
+assert.equal(recorderStops.length, 1);
+assert.equal(recorderStarts.length, 1);
+const secondGeneration = recorder.explicitStart();
+assert.equal(secondGeneration, 2, "a second explicit microphone press creates the next generation");
+assert.equal(recorder.sessionReady(secondGeneration), true);
+assert.equal(recorderStarts.length, 2, "the second press creates exactly one new MediaRecorder start");
+
+const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+for (const guard of ["startInFlightRef", "stopInFlightRef", "activeRecordingGenerationRef", "activeSessionIdRef", "recorderStartedForGenerationRef", "recorderStoppedForGenerationRef"]) {
+  assert.match(appSource, new RegExp(`const ${guard} = useRef`), `${guard} protects recorder lifecycle ownership`);
+}
+assert.doesNotMatch(appSource, /AUDIO_RECOVERY_SCHEDULED[\s\S]{0,900}?startSession/, "transient recorder recovery cannot automatically start a new recording generation");
+assert.match(appSource, /nextGeneration <= lastHandledDeepgramGenerationRef\.current/, "duplicate Deepgram generation resets are ignored");
+assert.match(appSource, /recordingPhaseRef\.current !== "listening"/, "draining blocks recorder generation changes and duplicate drain requests");
+assert.match(appSource, /activeRecordingGenerationRef\.current !== recordingGeneration[\s\S]{0,300}?if \(stale\) return/, "late start ACKs cannot update an old generation");
+assert.match(appSource, /stopReason: "no_meaningful_speech_timeout"/, "no-speech timeout stops once without restarting");

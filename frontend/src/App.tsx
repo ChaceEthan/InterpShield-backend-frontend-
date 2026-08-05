@@ -74,6 +74,7 @@ type TranslationProviderDiagnostic = {
   message?: string;
 };
 type SocketConnectionState = "ready" | "connecting" | "connected" | "listening" | "translating" | "reconnecting";
+type RecordingPhase = "idle" | "starting" | "listening" | "draining" | "finalizing" | "stopped";
 type MicrophonePermissionState = "unknown" | "prompt" | "granted" | "denied" | "unsupported";
 type MicrophoneRuntimeState = "idle" | "checking" | "requesting" | "ready" | "recording" | "recovering" | "blocked" | "failed";
 type Plan = "free" | "pro";
@@ -285,8 +286,6 @@ const CLIENT_HEARTBEAT_MS = 25000;
 const AUTH_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STALE_TRANSLATION_STATE_MS = 45000;
 const SOCKET_HEARTBEAT_STALE_MS = 75000;
-const MAX_AUDIO_RECOVERY_ATTEMPTS = 2;
-const AUDIO_RECOVERY_DELAY_MS = 900;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "subscription", "history", "help", "settings", "admin-login", "admin"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "subscription", "history", "settings", "admin"]);
@@ -1510,6 +1509,7 @@ export default function App() {
     };
     preferredProvider?: string;
     userPlan?: Plan;
+    recordingGeneration: number;
   } | null>(null);
   const shouldRestartSessionOnReconnectRef = useRef(false);
   const sequenceRef = useRef(0);
@@ -1562,9 +1562,19 @@ export default function App() {
   const saveTranscriptRef = useRef(saveTranscript);
   const sessionSecondsRef = useRef(sessionSeconds);
   const sessionActionInFlightRef = useRef(false);
+  const startInFlightRef = useRef(false);
+  const stopInFlightRef = useRef(false);
+  const activeRecordingGenerationRef = useRef(0);
+  const activeSessionIdRef = useRef("");
+  const recorderStartedForGenerationRef = useRef<number | null>(null);
+  const recorderStoppedForGenerationRef = useRef<number | null>(null);
+  const recordingPhaseRef = useRef<RecordingPhase>("idle");
+  const recorderStopReasonRef = useRef("unexpected_stop");
+  const lastHandledDeepgramGenerationRef = useRef(1);
+  const speechDetectedRef = useRef(false);
+  const lastVadSilenceDurationRef = useRef(0);
   const authRequestRef = useRef<AuthProvider | null>(null);
   const socketAuthRefreshInFlightRef = useRef(false);
-  const startSessionRef = useRef<(() => Promise<void>) | null>(null);
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro" || isAdminRole(user?.role);
@@ -2145,7 +2155,7 @@ export default function App() {
     }
   }, []);
 
-  const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean; preserveTranslationPipeline?: boolean } = {}) => {
+  const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean; preserveTranslationPipeline?: boolean; stopReason?: string } = {}) => {
     if (vadPollTimerRef.current) {
       window.clearInterval(vadPollTimerRef.current);
       vadPollTimerRef.current = null;
@@ -2165,10 +2175,16 @@ export default function App() {
       audioRestartAttemptsRef.current = 0;
     }
     recordingRef.current = false;
+    recordingPhaseRef.current = "stopped";
     sessionReadyRef.current = false;
     setMicrophoneActive(false);
     const recorder = mediaRecorderRef.current;
-    if (recorder && recorder.state !== "inactive") recorder.stop();
+    if (recorder && recorder.state !== "inactive" && recorderStoppedForGenerationRef.current !== activeRecordingGenerationRef.current) {
+      recorderStoppedForGenerationRef.current = activeRecordingGenerationRef.current;
+      stopInFlightRef.current = true;
+      recorderStopReasonRef.current = options.stopReason || "session_cleanup";
+      recorder.stop();
+    }
     setMediaRecorderActive(false);
     mediaRecorderRef.current = null;
     processedStreamRef.current?.getTracks().forEach((track) => track.stop());
@@ -2205,6 +2221,7 @@ export default function App() {
       interimTimerRef.current = null;
     }
     pendingPartialTranscriptRef.current = null;
+    startInFlightRef.current = false;
   }, [stopDubbingPlayback, stopSilenceMonitor]);
 
   const finishDrain = useCallback((reason: "processed" | "timeout") => {
@@ -2219,7 +2236,8 @@ export default function App() {
       setTranslationStatuses(readyStatuses);
       setTranslationDiagnostics({});
     }
-    cleanupMedia({ preserveTranslationPipeline: reason === "processed" });
+    recordingPhaseRef.current = "finalizing";
+    cleanupMedia({ preserveTranslationPipeline: reason === "processed", stopReason: `drain_${reason}` });
     socketRef.current?.emit("end_session", { reason });
     activeSessionPayloadRef.current = null;
     activeBackendSessionIdRef.current = "";
@@ -2227,11 +2245,14 @@ export default function App() {
     sessionActionInFlightRef.current = false;
     setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
     setStatus("idle");
+    recordingPhaseRef.current = "idle";
+    stopInFlightRef.current = false;
   }, [cleanupMedia]);
   finishDrainRef.current = finishDrain;
 
   const beginDrain = useCallback(() => {
-    if (!recordingRef.current || awaitingFinalTranscriptRef.current) return;
+    if (!recordingRef.current || awaitingFinalTranscriptRef.current || recordingPhaseRef.current !== "listening") return;
+    recordingPhaseRef.current = "draining";
     awaitingFinalTranscriptRef.current = true;
     setAwaitingFinalTranscript(true);
     drainPendingLanguagesRef.current.clear();
@@ -2247,44 +2268,16 @@ export default function App() {
   }, [finishDrain]);
 
   const scheduleAudioRecovery = useCallback((reason: string) => {
-    if (!recordingRef.current || status === "stopping") return;
-
-    if (audioRestartAttemptsRef.current >= MAX_AUDIO_RECOVERY_ATTEMPTS) {
-      setAudioDiagnostic({
-        state: "failed",
-        message: "Microphone recovery failed",
-        lastRestartReason: reason
-      });
-      setStatus("error");
-      setAlert("Microphone stopped unexpectedly and could not recover.");
-      cleanupMedia();
-      return;
-    }
-
-    audioRestartAttemptsRef.current += 1;
-    setAudioDiagnostic((current) => ({
-      ...current,
-      state: "recovering",
-      message: "Recovering microphone",
-      lastRestartReason: reason
-    }));
-    logFrontendDebug("audio", "AUDIO_RECOVERY_SCHEDULED", {
-      reason,
-      attempt: audioRestartAttemptsRef.current
-    });
-
-    if (audioRecoveryTimerRef.current) window.clearTimeout(audioRecoveryTimerRef.current);
-    audioRecoveryTimerRef.current = window.setTimeout(() => {
-      audioRecoveryTimerRef.current = null;
-      socketRef.current?.emit("end_session");
-      sessionActionInFlightRef.current = false;
-      cleanupMedia({ preserveRecoveryTimer: true, preserveRestartAttempts: true });
-      setStatus("connecting");
-      window.setTimeout(() => {
-        void startSessionRef.current?.();
-      }, 150);
-    }, AUDIO_RECOVERY_DELAY_MS);
-  }, [cleanupMedia, status]);
+    if (!recordingRef.current || recordingPhaseRef.current === "draining" || recordingPhaseRef.current === "finalizing") return;
+    logFrontendDebug("audio", "AUDIO_RECOVERY_BLOCKED", { reason, recordingGeneration: activeRecordingGenerationRef.current });
+    setAudioDiagnostic({ state: "failed", message: "Microphone stopped unexpectedly", lastRestartReason: reason });
+    setAlert("Microphone stopped unexpectedly. Press the microphone to try again.");
+    cleanupMedia({ stopReason: reason });
+    socketRef.current?.emit("end_session", { reason });
+    setStatus("idle");
+    recordingPhaseRef.current = "idle";
+    stopInFlightRef.current = false;
+  }, [cleanupMedia]);
 
   const emitAudioChunkPayload = useCallback((payload: AudioChunkPayload) => {
     const activeSocket = socketRef.current;
@@ -2327,10 +2320,11 @@ export default function App() {
   }, []);
 
   const stopSession = useCallback(() => {
-    if (status === "stopping") return;
+    if (status === "stopping" || stopInFlightRef.current) return;
+    stopInFlightRef.current = true;
     sessionActionInFlightRef.current = true;
     setStatus("stopping");
-    cleanupMedia();
+    cleanupMedia({ stopReason: "explicit_user_stop" });
     if (drainTimeoutRef.current) window.clearTimeout(drainTimeoutRef.current);
     drainTimeoutRef.current = null;
     awaitingFinalTranscriptRef.current = false;
@@ -2341,14 +2335,18 @@ export default function App() {
     sessionActionInFlightRef.current = false;
     setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
     setStatus("idle");
+    recordingPhaseRef.current = "idle";
+    stopInFlightRef.current = false;
   }, [cleanupMedia, status]);
 
   const completeListeningSession = useCallback((translationsPending: boolean) => {
     if (!recordingRef.current) return;
-    cleanupMedia({ preserveTranslationPipeline: translationsPending });
+    cleanupMedia({ preserveTranslationPipeline: translationsPending, stopReason: "final_transcript_processed" });
     if (!translationsPending) socketRef.current?.emit("end_session");
     setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
     setStatus("idle");
+    recordingPhaseRef.current = "idle";
+    stopInFlightRef.current = false;
   }, [cleanupMedia]);
 
   useEffect(() => {
@@ -2536,7 +2534,8 @@ export default function App() {
 
     const handleDeepgramStreamReset = ({ generation }: { generation?: number }) => {
       const nextGeneration = Number(generation);
-      if (!recordingRef.current || !Number.isFinite(nextGeneration) || nextGeneration <= audioStreamGenerationRef.current) return;
+      if (!recordingRef.current || recordingPhaseRef.current !== "listening" || !Number.isFinite(nextGeneration) || nextGeneration <= lastHandledDeepgramGenerationRef.current) return;
+      lastHandledDeepgramGenerationRef.current = nextGeneration;
       const recorder = mediaRecorderRef.current;
       pendingAudioStreamGenerationRef.current = nextGeneration;
       queuedAudioChunksRef.current = [];
@@ -2544,24 +2543,36 @@ export default function App() {
       recorderGenerationRestartRef.current = true;
       console.info("[AUDIO_STREAM_GENERATION_RESET]", { sessionId: clientSessionIdRef.current, oldGeneration: audioStreamGenerationRef.current, newGeneration: nextGeneration, recorderState: recorder?.state });
       if (recorder?.state === "recording" || recorder?.state === "paused") {
+        recorderStopReasonRef.current = "deepgram_generation_change";
         recorder.stop();
       } else if (recorder?.state === "inactive") {
         audioStreamGenerationRef.current = nextGeneration;
         awaitingContainerHeaderRef.current = true;
         recorderGenerationRestartRef.current = false;
+        const previousState = recorder.state;
         recorder.start(audioChunkMsRef.current);
+        console.info("[MEDIARECORDER_START]", { reason: "deepgram_generation_change", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, previousState, mimeType: recorder.mimeType, streamGeneration: nextGeneration });
       }
     };
     socket.on("deepgram_stream_reset", handleDeepgramStreamReset);
 
-    const markSessionReady = () => {
+    const markSessionReady = (payload?: { recordingGeneration?: number; sessionId?: string }) => {
+      const readyGeneration = Number(payload?.recordingGeneration || activeSessionPayloadRef.current?.recordingGeneration);
+      const initialReady = recordingPhaseRef.current === "starting";
+      if (!Number.isFinite(readyGeneration) || readyGeneration !== activeRecordingGenerationRef.current || !["starting", "listening"].includes(recordingPhaseRef.current)) {
+        console.info("[SESSION_START_ACK_IGNORED]", { readyGeneration, activeGeneration: activeRecordingGenerationRef.current, phase: recordingPhaseRef.current });
+        return;
+      }
       sessionActionInFlightRef.current = false;
+      startInFlightRef.current = false;
       sessionReadyRef.current = true;
+      activeSessionIdRef.current = payload?.sessionId || activeSessionIdRef.current;
       const recorder = mediaRecorderRef.current;
-      if (recorder?.state === "inactive") {
+      if (initialReady && recorder?.state === "inactive" && recorderStartedForGenerationRef.current !== readyGeneration) {
+        recorderStartedForGenerationRef.current = readyGeneration;
         recordingRef.current = true;
         recorder.start(audioChunkMsRef.current);
-        console.info("[MEDIARECORDER_START]", { mimeType: recorder.mimeType, state: recorder.state, streamGeneration: audioStreamGenerationRef.current });
+        console.info("[MEDIARECORDER_START]", { reason: "session_ready", recordingGeneration: readyGeneration, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, previousState: "inactive", mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
         setMicrophoneActive(true);
         setMediaRecorderActive(true);
       } else if (recorder?.state === "paused") {
@@ -2581,6 +2592,20 @@ export default function App() {
         lastError: undefined
       }));
       setStatus("listening");
+      recordingPhaseRef.current = "listening";
+      if (initialReady) {
+        if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
+        captionWatchdogTimerRef.current = window.setTimeout(() => {
+          captionWatchdogTimerRef.current = null;
+          if (activeRecordingGenerationRef.current !== readyGeneration || recordingPhaseRef.current !== "listening" || speechDetectedRef.current) return;
+          cleanupMedia({ stopReason: "no_meaningful_speech_timeout" });
+          socketRef.current?.emit("end_session", { reason: "no_meaningful_speech_timeout" });
+          setAudioDiagnostic({ state: "idle", message: "No speech detected. Microphone ready" });
+          setStatus("idle");
+          recordingPhaseRef.current = "idle";
+          stopInFlightRef.current = false;
+        }, CAPTION_WATCHDOG_MS);
+      }
     };
 
     socket.on("session_ready", markSessionReady);
@@ -3181,8 +3206,7 @@ export default function App() {
   }, [fetchHistory, view]);
 
   const startSession = useCallback(async () => {
-    if (sessionActionInFlightRef.current || recordingRef.current) return;
-
+    if (sessionActionInFlightRef.current || startInFlightRef.current || recordingRef.current || recordingPhaseRef.current !== "idle") return;
     primeSpeechSynthesis();
 
     if (!isAuthed) {
@@ -3202,6 +3226,16 @@ export default function App() {
       return;
     }
 
+    const recordingGeneration = activeRecordingGenerationRef.current + 1;
+    activeRecordingGenerationRef.current = recordingGeneration;
+    startInFlightRef.current = true;
+    stopInFlightRef.current = false;
+    recorderStartedForGenerationRef.current = null;
+    recorderStoppedForGenerationRef.current = null;
+    activeSessionIdRef.current = "";
+    speechDetectedRef.current = false;
+    lastVadSilenceDurationRef.current = 0;
+    recordingPhaseRef.current = "starting";
     sessionActionInFlightRef.current = true;
     setAlert(null);
     setStatus("connecting");
@@ -3327,6 +3361,7 @@ export default function App() {
       pendingAudioStreamGenerationRef.current = 1;
       awaitingContainerHeaderRef.current = true;
       recorderGenerationRestartRef.current = false;
+      lastHandledDeepgramGenerationRef.current = 1;
       mediaRecorderRef.current = recorder;
       const deviceLabel = stream.getAudioTracks()[0]?.label || (microphoneId === "default" ? "System default microphone" : "Selected microphone");
       setAudioDiagnostic({
@@ -3447,18 +3482,20 @@ export default function App() {
       };
 
       recorder.onstop = () => {
-        console.info("[MEDIARECORDER_STOP]", { mimeType: recorder.mimeType, state: recorder.state, streamGeneration: audioStreamGenerationRef.current, generationRestart: recorderGenerationRestartRef.current });
+        console.info("[MEDIARECORDER_STOP]", { reason: recorderStopReasonRef.current, recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, currentState: recorder.state, speechDetected: speechDetectedRef.current, silenceDuration: lastVadSilenceDurationRef.current, pendingFinalTranscript: awaitingFinalTranscriptRef.current, socketConnected: Boolean(socketRef.current?.connected), mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
         if (recorderGenerationRestartRef.current && recordingRef.current) {
           recorderGenerationRestartRef.current = false;
           audioStreamGenerationRef.current = pendingAudioStreamGenerationRef.current;
           sequenceRef.current = 0;
           pendingSpeechChunksRef.current = [];
           awaitingContainerHeaderRef.current = true;
+          const previousState = recorder.state;
           recorder.start(audioChunkMsRef.current);
-          console.info("[MEDIARECORDER_START]", { mimeType: recorder.mimeType, state: recorder.state, streamGeneration: audioStreamGenerationRef.current, reason: "deepgram_generation_reset" });
+          console.info("[MEDIARECORDER_START]", { reason: "deepgram_generation_change", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, previousState, mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
           setMediaRecorderActive(true);
           return;
         }
+        stopInFlightRef.current = false;
         if (recordingRef.current && status !== "stopping") {
           scheduleAudioRecovery("recorder_stopped");
         }
@@ -3475,6 +3512,7 @@ export default function App() {
         if (dubbingTransmissionGatedRef.current) return;
         const action = vadControllerRef.current.update(getAudioLevelRef.current(), Date.now(), false);
         if (!action) return;
+        if ("silenceMs" in action) lastVadSilenceDurationRef.current = action.silenceMs || 0;
         console.info("[VAD_STATE]", { event: action.type, speechStarted: action.type === "speech_started" || action.type === "speech_resumed", speechEnded: action.type === "finalize", silenceDuration: "silenceMs" in action ? action.silenceMs : 0, level: action.level, speechThreshold: action.speech, silenceThreshold: action.silence });
         if (action.type === "calibrated") {
           setStatus("listening");
@@ -3488,6 +3526,7 @@ export default function App() {
           return;
         }
         if (action.type === "speech_started") {
+          speechDetectedRef.current = true;
           const buffered = pendingSpeechChunksRef.current.splice(0);
           for (const bufferedChunk of buffered) {
             const { sequence: _discardedSequence, ...capturedChunk } = bufferedChunk;
@@ -3540,7 +3579,8 @@ export default function App() {
           webAudio: Boolean(enhancedAudio.audioContext && recorderSetup.source === "enhanced")
         },
         preferredProvider,
-        userPlan: user?.plan || "free"
+        userPlan: user?.plan || "free",
+        recordingGeneration
       };
       activeSessionPayloadRef.current = sessionPayload;
       shouldRestartSessionOnReconnectRef.current = false;
@@ -3548,11 +3588,16 @@ export default function App() {
       socketRef.current?.timeout(30000).emit(
         "start_session",
         sessionPayload,
-        (timeoutError: Error | null, response?: { ok?: boolean; error?: string }) => {
-          console.info("[SESSION_START_ACK]", { ok: !timeoutError && !response?.error, error: response?.error || timeoutError?.message || null, mimeType: recorderMimeType, sessionId: response && "sessionId" in response ? (response as { sessionId?: string }).sessionId : undefined });
+        (timeoutError: Error | null, response?: { ok?: boolean; error?: string; sessionId?: string }) => {
+          const stale = activeRecordingGenerationRef.current !== recordingGeneration;
+          console.info("[SESSION_START_ACK]", { reason: "explicit_user_start", recordingGeneration, stale, ok: !timeoutError && !response?.error, error: response?.error || timeoutError?.message || null, mimeType: recorderMimeType, sessionId: response?.sessionId });
+          if (stale) return;
+          activeSessionIdRef.current = response?.sessionId || activeSessionIdRef.current;
           if (timeoutError || response?.error) {
             sessionActionInFlightRef.current = false;
-            cleanupMedia();
+            startInFlightRef.current = false;
+            cleanupMedia({ stopReason: "session_start_failed" });
+            recordingPhaseRef.current = "idle";
             setStatus("error");
             setAlert(response?.error || "Unable to reach the live interpreter.");
           }
@@ -3560,7 +3605,9 @@ export default function App() {
       );
     } catch (error) {
       sessionActionInFlightRef.current = false;
-      cleanupMedia();
+      startInFlightRef.current = false;
+      cleanupMedia({ stopReason: "session_start_exception" });
+      recordingPhaseRef.current = "idle";
       setStatus("error");
       const message = mediaErrorMessage(error);
       setAudioDiagnostic({
@@ -3590,10 +3637,6 @@ export default function App() {
       setAlert(message);
     }
   }, [autoGainControl, beginDrain, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, scheduleAudioRecovery, shareableMode, sourceLang, targetLang, targetLanguages, user?.id, user?.plan, status]);
-
-  useEffect(() => {
-    startSessionRef.current = startSession;
-  }, [startSession]);
 
   const selectMode = (nextMode: Mode) => {
     if (isRecording) return;

@@ -654,9 +654,10 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           getTranslationHealth: session.getTranslationHealth
         });
         socketRuntime.totalReconnects += 1;
-        socket.emit("session_ready");
-        socket.emit("session:ready");
-        ack?.({ ok: true, mode: "production", sessionId: session.sessionId, targetLanguages, room: callRoomInfo, recovered: true });
+        const readyPayload = { sessionId: session.sessionId, recordingGeneration: payload.recordingGeneration };
+        socket.emit("session_ready", readyPayload);
+        socket.emit("session:ready", readyPayload);
+        ack?.({ ok: true, mode: "production", sessionId: session.sessionId, recordingGeneration: payload.recordingGeneration, targetLanguages, room: callRoomInfo, recovered: true });
         logSocketTranslationEvent("SOCKET_SESSION_RESUMED", {
           socketId: socket.id,
           oldSocketId,
@@ -694,8 +695,9 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           twoWay,
           onReady: () => {
             const activeSocket = getActiveSocket();
-            activeSocket.emit("session_ready");
-            activeSocket.emit("session:ready");
+            const readyPayload = { sessionId: session?.sessionId, recordingGeneration: payload.recordingGeneration };
+            activeSocket.emit("session_ready", readyPayload);
+            activeSocket.emit("session:ready", readyPayload);
           },
           onWarning: (message) => getActiveSocket().emit("warning", { message }),
           onError: (message) => {
@@ -789,7 +791,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           getTranslationHealth: session.getTranslationHealth
         });
 
-        ack?.({ ok: true, mode: "production", sessionId: session.sessionId, targetLanguages, room: callRoomInfo });
+        ack?.({ ok: true, mode: "production", sessionId: session.sessionId, recordingGeneration: payload.recordingGeneration, targetLanguages, room: callRoomInfo });
         logSocketTranslationEvent("SOCKET_SESSION_STARTED", {
           socketId: socket.id,
           sessionId: session.sessionId,

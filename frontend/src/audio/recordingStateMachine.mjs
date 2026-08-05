@@ -25,3 +25,36 @@ export const createRecordingStateMachine = ({ silenceMs = 1500, drainTimeoutMs =
     snapshot() { return { phase, meaningfulSpeech, awaitingFinalTranscript, pendingLanguages: [...pendingLanguages], dubbingSubmissions: [...dubbingSubmissions] }; }
   };
 };
+
+export const createRecorderGenerationController = ({ onStart = () => {}, onStop = () => {} } = {}) => {
+  let phase = "idle", generation = 0, startInFlight = false, stopInFlight = false;
+  let startedGeneration = 0, stoppedGeneration = 0, lastStreamGeneration = 1;
+  return {
+    explicitStart() {
+      if (phase !== "idle" || startInFlight) return null;
+      generation += 1; startInFlight = true; stopInFlight = false; phase = "starting";
+      return generation;
+    },
+    sessionReady(readyGeneration) {
+      if (phase !== "starting" || readyGeneration !== generation || startedGeneration === generation) return false;
+      startedGeneration = generation; startInFlight = false; phase = "listening"; onStart({ generation, reason: "session_ready" }); return true;
+    },
+    reconnect() { return false; },
+    streamGenerationChanged(streamGeneration) {
+      if (phase !== "listening" || streamGeneration <= lastStreamGeneration) return false;
+      lastStreamGeneration = streamGeneration; return true;
+    },
+    beginDrain() { if (phase !== "listening") return false; phase = "draining"; return true; },
+    finish(reason = "processed") {
+      if (!['draining', 'finalizing'].includes(phase) || stopInFlight || stoppedGeneration === generation) return false;
+      phase = "finalizing"; stopInFlight = true; stoppedGeneration = generation; onStop({ generation, reason });
+      stopInFlight = false; phase = "idle"; return true;
+    },
+    explicitStop() {
+      if (!['starting', 'listening'].includes(phase) || stopInFlight || stoppedGeneration === generation) return false;
+      stopInFlight = true; stoppedGeneration = generation; onStop({ generation, reason: "explicit_user_stop" });
+      startInFlight = false; stopInFlight = false; phase = "idle"; return true;
+    },
+    snapshot() { return { phase, generation, startInFlight, stopInFlight, startedGeneration, stoppedGeneration, lastStreamGeneration }; }
+  };
+};
