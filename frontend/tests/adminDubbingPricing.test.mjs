@@ -54,6 +54,24 @@ assert.equal(lifecycle.snapshot().gated, false, "all target completion releases 
 assert.equal(lifecycle.snapshot().queued, 0, "completed jobs leave no stale queue lock");
 assert.deepEqual(gates.slice(-2), [true, false]);
 
+plays.length = 0;
+for (let sentence = 1; sentence <= 20; sentence += 1) {
+  const translationId = `long-run-utterance-${sentence}`;
+  const language = ["fr", "ru", "zh"][sentence % 3];
+  assert.equal(
+    lifecycle.enqueue({ translationId, language, text: `Translated sentence ${sentence}`, createdAt: sentence }),
+    true,
+    `sentence ${sentence} enters its language queue`
+  );
+  const playback = plays.shift();
+  assert.ok(playback, `sentence ${sentence} starts playback`);
+  assert.equal(playback.job.translationId, translationId, `sentence ${sentence} preserves utterance ordering`);
+  playback.onEnd();
+  assert.equal(lifecycle.snapshot().gated, false, `sentence ${sentence} releases microphone gating`);
+  assert.equal(lifecycle.snapshot().queued, 0, `sentence ${sentence} leaves no frozen queue`);
+}
+assert.equal(plays.length, 0, "all twenty sequential playback callbacks completed");
+
 assert.equal(PLAN_CATALOG.pro_lite.monthlyPrice, 3, "Starter is $3 monthly");
 assert.equal(PLAN_CATALOG.creator.monthlyPrice, 7);
 assert.equal(PLAN_CATALOG.business.monthlyPrice, 15);
