@@ -31,6 +31,8 @@ assert.match(appSource, /dubbingLanguageSignature[\s\S]*?stopDubbingPlayback\(tr
 assert.match(appSource, /void loadSpeechVoices\(\)\.then/, "voices are requested before dubbing jobs are queued");
 assert.match(appSource, /speechSynthesis\.speak\(utterance\)/, "completed translations invoke browser speech playback");
 assert.match(appSource, /Dubbing is unavailable: \$\{unavailableReason\}/, "unsupported automatic dubbing reports an exact reason");
+assert.match(appSource, /EXPECTED_SPEECH_CANCELLATIONS = new Set\(\["interrupted", "canceled", "cancelled"\]\)/, "intentional browser speech cancellations are classified as expected");
+assert.match(appSource, /if \(isExpectedSpeechCancellation\(reason\)\)[\s\S]*?onError\(\)/, "expected cancellation settles the queue without displaying a new failure");
 assert.match(appSource, /const createdAt = Date\.now\(\)/, "completed translations are fresh when submitted to speech synthesis");
 assert.doesNotMatch(appSource, /recordingRef\.current = isRecording/, "dubbing UI status cannot reactivate a stopped microphone");
 assert.match(appSource, /recordingRef\.current = true;\s*recorder\.start/, "actual MediaRecorder startup activates the microphone ref");

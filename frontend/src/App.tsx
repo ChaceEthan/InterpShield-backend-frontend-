@@ -698,6 +698,9 @@ const speechSynthesisUnavailableReason = () => {
   return "";
 };
 
+const EXPECTED_SPEECH_CANCELLATIONS = new Set(["interrupted", "canceled", "cancelled"]);
+const isExpectedSpeechCancellation = (reason: string) => EXPECTED_SPEECH_CANCELLATIONS.has(reason.trim().toLowerCase());
+
 const safeGetStorageItem = (storage: Storage | undefined, key: string) => {
   try {
     return storage?.getItem(key) || null;
@@ -1631,7 +1634,11 @@ export default function App() {
         utterance.onend = onEnd;
         utterance.onerror = (event) => {
           const reason = event.error || "unknown browser speech error";
-          setAlert(`Dubbing audio failed: ${reason}.`);
+          if (isExpectedSpeechCancellation(reason)) {
+            setAlert((current) => current && /^Dubbing audio failed: (?:interrupted|cancell?ed)\.?$/i.test(current) ? null : current);
+          } else {
+            setAlert(`Dubbing audio failed: ${reason}.`);
+          }
           onError();
         };
         try {
