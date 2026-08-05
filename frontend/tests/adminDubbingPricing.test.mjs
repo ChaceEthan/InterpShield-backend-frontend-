@@ -25,31 +25,42 @@ assert.match(adminDashboardSource, /e\.status === 401\) onUnauthorized/, "admin 
 assert.match(adminDashboardSource, /e\.status === 403\) onForbidden/, "admin API authorization failures are handled");
 assert.match(adminDashboardSource, /Promote to admin/, "super admins receive a clear promotion action");
 assert.match(adminDashboardSource, /Remove admin role/, "super admins receive a clear role-removal action");
+assert.match(appSource, /socket\.on\("disconnect",[\s\S]*?stopDubbingPlayback\(true\)/, "socket reconnect cleanup clears queued dubbing");
+assert.match(appSource, /dubbingLanguageSignature[\s\S]*?stopDubbingPlayback\(true\)/, "language changes clear queued dubbing");
 
 const plays = [];
+const prepared = [];
 const gates = [];
 const completions = [];
+let cancels = 0;
+let testNow = 1000;
 const lifecycle = createDubbingLifecycle({
-  play(job, onEnd, onError) { plays.push({ job, onEnd, onError }); },
+  prepare(job) { prepared.push(job.translationId); return { job }; },
+  play(preparedSpeech, job, onStart, onEnd, onError) { plays.push({ preparedSpeech, job, onStart, onEnd, onError }); },
+  cancel() { cancels += 1; },
   onGateChange(value) { gates.push(value); },
   onIdle() { completions.push("idle"); },
-  schedule(callback) { callback(); },
-  pauseMs: () => 0
+  now: () => testNow,
+  maxAgeMs: 500
 });
 
 assert.equal(lifecycle.enqueue({ translationId: "utterance-1", language: "fr", text: "Bonjour" }), true);
 assert.equal(plays.length, 1, "first utterance dubs");
+assert.equal(lifecycle.enqueue({ translationId: "utterance-2", language: "fr", text: "Bonjour" }), true);
+assert.equal(plays.length, 2, "second TTS is prepared and submitted while the first is playing");
+assert.deepEqual(prepared.slice(0, 2), ["utterance-1", "utterance-2"], "TTS preparation preserves translation order");
+assert.equal(lifecycle.enqueue({ translationId: "utterance-2", language: "fr", text: "Bonjour" }), false, "duplicate socket aliases do not submit TTS twice");
 plays.shift().onEnd();
-assert.equal(lifecycle.snapshot().gated, false, "microphone gating ends after playback");
+assert.equal(lifecycle.snapshot().gated, true, "microphone remains gated while prepared speech is queued");
+plays.shift().onEnd();
+assert.equal(lifecycle.snapshot().gated, false, "microphone gating ends after all playback");
 assert.equal(completions.length, 1, "listening can resume after dubbing");
 
-assert.equal(lifecycle.enqueue({ translationId: "utterance-2", language: "fr", text: "Bonjour" }), true);
-assert.equal(plays.length, 1, "identical text in a second utterance dubs again");
-plays.shift().onEnd();
 assert.equal(lifecycle.enqueue({ translationId: "utterance-3", language: "fr", text: "Troisième" }), true);
 assert.equal(plays.length, 1, "third utterance dubs after earlier completion");
 plays.shift().onEnd();
 assert.equal(lifecycle.enqueue({ translationId: "utterance-3", language: "fr", text: "Troisième" }), false, "duplicate event for one utterance is suppressed");
+assert.equal(lifecycle.enqueue({ translationId: "stale", language: "fr", text: "Trop tard", createdAt: 1 }), false, "stale translated speech is discarded");
 
 lifecycle.enqueue({ translationId: "utterance-4", language: "fr", text: "Français" });
 lifecycle.enqueue({ translationId: "utterance-4", language: "ru", text: "Русский" });
@@ -66,7 +77,7 @@ for (let sentence = 1; sentence <= 20; sentence += 1) {
   const translationId = `long-run-utterance-${sentence}`;
   const language = ["fr", "ru", "zh"][sentence % 3];
   assert.equal(
-    lifecycle.enqueue({ translationId, language, text: `Translated sentence ${sentence}`, createdAt: sentence }),
+    lifecycle.enqueue({ translationId, language, text: `Translated sentence ${sentence}`, createdAt: 1000 }),
     true,
     `sentence ${sentence} enters its language queue`
   );
@@ -78,6 +89,19 @@ for (let sentence = 1; sentence <= 20; sentence += 1) {
   assert.equal(lifecycle.snapshot().queued, 0, `sentence ${sentence} leaves no frozen queue`);
 }
 assert.equal(plays.length, 0, "all twenty sequential playback callbacks completed");
+
+lifecycle.enqueue({ translationId: "queued-before-stop", language: "zh", text: "排队", createdAt: 1000 });
+lifecycle.stop();
+assert.equal(cancels, 1, "session or language cleanup cancels browser speech and clears its queue");
+assert.equal(lifecycle.snapshot().queued, 0);
+assert.equal(lifecycle.snapshot().gated, false);
+plays.length = 0;
+
+lifecycle.enqueue({ translationId: "fresh-then-delayed", language: "zh", text: "延迟", createdAt: 1000 });
+testNow = 1600;
+plays.shift().onStart();
+assert.equal(cancels, 2, "speech that became stale in the browser queue is cancelled before playback");
+assert.equal(lifecycle.snapshot().gated, false, "stale queue cancellation releases microphone gating");
 
 assert.equal(PLAN_CATALOG.pro_lite.monthlyPrice, 3, "Starter is $3 monthly");
 assert.equal(PLAN_CATALOG.creator.monthlyPrice, 7);

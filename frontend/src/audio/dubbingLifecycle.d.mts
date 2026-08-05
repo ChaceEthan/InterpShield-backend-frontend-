@@ -12,11 +12,12 @@ export interface DubbingLifecycle {
   snapshot(): { gated: boolean; activeLanguages: string[]; queued: number; seen: number };
 }
 
-export function createDubbingLifecycle(options: {
-  play: (job: DubbingJob, onEnd: () => void, onError: () => void) => void;
+export function createDubbingLifecycle<TPrepared>(options: {
+  prepare: (job: DubbingJob) => TPrepared;
+  play: (prepared: TPrepared, job: DubbingJob, onStart: () => void, onEnd: () => void, onError: () => void) => void;
   cancel?: () => void;
   onGateChange?: (gated: boolean) => void;
   onIdle?: () => void;
-  schedule?: (callback: () => void, delay: number) => unknown;
-  pauseMs?: (job: DubbingJob) => number;
+  now?: () => number;
+  maxAgeMs?: number;
 }): DubbingLifecycle;

@@ -267,9 +267,7 @@ const MAX_LIVE_SEGMENTS = 18;
 const VISIBLE_HISTORY_ITEMS = 40;
 const PARTIAL_SUBTITLE_THROTTLE_MS = 60;
 const HISTORY_PERSIST_DEBOUNCE_MS = 250;
-const MAX_DUBBING_QUEUE_ITEMS = 6;
-const MAX_SPOKEN_DUBBING_KEYS = 180;
-const DUBBING_UTTERANCE_TTL_MS = 45000;
+const DUBBING_UTTERANCE_TTL_MS = 15000;
 const MIN_MEDIA_CHUNK_BYTES = 96;
 const MIN_AUDIO_CHUNK_INTERVAL_MS = 45;
 const VAD_POLL_INTERVAL_MS = 30;
@@ -661,11 +659,6 @@ const appendTextWindow = (current: string, next: string, maxChars = LIVE_TEXT_WI
 };
 
 const languageFlag = (code: string) => LANGUAGE_FLAGS[code] || "🌐";
-const compactSetToLimit = (set: Set<string>, maxItems: number) => {
-  if (set.size <= maxItems) return set;
-  return new Set(Array.from(set).slice(-maxItems));
-};
-
 const speechLanguage = (code: string) => SPEECH_SYNTHESIS_LANGS[code] || code;
 
 const safeGetStorageItem = (storage: Storage | undefined, key: string) => {
@@ -1484,13 +1477,7 @@ export default function App() {
   const historyPersistTimerRef = useRef<number | null>(null);
   const conversationHistoryRef = useRef<HTMLDivElement | null>(null);
   const historyEndRef = useRef<HTMLDivElement | null>(null);
-  const dubbingQueuesRef = useRef<Record<string, DubbingQueueItem[]>>({});
-  const dubbingActiveLanguagesRef = useRef<Set<string>>(new Set());
   const dubbingTransmissionGatedRef = useRef(false);
-  const activeDubbingUtteranceIdRef = useRef("");
-  const activeDubbingLanguageRef = useRef("");
-  const lastDubbingTextRef = useRef("");
-  const spokenDubbingKeysRef = useRef<Set<string>>(new Set());
   const dubbingLifecycleRef = useRef<ReturnType<typeof createDubbingLifecycle> | null>(null);
   const historySignatureRef = useRef("");
   const persistedHistorySignaturesRef = useRef<Set<string>>(new Set());
@@ -1586,18 +1573,20 @@ export default function App() {
 
   const stopDubbingPlayback = useCallback((clearQueue = true) => {
     dubbingLifecycleRef.current?.stop({ clearQueue });
-    activeDubbingUtteranceIdRef.current = "";
-    activeDubbingLanguageRef.current = "";
   }, []);
 
   if (!dubbingLifecycleRef.current && typeof window !== "undefined" && "speechSynthesis" in window) {
     dubbingLifecycleRef.current = createDubbingLifecycle({
-      play: (job: DubbingQueueItem, onEnd: () => void, onError: () => void) => {
+      prepare: (job: DubbingQueueItem) => {
         const utterance = new SpeechSynthesisUtterance(job.text);
         utterance.lang = speechLanguage(job.language);
         utterance.rate = job.text.length > 140 ? 0.94 : 0.98;
         utterance.pitch = 1;
         utterance.volume = 0.92;
+        return utterance;
+      },
+      play: (utterance: SpeechSynthesisUtterance, _job: DubbingQueueItem, onStart: () => void, onEnd: () => void, onError: () => void) => {
+        utterance.onstart = onStart;
         utterance.onend = onEnd;
         utterance.onerror = onError;
         window.speechSynthesis.speak(utterance);
@@ -1614,17 +1603,17 @@ export default function App() {
         setStatus(recordingRef.current ? "listening-after-dubbing" : "idle");
         setAudioDiagnostic((current) => ({ ...current, message: recordingRef.current ? "Listening" : "Microphone ready" }));
       },
-      schedule: (callback: () => void, delay: number) => window.setTimeout(callback, delay),
-      pauseMs: (job: DubbingQueueItem) => /[.!?]$/.test(job.text.trim()) ? 220 : 360
+      maxAgeMs: DUBBING_UTTERANCE_TTL_MS
     });
   }
 
   const queueDubbingTranslations = useCallback((translationId: string, translations: Record<string, string>) => {
     if (modeRef.current !== "dubbing" || !("speechSynthesis" in window)) return;
-    const now = Date.now();
+    const transcriptCreatedAt = Date.parse(translationId.slice(0, 24));
+    const createdAt = Number.isFinite(transcriptCreatedAt) ? transcriptCreatedAt : Date.now();
     for (const [language, text] of Object.entries(translations)) {
       if (!isVisibleTranslationText(text)) continue;
-      dubbingLifecycleRef.current?.enqueue({ translationId, language, text, createdAt: now });
+      dubbingLifecycleRef.current?.enqueue({ translationId, language, text, createdAt });
     }
   }, []);
 
@@ -2064,8 +2053,6 @@ export default function App() {
     lastAudioChunkSentAtRef.current = 0;
     if (!options.preserveTranslationPipeline) {
       stopDubbingPlayback(true);
-      activeDubbingUtteranceIdRef.current = "";
-      activeDubbingLanguageRef.current = "";
       lastTranslationOriginalRef.current = "";
       activeBackendSessionIdRef.current = "";
       activeBackendTranslationJobIdRef.current = "";
@@ -2286,6 +2273,8 @@ export default function App() {
 
     socket.on("disconnect", () => {
       logFrontendDebug("socket", "SOCKET_DISCONNECTED", { recording: recordingRef.current });
+      stopDubbingPlayback(true);
+      dubbingLifecycleRef.current?.resetSeen();
       stopClientHeartbeat();
       setSocketConnected(false);
       if (recordingRef.current) {
@@ -2489,7 +2478,6 @@ export default function App() {
         latestTranslationSequenceRef.current = transcriptSequence;
       }
       updateTranslationStatuses(Object.fromEntries(pendingTargetLanguages.map((language) => [language, "queued"])));
-      spokenDubbingKeysRef.current = compactSetToLimit(spokenDubbingKeysRef.current, MAX_SPOKEN_DUBBING_KEYS);
       setInterimOriginal("");
       setLiveText("");
       setFinalText((current) => appendTextWindow(current, originalText));
@@ -2802,10 +2790,14 @@ export default function App() {
   useEffect(() => {
     if (mode === "dubbing") return;
     stopDubbingPlayback(true);
-    lastDubbingTextRef.current = "";
-    spokenDubbingKeysRef.current.clear();
     dubbingLifecycleRef.current?.resetSeen();
   }, [mode, stopDubbingPlayback]);
+
+  const dubbingLanguageSignature = `${sourceLang}:${targetLanguages.join(",")}`;
+  useEffect(() => {
+    stopDubbingPlayback(true);
+    dubbingLifecycleRef.current?.resetSeen();
+  }, [dubbingLanguageSignature, stopDubbingPlayback]);
 
   const applyAuthSession = (session: { token: string; user: AppUser }, destination: View = "dashboard") => {
     const normalizedUser = normalizeAuthUser(session.user) as AppUser;
@@ -2966,9 +2958,7 @@ export default function App() {
     activeBackendTranslationJobIdRef.current = "";
     latestTranslationSequenceRef.current = 0;
     finalTranslationsRef.current = {};
-    spokenDubbingKeysRef.current.clear();
     dubbingLifecycleRef.current?.resetSeen();
-    lastDubbingTextRef.current = "";
     stopDubbingPlayback(true);
     pendingPartialTranscriptRef.current = null;
     if (subtitleThrottleTimerRef.current) {
@@ -3359,9 +3349,7 @@ export default function App() {
     finalTranslationsRef.current = {};
     pendingFinalTranscriptRef.current = null;
     pendingFinalTranscriptsRef.current.clear();
-    spokenDubbingKeysRef.current.clear();
     dubbingLifecycleRef.current?.resetSeen();
-    lastDubbingTextRef.current = "";
     stopDubbingPlayback(true);
     pendingPartialTranscriptRef.current = null;
     if (subtitleThrottleTimerRef.current) {
