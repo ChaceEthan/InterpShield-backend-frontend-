@@ -1,4 +1,4 @@
-import { Languages } from "lucide-react";
+import { Languages, Volume2 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 
 export interface TranscriptTranslationEntry {
@@ -15,9 +15,10 @@ interface TranscriptAreaProps {
   interimText?: string;
   translations: TranscriptTranslationEntry[];
   isRecording: boolean;
+  onSpeakTranslation?: (language: string, text: string) => void;
 }
 
-export function TranscriptArea({ mode, originalText, interimText = "", translations, isRecording }: TranscriptAreaProps) {
+export function TranscriptArea({ mode, originalText, interimText = "", translations, isRecording, onSpeakTranslation }: TranscriptAreaProps) {
   const visibleOriginal = interimText || originalText;
   const hasTranslations = translations.some((entry) => entry.text.trim());
   const isTranscribe = mode === "transcribe";
@@ -71,12 +72,22 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
               <motion.article
                 layout
                 key={entry.language}
-                className="min-w-0 rounded-2xl border border-blue-100 bg-blue-50/80 p-4 text-left shadow-sm"
+                role={entry.text && onSpeakTranslation ? "button" : undefined}
+                tabIndex={entry.text && onSpeakTranslation ? 0 : undefined}
+                aria-label={entry.text && onSpeakTranslation ? `Speak ${entry.label} translation` : undefined}
+                onClick={() => { if (entry.text) onSpeakTranslation?.(entry.language, entry.text); }}
+                onKeyDown={(event) => {
+                  if (!entry.text || !onSpeakTranslation || (event.key !== "Enter" && event.key !== " ")) return;
+                  event.preventDefault();
+                  onSpeakTranslation(entry.language, entry.text);
+                }}
+                className={`min-w-0 rounded-2xl border border-blue-100 bg-blue-50/80 p-4 text-left shadow-sm ${entry.text && onSpeakTranslation ? "cursor-pointer transition hover:border-blue-300 hover:bg-blue-50 focus:outline-none focus:ring-2 focus:ring-blue-400" : ""}`}
               >
                 <div className="mb-3 flex items-center justify-between gap-2">
                   <span className="min-w-0 break-words text-xs font-semibold uppercase tracking-wide text-blue-700">{entry.label}</span>
-                  <span className="rounded-full bg-white px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-gray-500 shadow-sm">
-                    {entry.state}
+                  <span className="flex items-center gap-1.5">
+                    {entry.text && onSpeakTranslation && <Volume2 className="h-4 w-4 text-blue-600" aria-hidden="true" />}
+                    <span className="rounded-full bg-white px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-gray-500 shadow-sm">{entry.state}</span>
                   </span>
                 </div>
                 <p className="min-h-16 break-words text-base font-semibold leading-7 text-gray-950">

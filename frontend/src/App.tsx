@@ -661,6 +661,43 @@ const appendTextWindow = (current: string, next: string, maxChars = LIVE_TEXT_WI
 const languageFlag = (code: string) => LANGUAGE_FLAGS[code] || "🌐";
 const speechLanguage = (code: string) => SPEECH_SYNTHESIS_LANGS[code] || code;
 
+let speechVoicesReadyPromise: Promise<SpeechSynthesisVoice[]> | null = null;
+const loadSpeechVoices = () => {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return Promise.resolve([]);
+  const synth = window.speechSynthesis;
+  const loaded = synth.getVoices();
+  if (loaded.length > 0) return Promise.resolve(loaded);
+  if (speechVoicesReadyPromise) return speechVoicesReadyPromise;
+
+  speechVoicesReadyPromise = new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      synth.removeEventListener("voiceschanged", finish);
+      resolve(synth.getVoices());
+    };
+    synth.addEventListener("voiceschanged", finish, { once: true });
+    window.setTimeout(finish, 1200);
+  });
+  return speechVoicesReadyPromise;
+};
+
+const selectSpeechVoice = (language: string) => {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return undefined;
+  const requested = speechLanguage(language).toLowerCase();
+  const base = requested.split("-")[0];
+  const voices = window.speechSynthesis.getVoices();
+  return voices.find((voice) => voice.lang.toLowerCase() === requested)
+    || voices.find((voice) => voice.lang.toLowerCase().split("-")[0] === base);
+};
+
+const speechSynthesisUnavailableReason = () => {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return "this browser does not support speech synthesis";
+  if (!("SpeechSynthesisUtterance" in window)) return "this browser does not provide speech utterances";
+  return "";
+};
+
 const safeGetStorageItem = (storage: Storage | undefined, key: string) => {
   try {
     return storage?.getItem(key) || null;
@@ -1478,6 +1515,7 @@ export default function App() {
   const conversationHistoryRef = useRef<HTMLDivElement | null>(null);
   const historyEndRef = useRef<HTMLDivElement | null>(null);
   const dubbingTransmissionGatedRef = useRef(false);
+  const dubbingRequestGenerationRef = useRef(0);
   const dubbingLifecycleRef = useRef<ReturnType<typeof createDubbingLifecycle> | null>(null);
   const historySignatureRef = useRef("");
   const persistedHistorySignaturesRef = useRef<Set<string>>(new Set());
@@ -1491,7 +1529,7 @@ export default function App() {
 
   const isAuthed = Boolean(user && token);
   const isPro = user?.plan === "pro" || isAdminRole(user?.role);
-  const isRecording = ["connecting", "calibrating", "listening", "speaking", "soft-pause", "finalizing", "dubbing", "listening-after-dubbing", "paused"].includes(status);
+  const isRecording = ["connecting", "calibrating", "listening", "speaking", "soft-pause", "finalizing", "paused"].includes(status);
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
   const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
   const isTranslationActive = mode !== "transcribe" && Object.values(translationStatuses).some((translationState) =>
@@ -1572,10 +1610,11 @@ export default function App() {
   }, []);
 
   const stopDubbingPlayback = useCallback((clearQueue = true) => {
+    dubbingRequestGenerationRef.current += 1;
     dubbingLifecycleRef.current?.stop({ clearQueue });
   }, []);
 
-  if (!dubbingLifecycleRef.current && typeof window !== "undefined" && "speechSynthesis" in window) {
+  if (!dubbingLifecycleRef.current && typeof window !== "undefined" && !speechSynthesisUnavailableReason()) {
     dubbingLifecycleRef.current = createDubbingLifecycle({
       prepare: (job: DubbingQueueItem) => {
         const utterance = new SpeechSynthesisUtterance(job.text);
@@ -1583,13 +1622,25 @@ export default function App() {
         utterance.rate = job.text.length > 140 ? 0.94 : 0.98;
         utterance.pitch = 1;
         utterance.volume = 0.92;
+        const voice = selectSpeechVoice(job.language);
+        if (voice) utterance.voice = voice;
         return utterance;
       },
       play: (utterance: SpeechSynthesisUtterance, _job: DubbingQueueItem, onStart: () => void, onEnd: () => void, onError: () => void) => {
         utterance.onstart = onStart;
         utterance.onend = onEnd;
-        utterance.onerror = onError;
-        window.speechSynthesis.speak(utterance);
+        utterance.onerror = (event) => {
+          const reason = event.error || "unknown browser speech error";
+          setAlert(`Dubbing audio failed: ${reason}.`);
+          onError();
+        };
+        try {
+          if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+          window.speechSynthesis.speak(utterance);
+        } catch (error) {
+          setAlert(`Dubbing audio failed: ${error instanceof Error ? error.message : "speech synthesis could not start"}.`);
+          throw error;
+        }
       },
       cancel: () => window.speechSynthesis.cancel(),
       onGateChange: (gated: boolean) => {
@@ -1608,14 +1659,44 @@ export default function App() {
   }
 
   const queueDubbingTranslations = useCallback((translationId: string, translations: Record<string, string>) => {
-    if (modeRef.current !== "dubbing" || !("speechSynthesis" in window)) return;
-    const transcriptCreatedAt = Date.parse(translationId.slice(0, 24));
-    const createdAt = Number.isFinite(transcriptCreatedAt) ? transcriptCreatedAt : Date.now();
-    for (const [language, text] of Object.entries(translations)) {
-      if (!isVisibleTranslationText(text)) continue;
-      dubbingLifecycleRef.current?.enqueue({ translationId, language, text, createdAt });
+    if (modeRef.current !== "dubbing") return;
+    const unavailableReason = speechSynthesisUnavailableReason();
+    if (unavailableReason) {
+      setAlert(`Dubbing is unavailable: ${unavailableReason}.`);
+      return;
     }
+    const requestGeneration = dubbingRequestGenerationRef.current;
+    void loadSpeechVoices().then(() => {
+      if (requestGeneration !== dubbingRequestGenerationRef.current || modeRef.current !== "dubbing") return;
+      const createdAt = Date.now();
+      for (const [language, text] of Object.entries(translations)) {
+        if (!isVisibleTranslationText(text)) continue;
+        dubbingLifecycleRef.current?.enqueue({ translationId, language, text, createdAt });
+      }
+    });
   }, []);
+
+  const speakTranslatedCaption = useCallback((language: string, text: string) => {
+    const spokenText = text.trim();
+    if (!spokenText) return;
+    stopDubbingPlayback(true);
+    const unavailableReason = speechSynthesisUnavailableReason();
+    if (unavailableReason) {
+      setAlert(`Speech playback is unavailable: ${unavailableReason}.`);
+      return;
+    }
+    const requestGeneration = dubbingRequestGenerationRef.current;
+    void loadSpeechVoices().then(() => {
+      if (requestGeneration !== dubbingRequestGenerationRef.current) return;
+      const createdAt = Date.now();
+      dubbingLifecycleRef.current?.enqueue({
+        translationId: `manual-${createdAt}-${language}`,
+        language,
+        text: spokenText,
+        createdAt
+      });
+    });
+  }, [stopDubbingPlayback]);
 
   const navigate = useCallback(
     (nextView: View) => {
@@ -1846,10 +1927,6 @@ export default function App() {
       return nextTargets.length > 0 ? nextTargets : ["es"];
     });
   }, [sourceLang]);
-
-  useEffect(() => {
-    recordingRef.current = isRecording;
-  }, [isRecording]);
 
   useEffect(() => {
     audioChunkMsRef.current = Math.max(500, Math.min(800, config?.audioChunkMs || 700));
@@ -2345,6 +2422,7 @@ export default function App() {
       sessionActionInFlightRef.current = false;
       const recorder = mediaRecorderRef.current;
       if (recorder?.state === "inactive") {
+        recordingRef.current = true;
         recorder.start(audioChunkMsRef.current);
       }
       const previousStartedAt = sessionStartedAtRef.current;
@@ -3683,6 +3761,7 @@ export default function App() {
           alert={alert || microphoneNotice}
           aiDegraded={aiDegraded}
           onMicClick={!isRecording ? () => void startSession() : stopSession}
+          onSpeakTranslation={speakTranslatedCaption}
           onClear={clearLiveSession}
           onSave={saveHistoryAsPdf}
         />

@@ -28,6 +28,7 @@ interface TranslationPanelProps {
   alert?: string | null;
   aiDegraded?: boolean;
   onMicClick: () => void;
+  onSpeakTranslation?: (language: string, text: string) => void;
   onClear: () => void;
   onSave: () => void;
 }
@@ -52,6 +53,7 @@ export function TranslationPanel({
   alert,
   aiDegraded = false,
   onMicClick,
+  onSpeakTranslation,
   onClear,
   onSave
 }: TranslationPanelProps) {
@@ -119,6 +121,7 @@ export function TranslationPanel({
           interimText={interimText}
           translations={translations}
           isRecording={isRecording}
+          onSpeakTranslation={onSpeakTranslation}
         />
 
         <div className="sticky bottom-4 z-20 mx-auto rounded-full bg-white/80 p-2 shadow-lg shadow-gray-200/80 backdrop-blur sm:static sm:bg-transparent sm:p-0 sm:shadow-none">

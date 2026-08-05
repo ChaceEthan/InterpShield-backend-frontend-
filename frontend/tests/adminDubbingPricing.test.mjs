@@ -15,6 +15,7 @@ assert.equal(isAdminRole("user"), false);
 
 const appSource = fs.readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
 const adminDashboardSource = fs.readFileSync(new URL("../src/components/AdminDashboard.tsx", import.meta.url), "utf8");
+const transcriptAreaSource = fs.readFileSync(new URL("../src/components/TranscriptArea.tsx", import.meta.url), "utf8");
 assert.match(appSource, /requestApi<\{ token\?: string; user: AppUser \}>\("\/api\/auth\/me"/, "login refreshes the backend profile before routing");
 assert.match(appSource, /const destination = isAdminRole\(refreshed\.user\.role\) \? "admin" : "dashboard"/, "password login routes using the refreshed profile role");
 assert.match(appSource, /isAdminRole\(refreshed\.user\.role\) \? "admin" : "dashboard"\s*\)/, "Google login routes using the refreshed profile role");
@@ -27,6 +28,16 @@ assert.match(adminDashboardSource, /Promote to admin/, "super admins receive a c
 assert.match(adminDashboardSource, /Remove admin role/, "super admins receive a clear role-removal action");
 assert.match(appSource, /socket\.on\("disconnect",[\s\S]*?stopDubbingPlayback\(true\)/, "socket reconnect cleanup clears queued dubbing");
 assert.match(appSource, /dubbingLanguageSignature[\s\S]*?stopDubbingPlayback\(true\)/, "language changes clear queued dubbing");
+assert.match(appSource, /void loadSpeechVoices\(\)\.then/, "voices are requested before dubbing jobs are queued");
+assert.match(appSource, /speechSynthesis\.speak\(utterance\)/, "completed translations invoke browser speech playback");
+assert.match(appSource, /Dubbing is unavailable: \$\{unavailableReason\}/, "unsupported automatic dubbing reports an exact reason");
+assert.match(appSource, /const createdAt = Date\.now\(\)/, "completed translations are fresh when submitted to speech synthesis");
+assert.doesNotMatch(appSource, /recordingRef\.current = isRecording/, "dubbing UI status cannot reactivate a stopped microphone");
+assert.match(appSource, /recordingRef\.current = true;\s*recorder\.start/, "actual MediaRecorder startup activates the microphone ref");
+assert.match(appSource, /completeListeningSession\(modeRef\.current !== "transcribe"\)/, "a finalized utterance automatically releases microphone capture while preserving pending translation");
+assert.match(appSource, /const speakTranslatedCaption[\s\S]*?stopDubbingPlayback\(true\)/, "manual translated-card replay stops current speech first");
+assert.match(transcriptAreaSource, /onSpeakTranslation\?\.\(entry\.language, entry\.text\)/, "translated cards replay their own language and text");
+assert.match(transcriptAreaSource, /Speak \$\{entry\.label\} translation/, "translated cards expose an accessible speaker action");
 
 const plays = [];
 const prepared = [];
