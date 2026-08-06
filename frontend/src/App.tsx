@@ -41,6 +41,7 @@ import { buildProductionAudioConstraints, createVadController, DEFAULT_VAD_CONFI
 import { createUtteranceBoundaryController, stableSessionStartTime } from "./audio/recorderLifecycle.mjs";
 import { createDubbingLifecycle } from "./audio/dubbingLifecycle.mjs";
 import { containerSignature, selectDeepgramMediaRecorderMimeType } from "./audio/mediaRecorderFormat.mjs";
+import { createMeaningfulSpeechGate } from "./audio/meaningfulSpeechGate.mjs";
 import { isAdminRole, normalizeAuthUser } from "./auth/roles.mjs";
 import { PLAN_CATALOG, PRICING_PLAN_IDS, yearlyMonthlyPrice } from "../../shared/plans.mjs";
 import {
@@ -280,6 +281,8 @@ const FINAL_CHUNK_ACK_TIMEOUT_MS = 2500;
 const RECORDING_DRAIN_TIMEOUT_MS = 8000;
 const MAX_SOCKET_RECONNECT_ATTEMPTS = 8;
 const CAPTION_WATCHDOG_MS = 12000;
+const CONTINUOUS_INACTIVITY_TIMEOUT_MS = 30000;
+const isDesktopChrome = () => typeof navigator !== "undefined" && /Chrome\//i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent);
 const MAX_QUEUED_AUDIO_CHUNKS = 240;
 const MAX_PENDING_FINAL_TRANSCRIPTS = 16;
 const CLIENT_HEARTBEAT_MS = 25000;
@@ -1575,6 +1578,7 @@ export default function App() {
   const lastVadSilenceDurationRef = useRef(0);
   const finalizedUtteranceCountRef = useRef(0);
   const audioAfterFinalLoggedRef = useRef(0);
+  const meaningfulSpeechGateRef = useRef(createMeaningfulSpeechGate());
   const authRequestRef = useRef<AuthProvider | null>(null);
   const socketAuthRefreshInFlightRef = useRef(false);
 
@@ -2158,7 +2162,8 @@ export default function App() {
   }, []);
 
   const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean; preserveTranslationPipeline?: boolean; stopReason?: string } = {}) => {
-    console.info("[SESSION_STOP_REASON]", { reason: options.stopReason || "session_cleanup", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, phase: recordingPhaseRef.current });
+    const speechSnapshot = meaningfulSpeechGateRef.current.snapshot();
+    console.info("[SESSION_STOP_REASON]", { reason: options.stopReason || "session_cleanup", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, phase: recordingPhaseRef.current, elapsedSinceStartMs: speechSnapshot.elapsedSinceStartMs, meaningfulSpeechDetected: speechDetectedRef.current || speechSnapshot.meaningfulSpeechDetected, chunksCaptured: speechSnapshot.chunksCaptured, chunksEmitted: speechSnapshot.chunksEmitted, lastAudioLevel: speechSnapshot.lastAudioLevel, threshold: speechSnapshot.threshold });
     if (vadPollTimerRef.current) {
       window.clearInterval(vadPollTimerRef.current);
       vadPollTimerRef.current = null;
@@ -2269,7 +2274,7 @@ export default function App() {
         setStatus("idle");
         recordingPhaseRef.current = "idle";
         stopInFlightRef.current = false;
-      }, CAPTION_WATCHDOG_MS);
+      }, CONTINUOUS_INACTIVITY_TIMEOUT_MS);
       return;
     }
     recordingPhaseRef.current = "finalizing";
@@ -2631,16 +2636,22 @@ export default function App() {
       recordingPhaseRef.current = "listening";
       if (initialReady) {
         if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
-        captionWatchdogTimerRef.current = window.setTimeout(() => {
+        meaningfulSpeechGateRef.current.start(Date.now());
+        const checkNoMeaningfulSpeech = () => {
           captionWatchdogTimerRef.current = null;
-          if (activeRecordingGenerationRef.current !== readyGeneration || recordingPhaseRef.current !== "listening" || speechDetectedRef.current) return;
+          if (activeRecordingGenerationRef.current !== readyGeneration || recordingPhaseRef.current !== "listening" || speechDetectedRef.current || meaningfulSpeechGateRef.current.snapshot().meaningfulSpeechDetected) return;
+          if (!meaningfulSpeechGateRef.current.shouldStopForNoSpeech()) {
+            captionWatchdogTimerRef.current = window.setTimeout(checkNoMeaningfulSpeech, meaningfulSpeechGateRef.current.nextCheckDelay());
+            return;
+          }
           cleanupMedia({ stopReason: "no_meaningful_speech_timeout" });
           socketRef.current?.emit("end_session", { reason: "no_meaningful_speech_timeout" });
           setAudioDiagnostic({ state: "idle", message: "No speech detected. Microphone ready" });
           setStatus("idle");
           recordingPhaseRef.current = "idle";
           stopInFlightRef.current = false;
-        }, CAPTION_WATCHDOG_MS);
+        };
+        captionWatchdogTimerRef.current = window.setTimeout(checkNoMeaningfulSpeech, isDesktopChrome() ? meaningfulSpeechGateRef.current.nextCheckDelay() : CAPTION_WATCHDOG_MS);
       }
     };
 
@@ -2700,6 +2711,10 @@ export default function App() {
       captionWatchdogTimerRef.current = null;
       logFrontendDebug("audio", "TRANSCRIPT_PARTIAL_RECEIVED", { chars: originalText.length, providerFinal, speechFinal, utteranceEnd });
       vadControllerRef.current.noteTranscript(originalText, { providerFinal, speechFinal, utteranceEnd });
+      if (originalText) {
+        speechDetectedRef.current = true;
+        meaningfulSpeechGateRef.current.confirmMeaningfulSpeech();
+      }
       if (speechStarted && vadControllerRef.current.getState() === "soft-pause") {
         setStatus("speaking");
       }
@@ -3431,6 +3446,7 @@ export default function App() {
         }
         lastAudioChunkSentAtRef.current = chunk.capturedAt;
         emitAudioChunkPayload({ ...chunk, sequence: sequenceRef.current });
+        meaningfulSpeechGateRef.current.noteEmitted();
         if (sequenceRef.current % 3 === 0) setChunkCount(sequenceRef.current);
         return true;
       };
@@ -3465,6 +3481,14 @@ export default function App() {
         let finalChunkSent = false;
         try {
           if (event.data.size < MIN_MEDIA_CHUNK_BYTES) return;
+          if (isDesktopChrome()) {
+            const speechSnapshot = meaningfulSpeechGateRef.current.observeAudio({ audioLevel, noiseFloor: vadControllerRef.current.getNoiseFloor(), bytes: event.data.size, containerAudio: /audio\/(webm|ogg)/i.test(recorderMimeType), now: capturedAt });
+            if (speechSnapshot.meaningfulSpeechDetected) {
+              speechDetectedRef.current = true;
+              if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
+              captionWatchdogTimerRef.current = null;
+            }
+          }
           const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
           if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.002) return;
           const isGenerationHeader = awaitingContainerHeaderRef.current;
@@ -3543,8 +3567,10 @@ export default function App() {
         }
       };
 
+      const desktopChrome = isDesktopChrome();
       vadControllerRef.current = createVadController({
-        autoFinalize: autoStopOnSilence
+        autoFinalize: autoStopOnSilence,
+        ...(desktopChrome ? { speechThreshold: 0.003, silenceThreshold: 0.0018, noiseFloorMultiplier: 1.5, consecutiveSpeechSamples: 3 } : {})
       });
       vadControllerRef.current.start(Date.now());
       setStatus("calibrating");
@@ -3555,7 +3581,8 @@ export default function App() {
         const action = vadControllerRef.current.update(getAudioLevelRef.current(), Date.now(), false);
         if (!action) return;
         if ("silenceMs" in action) lastVadSilenceDurationRef.current = action.silenceMs || 0;
-        console.info("[VAD_STATE]", { event: action.type, speechStarted: action.type === "speech_started" || action.type === "speech_resumed", speechEnded: action.type === "finalize", silenceDuration: "silenceMs" in action ? action.silenceMs : 0, level: action.level, speechThreshold: action.speech, silenceThreshold: action.silence });
+        const speechSnapshot = meaningfulSpeechGateRef.current.snapshot();
+        console.info("[VAD_STATE]", { event: action.type, speechStarted: action.type === "speech_started" || action.type === "speech_resumed", speechEnded: action.type === "finalize", silenceDuration: "silenceMs" in action ? action.silenceMs : 0, audioLevel: action.level, noiseFloor: vadControllerRef.current.getNoiseFloor(), threshold: action.speech, consecutiveSpeechSamples: speechSnapshot.consecutiveSpeechSamples, meaningfulSpeechDetected: speechDetectedRef.current || speechSnapshot.meaningfulSpeechDetected, elapsedSinceStartMs: speechSnapshot.elapsedSinceStartMs, graceRemainingMs: speechSnapshot.graceRemainingMs, silenceThreshold: action.silence });
         if (action.type === "calibrated") {
           setStatus("listening");
           return;
@@ -3569,6 +3596,9 @@ export default function App() {
         }
         if (action.type === "speech_started") {
           speechDetectedRef.current = true;
+          meaningfulSpeechGateRef.current.confirmMeaningfulSpeech();
+          if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
+          captionWatchdogTimerRef.current = null;
           const buffered = pendingSpeechChunksRef.current.splice(0);
           for (const bufferedChunk of buffered) {
             const { sequence: _discardedSequence, ...capturedChunk } = bufferedChunk;

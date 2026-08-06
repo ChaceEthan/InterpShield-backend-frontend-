@@ -12,7 +12,8 @@ export const DEFAULT_VAD_CONFIG = Object.freeze({
   hardFinalizeMs: 1750,
   maximumUtteranceMs: 55000,
   transcriptChangeGraceMs: 650,
-  noiseFloorMultiplier: 2.4
+  noiseFloorMultiplier: 2.4,
+  consecutiveSpeechSamples: 0
 });
 
 const INCOMPLETE_ENDINGS = new Set([
@@ -68,7 +69,7 @@ export const buildProductionAudioConstraints = (supported = {}, microphoneOrOpti
 export const createVadController = (options = {}) => {
   const config = { ...DEFAULT_VAD_CONFIG, ...options };
   let state = "idle", startedAt = 0, calibrationTotal = 0, calibrationSamples = 0, noiseFloor = 0.003;
-  let speechCandidateAt = 0, utteranceStartedAt = 0, silenceStartedAt = 0, lastSpeechAt = 0;
+  let speechCandidateAt = 0, speechCandidateSamples = 0, utteranceStartedAt = 0, silenceStartedAt = 0, lastSpeechAt = 0;
   let transcript = "", transcriptChangedAt = 0, providerFinal = false, speechFinal = false, utteranceEnd = false;
   const thresholds = () => {
     const speech = clamp(Math.max(config.speechThreshold, noiseFloor * config.noiseFloorMultiplier), config.speechThreshold, 0.12);
@@ -76,6 +77,7 @@ export const createVadController = (options = {}) => {
   };
   const clearUtterance = () => {
     speechCandidateAt = utteranceStartedAt = silenceStartedAt = lastSpeechAt = transcriptChangedAt = 0;
+    speechCandidateSamples = 0;
     transcript = "";
     providerFinal = speechFinal = utteranceEnd = false;
   };
@@ -128,9 +130,11 @@ export const createVadController = (options = {}) => {
       if (level >= speech) {
         if (!speechCandidateAt) {
           speechCandidateAt = now;
+          speechCandidateSamples = 1;
           return { type: "speech_candidate", state, level, speech, silence };
         }
-        if (now - speechCandidateAt >= config.minimumSpeechMs) {
+        speechCandidateSamples += 1;
+        if ((config.consecutiveSpeechSamples > 0 && speechCandidateSamples >= config.consecutiveSpeechSamples) || now - speechCandidateAt >= config.minimumSpeechMs) {
           state = "speaking";
           utteranceStartedAt = speechCandidateAt;
           lastSpeechAt = now;
@@ -139,6 +143,7 @@ export const createVadController = (options = {}) => {
         }
       } else if (level <= silence && speechCandidateAt) {
         speechCandidateAt = 0;
+        speechCandidateSamples = 0;
         return { type: "speech_cancelled", state, level, speech, silence };
       }
       return null;

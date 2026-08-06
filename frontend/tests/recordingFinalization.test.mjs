@@ -102,3 +102,9 @@ assert.match(appSource, /stopReason: "no_meaningful_speech_timeout"/, "no-speech
 assert.match(appSource, /\[RECORDING_SESSION_CONTINUES\]/, "processed utterances explicitly preserve the recording session");
 assert.match(appSource, /vadControllerRef\.current\.markPaused\(\)/, "VAD resets to accept the next utterance");
 assert.match(appSource, /recordingPhaseRef\.current = "listening"[\s\S]{0,900}?return;/, "processed utterance completion cannot fall through to full cleanup");
+assert.match(appSource, /speechThreshold: 0\.003, silenceThreshold: 0\.0018, noiseFloorMultiplier: 1\.5, consecutiveSpeechSamples: 3/, "desktop Chrome uses the low-volume adaptive VAD profile");
+assert.match(appSource, /meaningfulSpeechGateRef\.current\.confirmMeaningfulSpeech\(\)/, "partial transcripts and VAD speech permanently confirm meaningful input");
+assert.match(appSource, /CONTINUOUS_INACTIVITY_TIMEOUT_MS = 30000/, "continued sessions use a longer inactivity timeout than initial startup");
+for (const field of ["elapsedSinceStartMs", "meaningfulSpeechDetected", "chunksCaptured", "chunksEmitted", "lastAudioLevel", "threshold"]) {
+  assert.match(appSource, new RegExp(`\\[SESSION_STOP_REASON\\][\\s\\S]{0,900}?${field}`), `session-stop diagnostics include ${field}`);
+}

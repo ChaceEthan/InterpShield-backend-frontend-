@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { analyzeTranscriptCompleteness, buildProductionAudioConstraints, createVadController, getDynamicSilenceHoldMs } from "../src/audio/vadController.mjs";
 import { createUtteranceBoundaryController, stableSessionStartTime } from "../src/audio/recorderLifecycle.mjs";
+import { createMeaningfulSpeechGate, DESKTOP_SPEECH_GATE_CONFIG } from "../src/audio/meaningfulSpeechGate.mjs";
 
 const constraints = buildProductionAudioConstraints({ echoCancellation: true, noiseSuppression: true, autoGainControl: true, sampleRate: true, channelCount: true });
 assert.equal(constraints.noiseSuppression, true);
@@ -117,6 +118,35 @@ assert.equal(duplicateGuard.update(0, 2), null, "calibration transition is emitt
   assert.equal(desktopLowVolume.update(0.008, 350)?.type, "speech_started", "calibrated low-volume desktop speech must cross the adaptive threshold");
   assert.equal(desktopLowVolume.update(0.004, 700), null, "normal low-volume speech must not be classified as silence");
   assert.equal(desktopLowVolume.getState(), "speaking");
+}
+
+{
+  const desktopVad = createVadController({ calibrationMs: 0, speechThreshold: 0.003, silenceThreshold: 0.0018, noiseFloorMultiplier: 1.5, consecutiveSpeechSamples: 3 });
+  desktopVad.start(0);
+  desktopVad.update(0.001, 1);
+  assert.equal(desktopVad.update(0.0035, 30)?.type, "speech_candidate");
+  assert.equal(desktopVad.update(0.0035, 60), null);
+  assert.equal(desktopVad.update(0.0035, 90)?.type, "speech_started", "three low-volume desktop samples must confirm meaningful speech");
+}
+
+{
+  const gate = createMeaningfulSpeechGate({ noSpeechTimeoutMs: 1000 });
+  gate.start(1000);
+  assert.equal(gate.shouldStopForNoSpeech(2500), false, "no-speech timeout cannot fire during the four-second startup grace period");
+  assert.equal(gate.shouldStopForNoSpeech(4999), false);
+  assert.equal(gate.shouldStopForNoSpeech(5000), true, "real silence eventually becomes eligible to return idle");
+
+  gate.start(1000);
+  gate.observeAudio({ audioLevel: 0.002, noiseFloor: 0.0015, bytes: 128, containerAudio: true, now: 1500 });
+  gate.observeAudio({ audioLevel: 0.002, noiseFloor: 0.0015, bytes: 128, containerAudio: true, now: 1530 });
+  const lowVolume = gate.observeAudio({ audioLevel: 0.002, noiseFloor: 0.0015, bytes: 128, containerAudio: true, now: 1560 });
+  assert.equal(lowVolume.meaningfulSpeechDetected, true, "clear WebM/Opus chunks confirm normal low-volume desktop speech after three samples");
+  assert.equal(gate.shouldStopForNoSpeech(60000), false, "confirmed meaningful speech permanently cancels the initial no-speech timeout");
+
+  gate.start(1000);
+  gate.confirmMeaningfulSpeech(2000);
+  assert.equal(gate.shouldStopForNoSpeech(60000), false, "a non-empty Deepgram partial cancels the no-speech timeout");
+  assert.equal(DESKTOP_SPEECH_GATE_CONFIG.startupGraceMs, 4000);
 }
 
 const recorder = {
