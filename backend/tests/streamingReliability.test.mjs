@@ -375,6 +375,29 @@ const createFakeClientFactory = (options = {}) => {
 
 {
   const factory = createFakeClientFactory();
+  const completions = [];
+  const session = await createInterpreterSession({
+    env: { deepgramApiKey: "test-key", geminiApiKey: "", openaiApiKey: "" },
+    sourceLang: "en",
+    targetLanguages: ["es"],
+    shouldTranslate: true,
+    deepgramClientFactory: factory,
+    onResult: (result) => {
+      if (result.isTranslationComplete && result.translations?.es) completions.push(result);
+    }
+  });
+  await wait(10);
+
+  const connection = factory.connections[0];
+  connection.emitTranscript("Can you please give me your book?", { isFinal: true, speechFinal: true });
+  await wait(900);
+
+  assert.equal(completions.length, 1, "a speech-final transcript should trigger exactly one translation dispatch");
+  session.stop();
+}
+
+{
+  const factory = createFakeClientFactory();
   const partials = [];
   const finals = [];
   const translations = [];
@@ -398,15 +421,15 @@ const createFakeClientFactory = (options = {}) => {
   connection.emitTranscript("Can you please", { isFinal: false });
   connection.emitTranscript("Can you please give me your book?", { isFinal: true, speechFinal: true });
   await wait(550);
-  assert.equal(finals.length, 0, "provider finalization must remain supporting evidence during soft-pause");
-  assert.equal(translations.length, 0, "translation preview must not become a final translation before the hybrid boundary");
+  assert.equal(finals.length, 1, "a speech-final transcript should finalize once without waiting for an additional boundary");
+  assert.equal(translations.length, 1, "a speech-final transcript should dispatch one final translation immediately");
   assert.equal(partials.at(-1), "Can you please give me your book?", "the same live source caption should advance to the provider-final text");
   assert.equal(partials.length, 2, "duplicate partial captions must be suppressed while the live line updates");
   assert.ok(previews.length <= 2, "translation previews must be throttled instead of emitted per token");
   session.completeUtterance();
   await wait(900);
   assert.equal(finals.length, 1, "the full source caption must finalize once");
-  assert.equal(translations.length, 1, "the preview must be replaced by one final translation");
+  assert.equal(translations.length, 1, "the final translation should not be duplicated after a later boundary");
   assert.ok(translations[0].translations?.es, "the final translation must contain the completed utterance output");
   assert.equal(factory.connections.length, 1, "finalization must not replace the Deepgram stream");
   session.stop();

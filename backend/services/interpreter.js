@@ -1215,6 +1215,13 @@ export const createInterpreterSession = async ({
   let lastAdminStatsAt = 0;
   const sessionId = createSessionId();
   const providerHealth = sharedProviderHealth;
+  const logPipelineDecision = (decision, extra = {}) => {
+    console.info("[TRANSLATION_PIPELINE_DIAGNOSTICS]", {
+      decision,
+      sessionId,
+      ...extra
+    });
+  };
   const translationMetrics = {
     timeoutCount: 0,
     retryCount: 0,
@@ -1845,6 +1852,22 @@ export const createInterpreterSession = async ({
           sourceLang: direction.source,
           chars: translationInput.length
         });
+        if (provider === "openai") {
+          logPipelineDecision("OpenAI request started", {
+            jobId,
+            language,
+            provider,
+            requestId: requestId || `${jobId}:${language}:${provider}:${Date.now().toString(36)}`
+          });
+        }
+        if (provider === "gemini") {
+          logPipelineDecision("Gemini fallback started", {
+            jobId,
+            language,
+            provider,
+            requestId: requestId || `${jobId}:${language}:${provider}:${Date.now().toString(36)}`
+          });
+        }
         const providerResult = await withTimeout(
           providerRunner(provider)({
             apiKey: provider === "gemini" ? env.geminiApiKey : env.openaiApiKey,
@@ -3585,6 +3608,11 @@ export const createInterpreterSession = async ({
     clearTranslationTimer();
     cleanupStaleTranslationWork();
 
+    if (sessionStopped) {
+      logPipelineDecision("skipped because session closed", { source: "emitStableSentence" });
+      return;
+    }
+
     const sentence = cleanTranscriptText(currentSentence);
     const normalizedSentence = normalizeTranscript(sentence);
     const baseDirection = { ...currentDirection, targets: [...currentDirection.targets] };
@@ -3596,12 +3624,17 @@ export const createInterpreterSession = async ({
       normalizedSentence === lastTranslatedTranscript &&
       Date.now() - lastTranslatedTranscriptAt < TRANSLATED_SENTENCE_DUPLICATE_WINDOW_MS;
 
-    if (
-      !sentence ||
-      !hasMeaningfulTranslationText(sentence) ||
-      recentTranslatedDuplicate ||
-      hasQueuedTranslationForSentence(normalizedSentence)
-    ) {
+    if (!sentence || !hasMeaningfulTranslationText(sentence)) {
+      logPipelineDecision("skipped because transcript empty", { source: "emitStableSentence" });
+      return;
+    }
+
+    if (recentTranslatedDuplicate || hasQueuedTranslationForSentence(normalizedSentence)) {
+      logPipelineDecision("skipped because utterance already finalized", {
+        source: "emitStableSentence",
+        normalizedSentence,
+        reason: recentTranslatedDuplicate ? "recent_duplicate" : "queued_translation"
+      });
       return;
     }
 
@@ -3704,6 +3737,12 @@ export const createInterpreterSession = async ({
     });
     console.info("[TRANSLATION_STARTED]", { sessionId, jobId, sequence: jobSequence, chars: translationInput.length, targetLanguages: direction.targets });
 
+    logPipelineDecision("translation job created", {
+      jobId,
+      sequence: jobSequence,
+      targetLanguages: direction.targets,
+      chars: translationInput.length
+    });
     enqueueTranslationJob(job);
 
     if (currentSentence.trim()) {
@@ -3785,8 +3824,19 @@ export const createInterpreterSession = async ({
       const normalized = normalizeTranscript(displayText);
 
       if (!normalized) {
+        logPipelineDecision("skipped because transcript empty", { source: "onTranscript", isFinal: Boolean(isFinal), speechFinal: Boolean(speechFinal) });
         return;
       }
+      if (sessionStopped) {
+        logPipelineDecision("skipped because session closed", { source: "onTranscript", isFinal: Boolean(isFinal), speechFinal: Boolean(speechFinal) });
+        return;
+      }
+      logPipelineDecision("entered translation pipeline", {
+        source: "onTranscript",
+        isFinal: Boolean(isFinal),
+        speechFinal: Boolean(speechFinal),
+        chars: displayText.length
+      });
       if (finalizedUtteranceCount > 0) {
         console.info("[DEEPGRAM_MESSAGE_AFTER_FINAL]", { sessionId, utterance: finalizedUtteranceCount + 1, chars: displayText.length, isFinal: Boolean(isFinal), speechFinal: Boolean(speechFinal) });
       }
@@ -3875,7 +3925,10 @@ export const createInterpreterSession = async ({
         direction,
         detectedLanguage: effectiveDetectedLanguage
       });
-      if (utteranceBoundaryPending) {
+      if (Boolean(speechFinal) || utteranceBoundaryPending) {
+        if (speechFinal) {
+          logPipelineDecision("entered translation pipeline", { source: "speechFinal", isFinal: Boolean(isFinal), speechFinal: true, chars: displayText.length });
+        }
         utteranceBoundaryPending = false;
         scheduleStableTranslation(0);
       }

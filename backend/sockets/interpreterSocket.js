@@ -401,6 +401,14 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           console.info("[DESKTOP_PIPELINE_SOCKET_EMIT]", { event, socketId: activeSocket.id, ...diagnostic });
           activeSocket.emit(event, payload);
         }
+        console.info("[TRANSLATION_PIPELINE_DIAGNOSTICS]", {
+          decision: "translation emitted to socket",
+          socketId: activeSocket.id,
+          sessionId: payload.sessionId,
+          jobId: payload.jobId,
+          sequence: payload.sequence,
+          events: ["translation_update", "translation_result", "translated_text"]
+        });
         const speechRoutes = audioPipeline?.queueTranslatedSpeech?.({
           original: payload.original,
           translations: payload.translations,

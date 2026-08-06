@@ -75,7 +75,6 @@ type TranslationProviderDiagnostic = {
   message?: string;
 };
 type SocketConnectionState = "ready" | "connecting" | "connected" | "listening" | "translating" | "reconnecting";
-type RecordingPhase = "idle" | "starting" | "listening" | "draining" | "finalizing" | "stopped";
 type MicrophonePermissionState = "unknown" | "prompt" | "granted" | "denied" | "unsupported";
 type MicrophoneRuntimeState = "idle" | "checking" | "requesting" | "ready" | "recording" | "recovering" | "blocked" | "failed";
 type Plan = "free" | "pro";
@@ -281,7 +280,6 @@ const FINAL_CHUNK_ACK_TIMEOUT_MS = 2500;
 const RECORDING_DRAIN_TIMEOUT_MS = 8000;
 const MAX_SOCKET_RECONNECT_ATTEMPTS = 8;
 const CAPTION_WATCHDOG_MS = 12000;
-const CONTINUOUS_INACTIVITY_TIMEOUT_MS = 30000;
 const isDesktopChrome = () => typeof navigator !== "undefined" && /Chrome\//i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent);
 const MAX_QUEUED_AUDIO_CHUNKS = 240;
 const MAX_PENDING_FINAL_TRANSCRIPTS = 16;
@@ -1571,14 +1569,11 @@ export default function App() {
   const activeSessionIdRef = useRef("");
   const recorderStartedForGenerationRef = useRef<number | null>(null);
   const recorderStoppedForGenerationRef = useRef<number | null>(null);
-  const recordingPhaseRef = useRef<RecordingPhase>("idle");
   const recorderStopReasonRef = useRef("unexpected_stop");
   const lastHandledDeepgramGenerationRef = useRef(1);
-  const speechDetectedRef = useRef(false);
+  const finalizationEmittedForGenerationRef = useRef<number | null>(null);
   const lastVadSilenceDurationRef = useRef(0);
-  const finalizedUtteranceCountRef = useRef(0);
-  const audioAfterFinalLoggedRef = useRef(0);
-  const meaningfulSpeechGateRef = useRef(createMeaningfulSpeechGate());
+  const utteranceLifecycleRef = useRef(createMeaningfulSpeechGate());
   const authRequestRef = useRef<AuthProvider | null>(null);
   const socketAuthRefreshInFlightRef = useRef(false);
 
@@ -2161,9 +2156,9 @@ export default function App() {
     }
   }, []);
 
-  const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean; preserveTranslationPipeline?: boolean; stopReason?: string } = {}) => {
-    const speechSnapshot = meaningfulSpeechGateRef.current.snapshot();
-    console.info("[SESSION_STOP_REASON]", { reason: options.stopReason || "session_cleanup", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, phase: recordingPhaseRef.current, elapsedSinceStartMs: speechSnapshot.elapsedSinceStartMs, meaningfulSpeechDetected: speechDetectedRef.current || speechSnapshot.meaningfulSpeechDetected, chunksCaptured: speechSnapshot.chunksCaptured, chunksEmitted: speechSnapshot.chunksEmitted, lastAudioLevel: speechSnapshot.lastAudioLevel, threshold: speechSnapshot.threshold });
+  const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean; preserveTranslationPipeline?: boolean; stopReason?: string; caller?: string } = {}) => {
+    const speechSnapshot = utteranceLifecycleRef.current.snapshot();
+    console.info("[SESSION_STOP_REASON]", { reason: options.stopReason || "session_cleanup", caller: options.caller || "cleanupMedia", recordingGeneration: speechSnapshot.recordingGeneration, elapsedSinceStartMs: speechSnapshot.elapsedSinceStartMs, speechStarted: speechSnapshot.speechStarted, meaningfulSpeechDetected: speechSnapshot.meaningfulSpeechDetected, chunksCaptured: speechSnapshot.chunksCaptured, chunksEmitted: speechSnapshot.chunksEmitted });
     if (vadPollTimerRef.current) {
       window.clearInterval(vadPollTimerRef.current);
       vadPollTimerRef.current = null;
@@ -2183,7 +2178,7 @@ export default function App() {
       audioRestartAttemptsRef.current = 0;
     }
     recordingRef.current = false;
-    recordingPhaseRef.current = "stopped";
+    utteranceLifecycleRef.current.stop();
     sessionReadyRef.current = false;
     setMicrophoneActive(false);
     const recorder = mediaRecorderRef.current;
@@ -2233,52 +2228,25 @@ export default function App() {
   }, [stopDubbingPlayback, stopSilenceMonitor]);
 
   const finishDrain = useCallback((reason: "processed" | "timeout") => {
-    if (reason === "processed" && !["draining", "finalizing"].includes(recordingPhaseRef.current)) return;
+    const phase = utteranceLifecycleRef.current.snapshot().phase;
+    if (!["draining", "finalizing"].includes(phase)) return;
     if (drainTimeoutRef.current) window.clearTimeout(drainTimeoutRef.current);
     drainTimeoutRef.current = null;
     awaitingFinalTranscriptRef.current = false;
     setAwaitingFinalTranscript(false);
     drainPendingLanguagesRef.current.clear();
     setTranslationsPending([]);
-    if (reason === "timeout" && !lastFinalOriginalRef.current) {
+    const timeoutWithoutFinalOriginal = reason === "timeout" && !lastFinalOriginalRef.current;
+    if (reason === "timeout") {
       const readyStatuses = Object.fromEntries(targetLanguagesRef.current.map((language) => [language, "ready" as TranslationLifecycleState]));
       setTranslationStatuses(readyStatuses);
       setTranslationDiagnostics({});
-    }
-    if (reason === "processed" && recordingRef.current) {
-      finalizedUtteranceCountRef.current += 1;
-      speechDetectedRef.current = false;
-      lastVadSilenceDurationRef.current = 0;
-      lastInterimRef.current = "";
-      lastFinalOriginalRef.current = "";
+      setAlert(timeoutWithoutFinalOriginal ? "No final caption was received. Please try again." : "Translation did not finish. Please try again.");
       pendingFinalTranscriptRef.current = null;
-      activeTranslationIdRef.current = "";
-      activeBackendTranslationJobIdRef.current = "";
-      vadControllerRef.current.markPaused();
-      recordingPhaseRef.current = "listening";
-      console.info("[UTTERANCE_FINALIZED]", { utterance: finalizedUtteranceCountRef.current, recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, sequence: sequenceRef.current });
-      console.info("[RECORDING_SESSION_CONTINUES]", { mediaRecorderState: mediaRecorderRef.current?.state, deepgramSessionActive: sessionReadyRef.current, recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current });
-      console.info("[NEXT_UTTERANCE_READY]", { vadState: vadControllerRef.current.getState(), sequence: sequenceRef.current, streamGeneration: audioStreamGenerationRef.current });
-      setLiveText("");
-      setInterimOriginal("");
-      setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
-      setStatus("listening");
-      if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
-      const continuedGeneration = activeRecordingGenerationRef.current;
-      captionWatchdogTimerRef.current = window.setTimeout(() => {
-        captionWatchdogTimerRef.current = null;
-        if (activeRecordingGenerationRef.current !== continuedGeneration || recordingPhaseRef.current !== "listening" || speechDetectedRef.current) return;
-        cleanupMedia({ stopReason: "inactivity_timeout" });
-        socketRef.current?.emit("end_session", { reason: "inactivity_timeout" });
-        setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
-        setStatus("idle");
-        recordingPhaseRef.current = "idle";
-        stopInFlightRef.current = false;
-      }, CONTINUOUS_INACTIVITY_TIMEOUT_MS);
-      return;
+      pendingFinalTranscriptsRef.current.clear();
     }
-    recordingPhaseRef.current = "finalizing";
-    cleanupMedia({ preserveTranslationPipeline: reason === "processed", stopReason: `drain_${reason}` });
+    utteranceLifecycleRef.current.setPhase("finalizing");
+    cleanupMedia({ preserveTranslationPipeline: true, stopReason: `drain_${reason}`, caller: "finishDrain" });
     socketRef.current?.emit("end_session", { reason });
     activeSessionPayloadRef.current = null;
     activeBackendSessionIdRef.current = "";
@@ -2286,14 +2254,15 @@ export default function App() {
     sessionActionInFlightRef.current = false;
     setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
     setStatus("idle");
-    recordingPhaseRef.current = "idle";
+    utteranceLifecycleRef.current.resetToIdle();
     stopInFlightRef.current = false;
   }, [cleanupMedia]);
   finishDrainRef.current = finishDrain;
 
   const beginDrain = useCallback(() => {
-    if (!recordingRef.current || awaitingFinalTranscriptRef.current || recordingPhaseRef.current !== "listening") return;
-    recordingPhaseRef.current = "draining";
+    if (!recordingRef.current || awaitingFinalTranscriptRef.current) return;
+    const transition = utteranceLifecycleRef.current.requestFinalization("vad_sustained_silence");
+    if (!transition.accepted) return;
     awaitingFinalTranscriptRef.current = true;
     setAwaitingFinalTranscript(true);
     drainPendingLanguagesRef.current.clear();
@@ -2301,22 +2270,40 @@ export default function App() {
     setStatus("draining");
     setAudioDiagnostic((current) => ({ ...current, state: "ready", message: "Finishing recording" }));
     const recorder = mediaRecorderRef.current;
+    console.info("[UTTERANCE_FINALIZATION]", { reason: transition.reason, phaseBefore: transition.phaseBefore, phaseAfter: transition.phaseAfter, recorderState: recorder?.state, transcriptPending: true, translationsPending: drainPendingLanguagesRef.current.size });
     if (recorder?.state === "recording") {
       try { recorder.requestData(); } catch { /* MediaRecorder may already be stopping. */ }
+      if (recorderStoppedForGenerationRef.current !== activeRecordingGenerationRef.current) {
+        recorderStoppedForGenerationRef.current = activeRecordingGenerationRef.current;
+        recorderStopReasonRef.current = "vad_sustained_silence";
+        recorder.stop();
+      }
     }
-    socketRef.current?.emit("audio_utterance_end", { sequence: sequenceRef.current, capturedAt: Date.now(), finalChunk: false });
+    recordingRef.current = false;
+    setMicrophoneActive(false);
+    setMediaRecorderActive(false);
+    processedStreamRef.current?.getTracks().forEach((track) => track.stop());
+    processedStreamRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    void audioContextRef.current?.close().catch(() => undefined);
+    audioContextRef.current = null;
+    if (vadPollTimerRef.current) window.clearInterval(vadPollTimerRef.current);
+    vadPollTimerRef.current = null;
+    vadControllerRef.current.stop();
     drainTimeoutRef.current = window.setTimeout(() => finishDrain("timeout"), RECORDING_DRAIN_TIMEOUT_MS);
   }, [finishDrain]);
 
   const scheduleAudioRecovery = useCallback((reason: string) => {
-    if (!recordingRef.current || recordingPhaseRef.current === "draining" || recordingPhaseRef.current === "finalizing") return;
+    const phase = utteranceLifecycleRef.current.snapshot().phase;
+    if (!recordingRef.current || phase === "draining" || phase === "finalizing") return;
     logFrontendDebug("audio", "AUDIO_RECOVERY_BLOCKED", { reason, recordingGeneration: activeRecordingGenerationRef.current });
     setAudioDiagnostic({ state: "failed", message: "Microphone stopped unexpectedly", lastRestartReason: reason });
     setAlert("Microphone stopped unexpectedly. Press the microphone to try again.");
     cleanupMedia({ stopReason: reason });
     socketRef.current?.emit("end_session", { reason });
     setStatus("idle");
-    recordingPhaseRef.current = "idle";
+    utteranceLifecycleRef.current.resetToIdle();
     stopInFlightRef.current = false;
   }, [cleanupMedia]);
 
@@ -2365,7 +2352,7 @@ export default function App() {
     stopInFlightRef.current = true;
     sessionActionInFlightRef.current = true;
     setStatus("stopping");
-    cleanupMedia({ stopReason: "explicit_user_stop" });
+    cleanupMedia({ stopReason: "explicit_user_stop", caller: "stopSession" });
     if (drainTimeoutRef.current) window.clearTimeout(drainTimeoutRef.current);
     drainTimeoutRef.current = null;
     awaitingFinalTranscriptRef.current = false;
@@ -2376,19 +2363,9 @@ export default function App() {
     sessionActionInFlightRef.current = false;
     setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
     setStatus("idle");
-    recordingPhaseRef.current = "idle";
+    utteranceLifecycleRef.current.resetToIdle();
     stopInFlightRef.current = false;
   }, [cleanupMedia, status]);
-
-  const completeListeningSession = useCallback((translationsPending: boolean) => {
-    if (!recordingRef.current) return;
-    cleanupMedia({ preserveTranslationPipeline: translationsPending, stopReason: "final_transcript_processed" });
-    if (!translationsPending) socketRef.current?.emit("end_session");
-    setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
-    setStatus("idle");
-    recordingPhaseRef.current = "idle";
-    stopInFlightRef.current = false;
-  }, [cleanupMedia]);
 
   useEffect(() => {
     if (!isAuthed || !tokenRef.current) return undefined;
@@ -2575,7 +2552,7 @@ export default function App() {
 
     const handleDeepgramStreamReset = ({ generation }: { generation?: number }) => {
       const nextGeneration = Number(generation);
-      if (!recordingRef.current || recordingPhaseRef.current !== "listening" || !Number.isFinite(nextGeneration) || nextGeneration <= lastHandledDeepgramGenerationRef.current) return;
+      if (!recordingRef.current || utteranceLifecycleRef.current.snapshot().phase !== "listening" || !Number.isFinite(nextGeneration) || nextGeneration <= lastHandledDeepgramGenerationRef.current) return;
       lastHandledDeepgramGenerationRef.current = nextGeneration;
       const recorder = mediaRecorderRef.current;
       pendingAudioStreamGenerationRef.current = nextGeneration;
@@ -2599,15 +2576,17 @@ export default function App() {
 
     const markSessionReady = (payload?: { recordingGeneration?: number; sessionId?: string }) => {
       const readyGeneration = Number(payload?.recordingGeneration || activeSessionPayloadRef.current?.recordingGeneration);
-      const initialReady = recordingPhaseRef.current === "starting";
-      if (!Number.isFinite(readyGeneration) || readyGeneration !== activeRecordingGenerationRef.current || !["starting", "listening"].includes(recordingPhaseRef.current)) {
-        console.info("[SESSION_START_ACK_IGNORED]", { readyGeneration, activeGeneration: activeRecordingGenerationRef.current, phase: recordingPhaseRef.current });
+      const currentPhase = utteranceLifecycleRef.current.snapshot().phase;
+      const initialReady = currentPhase === "starting";
+      if (!Number.isFinite(readyGeneration) || readyGeneration !== activeRecordingGenerationRef.current || !["starting", "listening"].includes(currentPhase)) {
+        console.info("[SESSION_START_ACK_IGNORED]", { readyGeneration, activeGeneration: activeRecordingGenerationRef.current, phase: currentPhase });
         return;
       }
       sessionActionInFlightRef.current = false;
       startInFlightRef.current = false;
       sessionReadyRef.current = true;
       activeSessionIdRef.current = payload?.sessionId || activeSessionIdRef.current;
+      utteranceLifecycleRef.current.setSessionId(activeSessionIdRef.current || clientSessionIdRef.current);
       const recorder = mediaRecorderRef.current;
       if (initialReady && recorder?.state === "inactive" && recorderStartedForGenerationRef.current !== readyGeneration) {
         recorderStartedForGenerationRef.current = readyGeneration;
@@ -2633,25 +2612,27 @@ export default function App() {
         lastError: undefined
       }));
       setStatus("listening");
-      recordingPhaseRef.current = "listening";
+      utteranceLifecycleRef.current.setPhase("listening");
       if (initialReady) {
         if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
-        meaningfulSpeechGateRef.current.start(Date.now());
+        utteranceLifecycleRef.current.start({ now: Date.now(), recordingGeneration: readyGeneration, sessionId: activeSessionIdRef.current || clientSessionIdRef.current });
+        utteranceLifecycleRef.current.setPhase("listening");
         const checkNoMeaningfulSpeech = () => {
           captionWatchdogTimerRef.current = null;
-          if (activeRecordingGenerationRef.current !== readyGeneration || recordingPhaseRef.current !== "listening" || speechDetectedRef.current || meaningfulSpeechGateRef.current.snapshot().meaningfulSpeechDetected) return;
-          if (!meaningfulSpeechGateRef.current.shouldStopForNoSpeech()) {
-            captionWatchdogTimerRef.current = window.setTimeout(checkNoMeaningfulSpeech, meaningfulSpeechGateRef.current.nextCheckDelay());
+          const lifecycle = utteranceLifecycleRef.current.snapshot();
+          if (activeRecordingGenerationRef.current !== readyGeneration || lifecycle.phase !== "listening" || lifecycle.meaningfulSpeechDetected) return;
+          if (!utteranceLifecycleRef.current.shouldStopForNoSpeech()) {
+            captionWatchdogTimerRef.current = window.setTimeout(checkNoMeaningfulSpeech, utteranceLifecycleRef.current.nextCheckDelay());
             return;
           }
-          cleanupMedia({ stopReason: "no_meaningful_speech_timeout" });
+          cleanupMedia({ stopReason: "no_meaningful_speech_timeout", caller: "noSpeechTimer" });
           socketRef.current?.emit("end_session", { reason: "no_meaningful_speech_timeout" });
           setAudioDiagnostic({ state: "idle", message: "No speech detected. Microphone ready" });
           setStatus("idle");
-          recordingPhaseRef.current = "idle";
+          utteranceLifecycleRef.current.resetToIdle();
           stopInFlightRef.current = false;
         };
-        captionWatchdogTimerRef.current = window.setTimeout(checkNoMeaningfulSpeech, isDesktopChrome() ? meaningfulSpeechGateRef.current.nextCheckDelay() : CAPTION_WATCHDOG_MS);
+        captionWatchdogTimerRef.current = window.setTimeout(checkNoMeaningfulSpeech, isDesktopChrome() ? utteranceLifecycleRef.current.nextCheckDelay() : CAPTION_WATCHDOG_MS);
       }
     };
 
@@ -2712,8 +2693,8 @@ export default function App() {
       logFrontendDebug("audio", "TRANSCRIPT_PARTIAL_RECEIVED", { chars: originalText.length, providerFinal, speechFinal, utteranceEnd });
       vadControllerRef.current.noteTranscript(originalText, { providerFinal, speechFinal, utteranceEnd });
       if (originalText) {
-        speechDetectedRef.current = true;
-        meaningfulSpeechGateRef.current.confirmMeaningfulSpeech();
+        utteranceLifecycleRef.current.confirmMeaningfulSpeech();
+        vadControllerRef.current.update(getAudioLevelRef.current(), Date.now(), true);
       }
       if (speechStarted && vadControllerRef.current.getState() === "soft-pause") {
         setStatus("speaking");
@@ -3033,7 +3014,7 @@ export default function App() {
           }
         }
         setTranslationsPending([...drainPendingLanguagesRef.current]);
-        if (recordingPhaseRef.current === "draining" && !awaitingFinalTranscriptRef.current && drainPendingLanguagesRef.current.size === 0) {
+        if (utteranceLifecycleRef.current.snapshot().phase === "draining" && !awaitingFinalTranscriptRef.current && drainPendingLanguagesRef.current.size === 0) {
           finishDrain("processed");
         }
       }
@@ -3069,7 +3050,7 @@ export default function App() {
       setSocketConnected(false);
       setSocketReconnecting(false);
     };
-  }, [isAuthed, completeListeningSession, finishDrain, queueDubbingTranslations, updateSocketAuth, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript]);
+  }, [isAuthed, finishDrain, queueDubbingTranslations, updateSocketAuth, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript]);
 
   useEffect(() => {
     const reconnectSocket = () => {
@@ -3257,7 +3238,7 @@ export default function App() {
   }, [fetchHistory, view]);
 
   const startSession = useCallback(async () => {
-    if (sessionActionInFlightRef.current || startInFlightRef.current || recordingRef.current || recordingPhaseRef.current !== "idle") return;
+    if (sessionActionInFlightRef.current || startInFlightRef.current || recordingRef.current || utteranceLifecycleRef.current.snapshot().phase !== "idle") return;
     primeSpeechSynthesis();
 
     if (!isAuthed) {
@@ -3283,12 +3264,10 @@ export default function App() {
     stopInFlightRef.current = false;
     recorderStartedForGenerationRef.current = null;
     recorderStoppedForGenerationRef.current = null;
+    finalizationEmittedForGenerationRef.current = null;
     activeSessionIdRef.current = "";
-    speechDetectedRef.current = false;
     lastVadSilenceDurationRef.current = 0;
-    finalizedUtteranceCountRef.current = 0;
-    audioAfterFinalLoggedRef.current = 0;
-    recordingPhaseRef.current = "starting";
+    utteranceLifecycleRef.current.start({ now: Date.now(), recordingGeneration, sessionId: clientSessionIdRef.current });
     sessionActionInFlightRef.current = true;
     setAlert(null);
     setStatus("connecting");
@@ -3440,14 +3419,18 @@ export default function App() {
       const sendCapturedChunk = (chunk: Omit<AudioChunkPayload, "sequence">) => {
         if ((dubbingTransmissionGatedRef.current && !chunk.containerHeader) || chunk.audio.size < MIN_MEDIA_CHUNK_BYTES) return false;
         sequenceRef.current += 1;
-        if (finalizedUtteranceCountRef.current > audioAfterFinalLoggedRef.current) {
-          audioAfterFinalLoggedRef.current = finalizedUtteranceCountRef.current;
-          console.info("[AUDIO_CHUNK_AFTER_FINAL]", { utterance: finalizedUtteranceCountRef.current, sequence: sequenceRef.current, bytes: chunk.audio.size, recordingGeneration: activeRecordingGenerationRef.current, streamGeneration: chunk.streamGeneration, sessionId: activeSessionIdRef.current || clientSessionIdRef.current });
-        }
         lastAudioChunkSentAtRef.current = chunk.capturedAt;
         emitAudioChunkPayload({ ...chunk, sequence: sequenceRef.current });
-        meaningfulSpeechGateRef.current.noteEmitted();
+        utteranceLifecycleRef.current.noteEmitted();
         if (sequenceRef.current % 3 === 0) setChunkCount(sequenceRef.current);
+        return true;
+      };
+
+      const emitUtteranceFinalization = (capturedAt: number, finalChunk: boolean, reason: string) => {
+        if (finalizationEmittedForGenerationRef.current === activeRecordingGenerationRef.current) return false;
+        finalizationEmittedForGenerationRef.current = activeRecordingGenerationRef.current;
+        socketRef.current?.emit("audio_utterance_end", { sequence: sequenceRef.current, capturedAt, finalChunk });
+        logFrontendDebug("audio", "UTTERANCE_BOUNDARY_EMITTED", { sequence: sequenceRef.current, reason });
         return true;
       };
 
@@ -3461,17 +3444,9 @@ export default function App() {
           setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Speaking" }));
         },
         onBoundary: (boundary, reason) => {
-          if (!recordingRef.current) return;
+          if (utteranceLifecycleRef.current.snapshot().phase !== "draining") return;
           pendingSpeechChunksRef.current = [];
-          vadControllerRef.current.markPaused();
-          socketRef.current?.emit("audio_utterance_end", {
-            sequence: sequenceRef.current,
-            capturedAt: boundary.capturedAt,
-            finalChunk: reason === "dataavailable"
-          });
-          logFrontendDebug("audio", "UTTERANCE_BOUNDARY_EMITTED", { sequence: boundary.sequence, reason });
-          setStatus("listening");
-          setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
+          emitUtteranceFinalization(boundary.capturedAt, reason === "dataavailable", reason);
         }
       });
 
@@ -3482,9 +3457,9 @@ export default function App() {
         try {
           if (event.data.size < MIN_MEDIA_CHUNK_BYTES) return;
           if (isDesktopChrome()) {
-            const speechSnapshot = meaningfulSpeechGateRef.current.observeAudio({ audioLevel, noiseFloor: vadControllerRef.current.getNoiseFloor(), bytes: event.data.size, containerAudio: /audio\/(webm|ogg)/i.test(recorderMimeType), now: capturedAt });
-            if (speechSnapshot.meaningfulSpeechDetected) {
-              speechDetectedRef.current = true;
+            const speechSnapshot = utteranceLifecycleRef.current.observeAudio({ audioLevel, noiseFloor: vadControllerRef.current.getNoiseFloor(), bytes: event.data.size, containerAudio: /audio\/(webm|ogg)/i.test(recorderMimeType), now: capturedAt });
+            if (speechSnapshot.speechLikeSample && speechSnapshot.meaningfulSpeechDetected) {
+              vadControllerRef.current.update(audioLevel, capturedAt, true);
               if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
               captionWatchdogTimerRef.current = null;
             }
@@ -3519,6 +3494,10 @@ export default function App() {
             return;
           }
           if (dubbingTransmissionGatedRef.current) return;
+          if (utteranceLifecycleRef.current.snapshot().phase === "draining") {
+            finalChunkSent = sendCapturedChunk(chunk);
+            return;
+          }
           const vadState = vadControllerRef.current.getState();
           if (vadState === "speaking" || vadState === "soft-pause" || vadState === "finalizing") {
             finalChunkSent = sendCapturedChunk(chunk);
@@ -3548,7 +3527,9 @@ export default function App() {
       };
 
       recorder.onstop = () => {
-        console.info("[MEDIARECORDER_STOP]", { reason: recorderStopReasonRef.current, recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, currentState: recorder.state, speechDetected: speechDetectedRef.current, silenceDuration: lastVadSilenceDurationRef.current, pendingFinalTranscript: awaitingFinalTranscriptRef.current, socketConnected: Boolean(socketRef.current?.connected), mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
+        const lifecycle = utteranceLifecycleRef.current.snapshot();
+        console.info("[MEDIARECORDER_STOP]", { reason: recorderStopReasonRef.current, recordingGeneration: lifecycle.recordingGeneration, sessionId: lifecycle.sessionId, currentState: recorder.state, speechDetected: lifecycle.speechStarted, silenceDuration: lastVadSilenceDurationRef.current, pendingFinalTranscript: awaitingFinalTranscriptRef.current, socketConnected: Boolean(socketRef.current?.connected), mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
+        if (recorderStopReasonRef.current === "vad_sustained_silence") emitUtteranceFinalization(Date.now(), true, "recorder_stop");
         if (recorderGenerationRestartRef.current && recordingRef.current) {
           recorderGenerationRestartRef.current = false;
           audioStreamGenerationRef.current = pendingAudioStreamGenerationRef.current;
@@ -3570,7 +3551,9 @@ export default function App() {
       const desktopChrome = isDesktopChrome();
       vadControllerRef.current = createVadController({
         autoFinalize: autoStopOnSilence,
-        ...(desktopChrome ? { speechThreshold: 0.003, silenceThreshold: 0.0018, noiseFloorMultiplier: 1.5, consecutiveSpeechSamples: 3 } : {})
+        ...(desktopChrome
+          ? { speechThreshold: 0.003, silenceThreshold: 0.0018, noiseFloorMultiplier: 1.5, consecutiveSpeechSamples: 3, hardFinalizeMs: 1700 }
+          : { hardFinalizeMs: 1500 })
       });
       vadControllerRef.current.start(Date.now());
       setStatus("calibrating");
@@ -3581,8 +3564,10 @@ export default function App() {
         const action = vadControllerRef.current.update(getAudioLevelRef.current(), Date.now(), false);
         if (!action) return;
         if ("silenceMs" in action) lastVadSilenceDurationRef.current = action.silenceMs || 0;
-        const speechSnapshot = meaningfulSpeechGateRef.current.snapshot();
-        console.info("[VAD_STATE]", { event: action.type, speechStarted: action.type === "speech_started" || action.type === "speech_resumed", speechEnded: action.type === "finalize", silenceDuration: "silenceMs" in action ? action.silenceMs : 0, audioLevel: action.level, noiseFloor: vadControllerRef.current.getNoiseFloor(), threshold: action.speech, consecutiveSpeechSamples: speechSnapshot.consecutiveSpeechSamples, meaningfulSpeechDetected: speechDetectedRef.current || speechSnapshot.meaningfulSpeechDetected, elapsedSinceStartMs: speechSnapshot.elapsedSinceStartMs, graceRemainingMs: speechSnapshot.graceRemainingMs, silenceThreshold: action.silence });
+        if (action.type === "speech_started" || action.type === "speech_resumed") utteranceLifecycleRef.current.confirmMeaningfulSpeech();
+        if (action.type === "soft_pause" || action.type === "finalize") utteranceLifecycleRef.current.noteSilence();
+        const speechSnapshot = utteranceLifecycleRef.current.snapshot();
+        console.info("[VAD_STATE]", { speechStarted: speechSnapshot.speechStarted, meaningfulSpeechDetected: speechSnapshot.meaningfulSpeechDetected, consecutiveSpeechSamples: speechSnapshot.consecutiveSpeechSamples, audioLevel: action.level, threshold: action.speech, silenceDurationMs: "silenceMs" in action ? action.silenceMs : 0, phase: speechSnapshot.phase, recordingGeneration: speechSnapshot.recordingGeneration, noiseFloor: vadControllerRef.current.getNoiseFloor() });
         if (action.type === "calibrated") {
           setStatus("listening");
           return;
@@ -3595,8 +3580,6 @@ export default function App() {
           return;
         }
         if (action.type === "speech_started") {
-          speechDetectedRef.current = true;
-          meaningfulSpeechGateRef.current.confirmMeaningfulSpeech();
           if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
           captionWatchdogTimerRef.current = null;
           const buffered = pendingSpeechChunksRef.current.splice(0);
@@ -3665,11 +3648,12 @@ export default function App() {
           console.info("[SESSION_START_ACK]", { reason: "explicit_user_start", recordingGeneration, stale, ok: !timeoutError && !response?.error, error: response?.error || timeoutError?.message || null, mimeType: recorderMimeType, sessionId: response?.sessionId });
           if (stale) return;
           activeSessionIdRef.current = response?.sessionId || activeSessionIdRef.current;
+          utteranceLifecycleRef.current.setSessionId(activeSessionIdRef.current || clientSessionIdRef.current);
           if (timeoutError || response?.error) {
             sessionActionInFlightRef.current = false;
             startInFlightRef.current = false;
             cleanupMedia({ stopReason: "session_start_failed" });
-            recordingPhaseRef.current = "idle";
+            utteranceLifecycleRef.current.resetToIdle();
             setStatus("error");
             setAlert(response?.error || "Unable to reach the live interpreter.");
           }
@@ -3679,7 +3663,7 @@ export default function App() {
       sessionActionInFlightRef.current = false;
       startInFlightRef.current = false;
       cleanupMedia({ stopReason: "session_start_exception" });
-      recordingPhaseRef.current = "idle";
+      utteranceLifecycleRef.current.resetToIdle();
       setStatus("error");
       const message = mediaErrorMessage(error);
       setAudioDiagnostic({
