@@ -1573,6 +1573,8 @@ export default function App() {
   const lastHandledDeepgramGenerationRef = useRef(1);
   const speechDetectedRef = useRef(false);
   const lastVadSilenceDurationRef = useRef(0);
+  const finalizedUtteranceCountRef = useRef(0);
+  const audioAfterFinalLoggedRef = useRef(0);
   const authRequestRef = useRef<AuthProvider | null>(null);
   const socketAuthRefreshInFlightRef = useRef(false);
 
@@ -2156,6 +2158,7 @@ export default function App() {
   }, []);
 
   const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean; preserveTranslationPipeline?: boolean; stopReason?: string } = {}) => {
+    console.info("[SESSION_STOP_REASON]", { reason: options.stopReason || "session_cleanup", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, phase: recordingPhaseRef.current });
     if (vadPollTimerRef.current) {
       window.clearInterval(vadPollTimerRef.current);
       vadPollTimerRef.current = null;
@@ -2225,6 +2228,7 @@ export default function App() {
   }, [stopDubbingPlayback, stopSilenceMonitor]);
 
   const finishDrain = useCallback((reason: "processed" | "timeout") => {
+    if (reason === "processed" && !["draining", "finalizing"].includes(recordingPhaseRef.current)) return;
     if (drainTimeoutRef.current) window.clearTimeout(drainTimeoutRef.current);
     drainTimeoutRef.current = null;
     awaitingFinalTranscriptRef.current = false;
@@ -2235,6 +2239,38 @@ export default function App() {
       const readyStatuses = Object.fromEntries(targetLanguagesRef.current.map((language) => [language, "ready" as TranslationLifecycleState]));
       setTranslationStatuses(readyStatuses);
       setTranslationDiagnostics({});
+    }
+    if (reason === "processed" && recordingRef.current) {
+      finalizedUtteranceCountRef.current += 1;
+      speechDetectedRef.current = false;
+      lastVadSilenceDurationRef.current = 0;
+      lastInterimRef.current = "";
+      lastFinalOriginalRef.current = "";
+      pendingFinalTranscriptRef.current = null;
+      activeTranslationIdRef.current = "";
+      activeBackendTranslationJobIdRef.current = "";
+      vadControllerRef.current.markPaused();
+      recordingPhaseRef.current = "listening";
+      console.info("[UTTERANCE_FINALIZED]", { utterance: finalizedUtteranceCountRef.current, recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, sequence: sequenceRef.current });
+      console.info("[RECORDING_SESSION_CONTINUES]", { mediaRecorderState: mediaRecorderRef.current?.state, deepgramSessionActive: sessionReadyRef.current, recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current });
+      console.info("[NEXT_UTTERANCE_READY]", { vadState: vadControllerRef.current.getState(), sequence: sequenceRef.current, streamGeneration: audioStreamGenerationRef.current });
+      setLiveText("");
+      setInterimOriginal("");
+      setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
+      setStatus("listening");
+      if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
+      const continuedGeneration = activeRecordingGenerationRef.current;
+      captionWatchdogTimerRef.current = window.setTimeout(() => {
+        captionWatchdogTimerRef.current = null;
+        if (activeRecordingGenerationRef.current !== continuedGeneration || recordingPhaseRef.current !== "listening" || speechDetectedRef.current) return;
+        cleanupMedia({ stopReason: "inactivity_timeout" });
+        socketRef.current?.emit("end_session", { reason: "inactivity_timeout" });
+        setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
+        setStatus("idle");
+        recordingPhaseRef.current = "idle";
+        stopInFlightRef.current = false;
+      }, CAPTION_WATCHDOG_MS);
+      return;
     }
     recordingPhaseRef.current = "finalizing";
     cleanupMedia({ preserveTranslationPipeline: reason === "processed", stopReason: `drain_${reason}` });
@@ -2982,7 +3018,7 @@ export default function App() {
           }
         }
         setTranslationsPending([...drainPendingLanguagesRef.current]);
-        if (!recordingRef.current && !awaitingFinalTranscriptRef.current && drainPendingLanguagesRef.current.size === 0) {
+        if (recordingPhaseRef.current === "draining" && !awaitingFinalTranscriptRef.current && drainPendingLanguagesRef.current.size === 0) {
           finishDrain("processed");
         }
       }
@@ -3235,6 +3271,8 @@ export default function App() {
     activeSessionIdRef.current = "";
     speechDetectedRef.current = false;
     lastVadSilenceDurationRef.current = 0;
+    finalizedUtteranceCountRef.current = 0;
+    audioAfterFinalLoggedRef.current = 0;
     recordingPhaseRef.current = "starting";
     sessionActionInFlightRef.current = true;
     setAlert(null);
@@ -3387,6 +3425,10 @@ export default function App() {
       const sendCapturedChunk = (chunk: Omit<AudioChunkPayload, "sequence">) => {
         if ((dubbingTransmissionGatedRef.current && !chunk.containerHeader) || chunk.audio.size < MIN_MEDIA_CHUNK_BYTES) return false;
         sequenceRef.current += 1;
+        if (finalizedUtteranceCountRef.current > audioAfterFinalLoggedRef.current) {
+          audioAfterFinalLoggedRef.current = finalizedUtteranceCountRef.current;
+          console.info("[AUDIO_CHUNK_AFTER_FINAL]", { utterance: finalizedUtteranceCountRef.current, sequence: sequenceRef.current, bytes: chunk.audio.size, recordingGeneration: activeRecordingGenerationRef.current, streamGeneration: chunk.streamGeneration, sessionId: activeSessionIdRef.current || clientSessionIdRef.current });
+        }
         lastAudioChunkSentAtRef.current = chunk.capturedAt;
         emitAudioChunkPayload({ ...chunk, sequence: sequenceRef.current });
         if (sequenceRef.current % 3 === 0) setChunkCount(sequenceRef.current);

@@ -324,6 +324,9 @@ const createFakeClientFactory = (options = {}) => {
   ];
 
   for (const phrase of phrases) {
+    const sentBefore = connection.sentMedia.length;
+    session.sendAudio(Buffer.alloc(128, phrases.indexOf(phrase) + 40));
+    assert.equal(connection.sentMedia.length, sentBefore + 1, "audio after a finalized utterance must reach the same Deepgram session");
     connection.emitTranscript(phrase, { isFinal: false });
     connection.emitTranscript(phrase, { isFinal: true });
     session.completeUtterance();
@@ -333,6 +336,7 @@ const createFakeClientFactory = (options = {}) => {
   const completed = results.filter((result) => result.isTranslationComplete && result.translations?.es);
   assert.equal(completed.length, 4, "repeated final transcripts outside the duplicate window should each complete exactly once");
   assert.equal(new Set(completed.map((result) => result.sequence)).size, 4, "completed translations should have unique stable sequences");
+  assert.equal(factory.connections.length, 1, "two or more utterances must keep one Deepgram session open");
   session.stop();
 }
 

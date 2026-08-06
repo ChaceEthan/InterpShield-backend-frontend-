@@ -6,12 +6,15 @@ export const createRecordingStateMachine = ({ silenceMs = 1500, drainTimeoutMs =
   const finish = (reason) => {
     if (!['draining', 'translating'].includes(phase)) return false;
     clearSilence(); if (drainTimer !== null) clearTimer(drainTimer); drainTimer = null;
-    awaitingFinalTranscript = false; pendingLanguages.clear(); dubbingSubmissions.clear(); change('idle'); onDrainComplete(reason); return true;
+    awaitingFinalTranscript = false; pendingLanguages.clear(); dubbingSubmissions.clear(); meaningfulSpeech = false;
+    if (reason === 'processed') change('listening');
+    else { change('idle'); onStopCapture(); }
+    onDrainComplete(reason); return true;
   };
   const maybeFinish = () => { if (!awaitingFinalTranscript && !pendingLanguages.size && !dubbingSubmissions.size) finish('processed'); };
   const beginDrain = () => {
     if (phase !== 'listening') return false;
-    clearSilence(); awaitingFinalTranscript = true; change('draining'); onStopCapture();
+    clearSilence(); awaitingFinalTranscript = true; change('draining');
     drainTimer = setTimer(() => finish('timeout'), drainTimeoutMs); return true;
   };
   return {
@@ -47,6 +50,7 @@ export const createRecorderGenerationController = ({ onStart = () => {}, onStop 
     beginDrain() { if (phase !== "listening") return false; phase = "draining"; return true; },
     finish(reason = "processed") {
       if (!['draining', 'finalizing'].includes(phase) || stopInFlight || stoppedGeneration === generation) return false;
+      if (reason === "processed") { phase = "listening"; return true; }
       phase = "finalizing"; stopInFlight = true; stoppedGeneration = generation; onStop({ generation, reason });
       stopInFlight = false; phase = "idle"; return true;
     },

@@ -28,8 +28,8 @@ lifecycle.noteMeaningfulSpeech();
 assert.equal(captureStops, 0, "resumed speech cancels the silence timer");
 lifecycle.noteSilence();
 [...timers.values()].find(({ delay }) => delay === 1500).callback();
-assert.equal(captureStops, 1, "sustained silence enters draining exactly once");
-assert.equal(trackStops, 1, "microphone tracks stop on entry to draining");
+assert.equal(captureStops, 0, "sustained silence drains an utterance without stopping MediaRecorder");
+assert.equal(trackStops, 0, "microphone tracks remain active while the utterance finalizes");
 assert.equal(lifecycle.beginDrain(), false, "duplicate drain calls are ignored");
 assert.equal(sessionClosed, 0, "the interpreter session remains alive for final results");
 lifecycle.noteFinalTranscript(["zh", "fr"]);
@@ -39,9 +39,9 @@ assert.equal(sessionClosed, 0, "one target does not wait on or close another tar
 lifecycle.noteLanguageSettled("fr", { dubbingQueued: true });
 lifecycle.noteDubbingSubmitted("fr");
 assert.equal(sessionClosed, 1);
-assert.equal(lifecycle.snapshot().phase, "idle", "the button returns to idle after processing");
+assert.equal(lifecycle.snapshot().phase, "listening", "the same microphone session listens for a second utterance after processing");
+assert.equal(captureStops, 0, "first utterance completion preserves MediaRecorder");
 
-lifecycle.start();
 lifecycle.noteMeaningfulSpeech();
 lifecycle.beginDrain();
 const drainTimer = [...timers.values()].find(({ delay }) => delay === 8000);
@@ -49,8 +49,9 @@ assert.ok(drainTimer, "draining has an 8 second upper bound");
 drainTimer.callback();
 assert.equal(lifecycle.snapshot().phase, "idle", "drain timeout prevents a stuck UI");
 assert.equal(sessionClosed, 2);
+assert.equal(captureStops, 1, "inactivity timeout stops the continuous recording session once");
 
-assert.deepEqual(phases.slice(0, 4), ["listening", "draining", "translating", "idle"]);
+assert.deepEqual(phases.slice(0, 5), ["listening", "draining", "translating", "listening", "draining"]);
 console.log("Recording auto-stop and drain state-machine regression tests passed.");
 
 const recorderStarts = [], recorderStops = [];
@@ -72,6 +73,11 @@ assert.equal(recorder.streamGenerationChanged(2), false, "duplicate generation r
 assert.equal(recorder.snapshot().phase, "listening", "short pauses do not alter recorder ownership");
 assert.equal(recorder.beginDrain(), true, "sustained silence enters draining once");
 assert.equal(recorder.beginDrain(), false);
+assert.equal(recorder.finish("processed"), true, "first finalized utterance resumes listening");
+assert.equal(recorder.snapshot().phase, "listening");
+assert.equal(recorderStops.length, 0, "first final transcript keeps MediaRecorder active");
+assert.equal(recorderStarts.length, 1, "continuous mode does not restart MediaRecorder between utterances");
+assert.equal(recorder.beginDrain(), true, "the second utterance is accepted in the same generation");
 assert.equal(recorder.finish("drain_timeout"), true);
 assert.equal(recorder.finish("drain_timeout"), false, "drain timeout stops once without restart");
 assert.equal(recorderStops.length, 1);
@@ -80,6 +86,9 @@ const secondGeneration = recorder.explicitStart();
 assert.equal(secondGeneration, 2, "a second explicit microphone press creates the next generation");
 assert.equal(recorder.sessionReady(secondGeneration), true);
 assert.equal(recorderStarts.length, 2, "the second press creates exactly one new MediaRecorder start");
+assert.equal(recorder.explicitStop(), true, "explicit Stop ends the active session once");
+assert.equal(recorder.explicitStop(), false, "duplicate explicit Stop is ignored");
+assert.equal(recorderStops.length, 2, "one inactivity stop and one later explicit stop are recorded");
 
 const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
 for (const guard of ["startInFlightRef", "stopInFlightRef", "activeRecordingGenerationRef", "activeSessionIdRef", "recorderStartedForGenerationRef", "recorderStoppedForGenerationRef"]) {
@@ -90,3 +99,6 @@ assert.match(appSource, /nextGeneration <= lastHandledDeepgramGenerationRef\.cur
 assert.match(appSource, /recordingPhaseRef\.current !== "listening"/, "draining blocks recorder generation changes and duplicate drain requests");
 assert.match(appSource, /activeRecordingGenerationRef\.current !== recordingGeneration[\s\S]{0,300}?if \(stale\) return/, "late start ACKs cannot update an old generation");
 assert.match(appSource, /stopReason: "no_meaningful_speech_timeout"/, "no-speech timeout stops once without restarting");
+assert.match(appSource, /\[RECORDING_SESSION_CONTINUES\]/, "processed utterances explicitly preserve the recording session");
+assert.match(appSource, /vadControllerRef\.current\.markPaused\(\)/, "VAD resets to accept the next utterance");
+assert.match(appSource, /recordingPhaseRef\.current = "listening"[\s\S]{0,900}?return;/, "processed utterance completion cannot fall through to full cleanup");

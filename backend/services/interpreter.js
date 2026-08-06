@@ -1130,6 +1130,7 @@ export const createInterpreterSession = async ({
   let lastTranslatedTranscript = "";
   let lastTranslatedTranscriptAt = 0;
   let currentSentence = "";
+  let finalizedUtteranceCount = 0;
   let sessionStopped = false;
   const sessionTargetLanguages = normalizeTargetLanguages(targetLanguages, targetLang);
   let currentDirection = { source: sourceLang, target: sessionTargetLanguages[0], targets: sessionTargetLanguages };
@@ -3618,6 +3619,8 @@ export const createInterpreterSession = async ({
     if (looksLikeTinyFragment) {
       return;
     }
+    finalizedUtteranceCount += 1;
+    console.info("[UTTERANCE_FINALIZED]", { sessionId, utterance: finalizedUtteranceCount, chars: sentence.length, deepgramSessionOpen: !sessionStopped });
 
     const startedAt = Date.now();
     const jobId = translationJobSequence + 1;
@@ -3783,6 +3786,9 @@ export const createInterpreterSession = async ({
 
       if (!normalized) {
         return;
+      }
+      if (finalizedUtteranceCount > 0) {
+        console.info("[DEEPGRAM_MESSAGE_AFTER_FINAL]", { sessionId, utterance: finalizedUtteranceCount + 1, chars: displayText.length, isFinal: Boolean(isFinal), speechFinal: Boolean(speechFinal) });
       }
 
       const localDetection = shouldUseDetectedSourceLanguage({ configuredSourceLang: sourceLang, twoWay })
