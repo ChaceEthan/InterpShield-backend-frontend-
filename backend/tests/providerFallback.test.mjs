@@ -19,6 +19,7 @@ import {
   translateWithOpenAI
 } from "../services/openai.js";
 import {
+  DEFAULT_TRANSLATION_PROVIDER,
   OPENAI_QUOTA_COOLDOWN_MS,
   applyProviderFailureToHealth,
   buildProviderExecutionOrder,
@@ -754,9 +755,10 @@ assert.doesNotMatch(frontendSource, /coerceTranslationState\(diagnostic\.status\
 // providers were actually tried for a given target language, in order), a from/to/reason
 // fallback log distinct from the pre-existing PROVIDER_FALLBACK shape, and a final-failure log
 // once every provider in the order has genuinely been exhausted.
-assert.match(interpreterSource, /logTranslationEvent\("TRANSLATION_PROVIDER_ATTEMPT", \{\s*sessionId,\s*jobId,\s*targetLanguage: language,\s*provider,\s*attempt: attempt \+ 1\s*\}\);/, "TRANSLATION_PROVIDER_ATTEMPT is logged immediately before each provider attempt, with the target language and attempt number");
-assert.match(interpreterSource, /logTranslationEvent\("TRANSLATION_PROVIDER_FALLBACK", \{\s*from: provider,\s*to: nextProviderInOrder,\s*jobId,\s*targetLanguage: language,\s*reason: lastError\?\.errorCategory \|\| lastError\?\.reason \|\| lastError\?\.message \|\| "provider_failed"\s*\}, "warn"\);/, "TRANSLATION_PROVIDER_FALLBACK is logged with the exact requested {from, to, reason} shape whenever a provider genuinely falls through to the next one in the order");
-assert.match(interpreterSource, /logTranslationEvent\("TRANSLATION_PROVIDER_FINAL_FAILURE", \{/, "TRANSLATION_PROVIDER_FINAL_FAILURE is logged once every provider in the order has been exhausted for this target language");
+assert.match(interpreterSource, /logTranslationEvent\("TRANSLATION_PROVIDER_ATTEMPT", \{\s*sessionId,\s*jobId,\s*utteranceId: jobId,\s*targetLanguage: language,\s*provider,\s*attempt: attempt \+ 1\s*\}\);/, "TRANSLATION_PROVIDER_ATTEMPT is logged immediately before each provider attempt, with the target language, utterance identity, and attempt number");
+assert.match(interpreterSource, /logTranslationEvent\("TRANSLATION_PROVIDER_SUCCESS", \{\s*sessionId,\s*jobId,\s*utteranceId: jobId,\s*targetLanguage: language,\s*provider: result\.provider\s*\}\);/, "TRANSLATION_PROVIDER_SUCCESS is logged as soon as a provider's result is accepted as a real translation");
+assert.match(interpreterSource, /logTranslationEvent\("TRANSLATION_PROVIDER_FALLBACK", \{\s*sessionId,\s*jobId,\s*utteranceId: jobId,\s*targetLanguage: language,\s*from: provider,\s*to: nextProviderInOrder,\s*reason: lastError\?\.errorCategory \|\| lastError\?\.reason \|\| lastError\?\.message \|\| "provider_failed"\s*\}, "warn"\);/, "TRANSLATION_PROVIDER_FALLBACK is logged with the exact requested {from, to, reason} shape (plus session/job/utterance identity) whenever a provider genuinely falls through to the next one in the order");
+assert.match(interpreterSource, /logTranslationEvent\("TRANSLATION_PROVIDER_FINAL_FAILURE", \{\s*sessionId,\s*jobId,\s*utteranceId: jobId,/, "TRANSLATION_PROVIDER_FINAL_FAILURE is logged once every provider in the order has been exhausted for this target language, with full session/job/utterance identity");
 
 // Section: these events must not be silently suppressed in production the way a non-PROVIDER_
 // prefixed event would be by logTranslationEvent's own shouldLog gate.
@@ -768,9 +770,44 @@ assert.match(interpreterSource, /const providerEvent = \/\^PROVIDER_\|\^TRANSLAT
   const attemptLogIndex = interpreterSource.indexOf('logTranslationEvent("TRANSLATION_PROVIDER_ATTEMPT"');
   const attemptLogBlock = interpreterSource.slice(attemptLogIndex, attemptLogIndex + 300);
   assert.doesNotMatch(attemptLogBlock, /apiKey|geminiApiKey|openaiApiKey/, "TRANSLATION_PROVIDER_ATTEMPT never includes an API key field");
+  const successLogIndex = interpreterSource.indexOf('logTranslationEvent("TRANSLATION_PROVIDER_SUCCESS"');
+  const successLogBlock = interpreterSource.slice(successLogIndex, successLogIndex + 300);
+  assert.doesNotMatch(successLogBlock, /apiKey|geminiApiKey|openaiApiKey/, "TRANSLATION_PROVIDER_SUCCESS never includes an API key field");
   const fallbackLogIndex = interpreterSource.indexOf('logTranslationEvent("TRANSLATION_PROVIDER_FALLBACK"');
   const fallbackLogBlock = interpreterSource.slice(fallbackLogIndex, fallbackLogIndex + 300);
   assert.doesNotMatch(fallbackLogBlock, /apiKey|geminiApiKey|openaiApiKey/, "TRANSLATION_PROVIDER_FALLBACK never includes an API key field");
+  const finalFailureLogIndex = interpreterSource.indexOf('logTranslationEvent("TRANSLATION_PROVIDER_FINAL_FAILURE"');
+  const finalFailureLogBlock = interpreterSource.slice(finalFailureLogIndex, finalFailureLogIndex + 300);
+  assert.doesNotMatch(finalFailureLogBlock, /apiKey|geminiApiKey|openaiApiKey/, "TRANSLATION_PROVIDER_FINAL_FAILURE never includes an API key field");
+}
+
+// Gemini-first default: DEFAULT_TRANSLATION_PROVIDER is the single source of truth used
+// wherever the caller does not explicitly request a provider (preferredProvider === "auto"),
+// and it resolves to "gemini" unless an operator explicitly overrides it via env — never a
+// second, independently-hardcoded "openai" default drifting out of sync.
+{
+  assert.equal(DEFAULT_TRANSLATION_PROVIDER, "gemini", "Gemini is the default primary translation provider (OpenAI, which currently has no paid quota, is fallback-only)");
+  const defaultOrder = buildProviderExecutionOrder({
+    providerHealth: {
+      gemini: { failures: 0, cooldownUntil: 0, lastSuccessAt: 0, lastFailure: null },
+      openai: { failures: 0, cooldownUntil: 0, lastSuccessAt: 0, lastFailure: null }
+    },
+    env: { geminiApiKey: "configured", openaiApiKey: "configured" },
+    preferredProvider: "auto"
+  });
+  assert.deepEqual(defaultOrder, ["gemini", "openai"], "with no explicit preference, Gemini is tried before OpenAI by default");
+}
+assert.match(interpreterSource, /const preferred = \["gemini", "openai"\]\.includes\(preferredProvider\) \? preferredProvider : DEFAULT_TRANSLATION_PROVIDER;/, "buildProviderExecutionOrder's own default resolves through the single DEFAULT_TRANSLATION_PROVIDER constant, not a separately hardcoded literal");
+assert.match(interpreterSource, /: DEFAULT_TRANSLATION_PROVIDER;\s*\n\s*const order = buildProviderExecutionOrder/, "getHealthyProviders' primaryChoice fallback resolves through the same single DEFAULT_TRANSLATION_PROVIDER constant");
+
+// Safe startup diagnostics (section 4): reports configured/model/preferred for both providers
+// without ever printing the key itself, and clearly flags a missing GEMINI_API_KEY.
+{
+  const serverSource = readFileSync(resolve(__dirname, "../server.js"), "utf8");
+  assert.match(serverSource, /event: "TRANSLATION_PROVIDER_STATUS",\s*provider: "gemini",\s*configured: Boolean\(env\.geminiApiKey\),\s*model: env\.geminiModel,\s*preferred: DEFAULT_TRANSLATION_PROVIDER === "gemini"/, "startup logs Gemini's configured/model/preferred status");
+  assert.match(serverSource, /event: "TRANSLATION_PROVIDER_STATUS",\s*provider: "openai",\s*configured: Boolean\(env\.openaiApiKey\),/, "startup logs OpenAI's configured status");
+  assert.doesNotMatch(serverSource, /TRANSLATION_PROVIDER_STATUS[\s\S]{0,400}geminiApiKey(?!\)|,)/, "the startup diagnostic never prints the raw geminiApiKey value, only Boolean(...) of it");
+  assert.match(serverSource, /GEMINI_API_KEY is not configured in this environment/, "a missing GEMINI_API_KEY is clearly reported at startup instead of silently degrading");
 }
 
 // French + German (or any two targets) are dispatched through createPerLanguageDispatchQueue

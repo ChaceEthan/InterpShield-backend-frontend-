@@ -123,4 +123,48 @@ const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8
   );
 }
 
+// ROOT CAUSE #5 ("DONE + Waiting for speech..." with no visible text): the status-update loop
+// used to mark every language present as a RAW KEY in the incoming translations payload as
+// "translated" (Object.keys(nextTranslations)), regardless of whether that language's text
+// actually survived the separate isValidTranslationText() gate in the merge loop just above it
+// (e.g. rejected as a source-echo). A language's status could reach "translated" ("DONE" once
+// translationStateLabel() uppercases it) while mergedTranslations[language] — and therefore
+// finalTranslations/translatedTextWindow — was never actually set, so the card's text stayed
+// empty and fell through to the "Waiting for speech…" placeholder despite the status claiming
+// completion. The fix makes the status loop use the exact same criterion as the text-merge loop:
+// only mark a language translated once its text is genuinely present in mergedTranslations.
+{
+  assert.match(
+    appSource,
+    /for \(const language of Object\.keys\(nextTranslations\)\) \{\s*if \(!mergedTranslations\[language\]\) continue;\s*nextStatusUpdates\[language\] = "translated";/,
+    "the status-update loop gates on mergedTranslations[language] before marking a language translated"
+  );
+  assert.doesNotMatch(
+    appSource,
+    /for \(const language of Object\.keys\(nextTranslations\)\) \{\s*nextStatusUpdates\[language\] = "translated";/,
+    'the old ungated version (marking every raw key "translated" regardless of merge success) is gone'
+  );
+}
+
+// ROOT CAUSE #6 (a language stuck in RETRYING/Translating for up to 45s while new source speech
+// kept arriving): the desktop-continuous staleness watchdog existed and did eventually resolve a
+// stuck language to "failed", but its 45-second bound made "stuck" indistinguishable from
+// "broken" during actual live use. Reduced to a bound still generous enough for a genuine
+// Gemini-then-OpenAI fallback with the backend's own bounded per-provider retries.
+assert.match(appSource, /const STALE_TRANSLATION_STATE_MS = 18000;/, "the desktop translation-status staleness watchdog now resolves a stuck language far sooner than the old 45s bound, matching a live-interpreter UX instead of a background task");
+assert.match(
+  appSource,
+  /for \(const \[language, state\] of Object\.entries\(translationStatuses\)\) \{\s*if \(!\["queued", "translating", "processing", "retrying"\]\.includes\(state as string\)\) continue;\s*const updatedAt = translationStatusUpdatedAtRef\.current\[language\] \|\| 0;\s*if \(updatedAt && now - updatedAt > STALE_TRANSLATION_STATE_MS\) \{\s*staleUpdates\[language\] = "failed";/,
+  "the watchdog itself (checked every second) still exists and forces any language stuck past the bound into a real terminal \"failed\" state, never leaving it in queued/translating/processing/retrying indefinitely"
+);
+
+// Section 10/11: French and German (or any set of independently-selected targets) are each
+// processed via their own entry in nextTranslations/mergedTranslations/nextStatusUpdates, keyed
+// by language code — there is no shared "currentTargetLanguage" mutable slot that one target's
+// async response could clobber for another. A failure recorded for one language (via
+// failedLanguages or a per-language statusByLanguage entry) is scoped to that language's own key
+// and never clears or reassigns a different language's already-merged text.
+assert.doesNotMatch(appSource, /let currentTargetLanguage/, "no shared mutable currentTargetLanguage exists for translation dispatch/consumption");
+assert.match(appSource, /for \(const language of failedLanguages \|\| \[\]\) \{\s*if \(!mergedTranslations\[language\] && !nextTranslations\[language\]\) \{\s*nextStatusUpdates\[language\] = "failed";/, "a failed language is marked failed only under its own key, and only when it genuinely has no merged or incoming text of its own");
+
 console.log("Translation pipeline regression tests passed.");

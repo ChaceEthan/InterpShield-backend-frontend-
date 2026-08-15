@@ -297,7 +297,13 @@ const MAX_QUEUED_AUDIO_CHUNKS = 240;
 const MAX_PENDING_FINAL_TRANSCRIPTS = 16;
 const CLIENT_HEARTBEAT_MS = 25000;
 const AUTH_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const STALE_TRANSLATION_STATE_MS = 45000;
+// A translation card stuck in queued/processing/retrying is a live-interpreter UX failure, not
+// a background task — 45s let a language sit on "Translating..."/"Retrying" for nearly a minute
+// while the speaker kept talking, which is what "stuck retrying forever" looked like to a real
+// user even though it did technically resolve eventually. 18s is still generous enough for a
+// genuine Gemini-then-OpenAI fallback with the backend's own bounded per-provider retries, but
+// far closer to what a live captioning experience actually requires.
+const STALE_TRANSLATION_STATE_MS = 18000;
 const SOCKET_HEARTBEAT_STALE_MS = 75000;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "subscription", "history", "help", "settings", "admin-login", "admin"];
@@ -3168,7 +3174,15 @@ export default function App() {
         });
       }
 
+      // ROOT CAUSE of "DONE + Waiting for speech...": this used to iterate Object.keys(nextTranslations)
+      // directly — every language PRESENT in the raw incoming payload, regardless of whether its text
+      // actually passed isValidTranslationText() in the merge loop above (e.g. rejected as a
+      // source-echo). A language could be marked "translated" here while mergedTranslations[language]
+      // was never actually set, leaving the status/text permanently out of sync: the card's state said
+      // done, but there was no text to show, so it fell through to the "Waiting for speech…" fallback.
+      // Only mark a language translated if its text genuinely made it into mergedTranslations.
       for (const language of Object.keys(nextTranslations)) {
+        if (!mergedTranslations[language]) continue;
         nextStatusUpdates[language] = "translated";
         diagnosticUpdates[language] = "";
       }

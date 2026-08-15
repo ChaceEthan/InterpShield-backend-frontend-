@@ -46,6 +46,13 @@ const MAX_CONSECUTIVE_TRANSLATION_FAILURES = 3;
 const MAX_PROVIDER_RETRY_ATTEMPTS = 3;
 const PROVIDER_RETRY_DELAY_MS = 1000;
 const PROVIDER_RETRY_MAX_DELAY_MS = 4000;
+// Single source of truth for which provider is tried first whenever the caller does not (or
+// cannot) explicitly request one: Gemini is the paid, actively-billed provider; OpenAI is the
+// fallback used only when Gemini genuinely fails/is unavailable. Read from an env override if
+// operators ever need to flip this without a deploy, but default to Gemini.
+export const DEFAULT_TRANSLATION_PROVIDER = ["gemini", "openai"].includes(String(process.env.DEFAULT_TRANSLATION_PROVIDER || "").trim().toLowerCase())
+  ? String(process.env.DEFAULT_TRANSLATION_PROVIDER).trim().toLowerCase()
+  : "gemini";
 
 // Admin Dashboard Tracking (Simulated Persistent Store)
 const globalUsageStats = {
@@ -900,7 +907,7 @@ export const shouldDegradeProviderHealth = ({ result = null, error = null, sourc
 
 export const buildProviderExecutionOrder = ({ providerHealth = {}, env = {}, preferredProvider = "auto" } = {}) => {
   const now = Date.now();
-  const preferred = ["gemini", "openai"].includes(preferredProvider) ? preferredProvider : "gemini";
+  const preferred = ["gemini", "openai"].includes(preferredProvider) ? preferredProvider : DEFAULT_TRANSLATION_PROVIDER;
 
   return ["gemini", "openai"]
     .filter((name) => name === "gemini" ? Boolean(env.geminiApiKey) : Boolean(env.openaiApiKey))
@@ -1634,7 +1641,7 @@ export const createInterpreterSession = async ({
     refreshProviderCooldowns();
     const primaryChoice = ["gemini", "openai"].includes(preferredProvider)
       ? preferredProvider
-      : "gemini";
+      : DEFAULT_TRANSLATION_PROVIDER;
     const order = buildProviderExecutionOrder({
       providerHealth,
       env,
@@ -2110,6 +2117,13 @@ export const createInterpreterSession = async ({
           languageState.status = "translated";
         }
         noteProviderSuccess(result.provider);
+        logTranslationEvent("TRANSLATION_PROVIDER_SUCCESS", {
+          sessionId,
+          jobId,
+          utteranceId: jobId,
+          targetLanguage: language,
+          provider: result.provider
+        });
         noteTranslationSuccess(language, result.translatedText, languageTranslationContext);
         rememberCachedTranslation(translationCache, cacheKey, result.translatedText, {
           source: direction.source,
@@ -2196,6 +2210,7 @@ export const createInterpreterSession = async ({
         logTranslationEvent("TRANSLATION_PROVIDER_ATTEMPT", {
           sessionId,
           jobId,
+          utteranceId: jobId,
           targetLanguage: language,
           provider,
           attempt: attempt + 1
@@ -2241,10 +2256,12 @@ export const createInterpreterSession = async ({
       }, "warn");
       if (nextProviderInOrder) {
         logTranslationEvent("TRANSLATION_PROVIDER_FALLBACK", {
+          sessionId,
+          jobId,
+          utteranceId: jobId,
+          targetLanguage: language,
           from: provider,
           to: nextProviderInOrder,
-          jobId,
-          targetLanguage: language,
           reason: lastError?.errorCategory || lastError?.reason || lastError?.message || "provider_failed"
         }, "warn");
       }
@@ -2256,6 +2273,7 @@ export const createInterpreterSession = async ({
     logTranslationEvent("TRANSLATION_PROVIDER_FINAL_FAILURE", {
       sessionId,
       jobId,
+      utteranceId: jobId,
       targetLanguage: language,
       providersAttempted: providerOrder,
       reason: lastError?.errorCategory || lastError?.reason || lastError?.message || "unknown"

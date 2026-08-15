@@ -9,7 +9,7 @@ import { createAuthRouter } from "./routes/auth.js";
 import { createAdminRouter } from "./routes/admin.js";
 import { createUserRouter } from "./routes/user.js";
 import { getGeminiHealth } from "./services/gemini.js";
-import { getInterpreterSessionHistory } from "./services/interpreter.js";
+import { DEFAULT_TRANSLATION_PROVIDER, getInterpreterSessionHistory } from "./services/interpreter.js";
 import { getOpenAIHealth } from "./services/openai.js";
 import { runStartupAdminBootstrap } from "./services/adminBootstrap.js";
 import { runSubscriptionExpirationCheck } from "./services/subscriptionJobs.js";
@@ -198,8 +198,39 @@ const connectDatabaseSafely = async () => {
   }
 };
 
+const logTranslationProviderStatus = () => {
+  // Startup-safe diagnostics: never logs the key itself, only whether one is present. A Google
+  // Gemini subscription and Gemini API billing are not the same thing — this only reports what
+  // GEMINI_API_KEY/OPENAI_API_KEY presence looks like at boot; whether the key actually has
+  // working API billing/quota can only be known once a real request succeeds or fails (see the
+  // per-request [TRANSLATION_PROVIDER_ATTEMPT]/[TRANSLATION_PROVIDER_SUCCESS]/
+  // [TRANSLATION_PROVIDER_FALLBACK]/[TRANSLATION_PROVIDER_FINAL_FAILURE] events).
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    severity: "INFO",
+    event: "TRANSLATION_PROVIDER_STATUS",
+    provider: "gemini",
+    configured: Boolean(env.geminiApiKey),
+    model: env.geminiModel,
+    preferred: DEFAULT_TRANSLATION_PROVIDER === "gemini"
+  }));
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    severity: "INFO",
+    event: "TRANSLATION_PROVIDER_STATUS",
+    provider: "openai",
+    configured: Boolean(env.openaiApiKey),
+    model: null,
+    preferred: DEFAULT_TRANSLATION_PROVIDER === "openai"
+  }));
+  if (!env.geminiApiKey) {
+    console.warn("GEMINI_API_KEY is not configured in this environment. Translation is unavailable until it is set — see config/env.js.");
+  }
+};
+
 const startServer = async () => {
   try {
+    logTranslationProviderStatus();
     await connectDatabaseSafely();
     await runStartupAdminBootstrap({ config: env });
     await runSubscriptionExpirationCheck().catch((error) => console.warn("Subscription check unavailable:", error?.message || error));
