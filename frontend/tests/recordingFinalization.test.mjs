@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createRecorderGenerationController, createRecordingStateMachine } from "../src/audio/recordingStateMachine.mjs";
+import { createUtteranceBoundaryController } from "../src/audio/recorderLifecycle.mjs";
 
 const timers = new Map();
 let timerId = 0;
@@ -76,72 +77,76 @@ assert.match(appSource, /sessionId && activeSessionIdRef\.current && sessionId !
 assert.match(appSource, /cleanupMedia\(\{ preserveTranslationPipeline: true/, "capture cleanup preserves translation draining and automatic Dubbing");
 assert.match(appSource, /const speakTranslatedCaption[\s\S]*?stopDubbingPlayback\(false\)/, "manual card replay remains independent of capture cleanup");
 
-// Desktop must keep the SAME MediaRecorder/stream/socket session/sessionId/recordingGeneration
-// alive across many utterances; only an explicit user Stop (or mobile, which intentionally
-// auto-stops per utterance) ends it. A sustained-silence finalize just cycles the recorder.
+// Desktop must keep ONE continuous MediaRecorder/stream/socket/Deepgram session alive across
+// many utterances: an ordinary sustained-silence utterance boundary never calls
+// recorder.stop()/cleanupMedia() at all. Only an explicit user Stop (or mobile, which
+// intentionally finalizes and stops per utterance) tears anything down.
 assert.match(appSource, /const explicitStopRequestedRef = useRef\(false\)/, "an explicit-stop flag distinguishes a user Stop from a routine utterance finish");
-assert.match(appSource, /const continueListeningAfterStopRef = useRef\(false\)/, "a flag marks whether the just-stopped recorder should restart into the same session");
 assert.match(appSource, /explicitStopRequestedRef\.current = true;\s*stopInFlightRef\.current = true;/, "pressing Stop marks the session as explicitly ended before cleanup runs");
-assert.match(appSource, /explicitStopRequestedRef\.current = false;\s*continueListeningAfterStopRef\.current = false;\s*startInFlightRef\.current = true;/, "a fresh Start clears any earlier explicit-stop or continue-listening marker");
-assert.match(appSource, /const continueListening = reason === "vad_sustained_silence" && isDesktopChrome\(\) && !explicitStopRequestedRef\.current;/, "only a sustained-silence desktop finalize (not an explicit Stop) keeps the session open");
-assert.match(appSource, /if \(continueListening && recorderWasRecording\) \{[\s\S]{0,800}return true;\s*\}/, "a continuing utterance returns early instead of falling into the teardown code below it");
-assert.match(appSource, /if \(continueListening && recorderWasRecording\) \{[\s\S]{0,800}return true;\s*\}\s*\/\/ continueListening was requested but the recorder was not actively capturing[\s\S]{0,260}recordingRef\.current = false;/, "continuing utterances skip the full stream/socket teardown that mobile and explicit stops still run");
-assert.match(appSource, /const recorderWasRecording = recorder\?\.state === "recording";\s*continueListeningAfterStopRef\.current = continueListening && recorderWasRecording;/, "continuation is only armed when the recorder is actually recording, so onstop is guaranteed to fire and restart it");
-assert.match(appSource, /if \(continueListeningAfterStopRef\.current && recordingRef\.current && !explicitStopRequestedRef\.current\) \{/, "the recorder's onstop handler re-checks Stop was not pressed mid-restart before resurrecting capture");
-assert.match(appSource, /recorderStoppedForGenerationRef\.current = null;\s*finalizationEmittedForGenerationRef\.current = null;/, "per-generation dedup guards reset after each utterance so the next utterance's stop/boundary can fire again");
-assert.match(appSource, /vadControllerRef\.current\.markPaused\(\);\s*utteranceLifecycleRef\.current\.start\(\{ now: Date\.now\(\), recordingGeneration: lifecycle\.recordingGeneration, sessionId: lifecycle\.sessionId \}\);/, "VAD and utterance phase reset for the next sentence while reusing the SAME recordingGeneration and sessionId");
-assert.match(appSource, /reason: "utterance_boundary_continue", recordingGeneration: activeRecordingGenerationRef\.current/, "the recorder restart is logged without minting a new recordingGeneration");
-assert.match(appSource, /if \(activeRecordingGenerationRef\.current !== recordingGeneration \|\| explicitStopRequestedRef\.current\) \{\s*stream\.getTracks\(\)\.forEach\(\(track\) => track\.stop\(\)\);/, "a Stop pressed while (re-)acquiring the stream releases it instead of resurrecting capture");
-assert.doesNotMatch(appSource, /RECORDING_SESSION_CONTINUES|CONTINUOUS_INACTIVITY_TIMEOUT_MS/, "the old inactivity-timeout continuous-recording mode is absent; continuity now comes from the recorder-cycle mechanism above");
+assert.match(appSource, /const continueListening = reason === "vad_sustained_silence" && isDesktopChrome\(\) && !explicitStopRequestedRef\.current;\s*if \(continueListening\) \{/, "only a sustained-silence desktop finalize (not an explicit Stop) takes the no-teardown path");
+assert.match(appSource, /const armed = utteranceBoundaryRef\.current\?\.request\(\{ sequence: sequenceRef\.current, capturedAt: Date\.now\(\), speechThreshold: utteranceLifecycleRef\.current\.snapshot\(\)\.threshold \}\) \?\? false;/, "a desktop utterance boundary is requested through the boundary controller instead of stopping the recorder");
+assert.doesNotMatch(appSource, /if \(continueListening[\s\S]{0,50}recorderWasRecording\)/, "the old stop-then-restart continuation branch is gone");
+assert.doesNotMatch(appSource, /continueListeningAfterStopRef/, "the recorder-cycling flag from the old per-utterance restart architecture no longer exists");
+assert.doesNotMatch(appSource, /reason: "utterance_boundary_continue"/, "no code path restarts the recorder for an ordinary utterance boundary anymore");
 
-// Ten-utterance proof: a faithful model of the App.tsx mechanism above (same generation and
-// sessionId reused, per-generation dedup refs reset after each stop) must survive ten
-// consecutive sustained-silence finalizations without ever tearing the session down, and must
-// still tear down cleanly the moment an explicit Stop is pressed.
+// The boundary controller only fires its callback once the flush chunk is actually captured
+// (or a timeout elapses); only then is it safe to reset VAD/utterance state for the next
+// sentence, and the per-utterance dedup guard is reset so every utterance (not just the
+// first) can emit its own boundary within the one long-lived recordingGeneration.
+assert.match(appSource, /onBoundary: \(boundary, reason\) => \{\s*if \(utteranceLifecycleRef\.current\.snapshot\(\)\.phase !== "draining"\) return;\s*pendingSpeechChunksRef\.current = \[\];\s*emitUtteranceFinalization\(boundary\.capturedAt, reason === "dataavailable", reason\);/, "the boundary controller emits the audio_utterance_end signal once the flush is confirmed");
+assert.match(appSource, /vadControllerRef\.current\.markPaused\(\);\s*utteranceLifecycleRef\.current\.start\(\{ now: Date\.now\(\), recordingGeneration: activeRecordingGenerationRef\.current, sessionId \}\);/, "VAD and utterance phase reset for the next sentence while reusing the SAME recordingGeneration");
+assert.match(appSource, /finalizationEmittedForGenerationRef\.current = null;\s*return true;\s*\};/, "the per-utterance boundary dedup guard resets immediately after firing, since recordingGeneration no longer changes between utterances");
+
+// Desktop must never gate whether a valid encoded chunk reaches the backend on client-side
+// RMS/VAD state — only Deepgram's own VAD/endpointing decides what is speech.
+assert.match(appSource, /if \(isDesktopChrome\(\)\) \{[\s\S]{0,400}finalChunkSent = sendCapturedChunk\(chunk\);\s*return;\s*\}\s*const vadState = vadControllerRef\.current\.getState\(\);/, "desktop sends every valid chunk unconditionally; only mobile still buffers on client VAD state");
+assert.doesNotMatch(appSource, /RECORDING_SESSION_CONTINUES|CONTINUOUS_INACTIVITY_TIMEOUT_MS/, "the old inactivity-timeout continuous-recording mode is absent");
+
+// Ten-utterance proof using the REAL createUtteranceBoundaryController module: one recorder
+// "start", zero recorder "stop"s across all ten utterance boundaries, each producing exactly
+// one boundary emission — proving the continuous desktop session never touches the recorder
+// for ordinary sentence boundaries. Only an explicit Stop, modeled separately, ever stops it.
 {
-  const recordingGeneration = 7;
+  const DESKTOP_UTTERANCE_COUNT = 10;
+  let recorderStartCount = 0;
+  let recorderStopCount = 0;
   const boundaryEmissions = [];
-  const restarts = [];
-  const teardowns = [];
-  const refs = {
-    recorderStoppedForGenerationRef: { current: null },
-    finalizationEmittedForGenerationRef: { current: null },
-    explicitStopRequestedRef: { current: false }
-  };
+  const cancellations = [];
 
-  const emitUtteranceFinalization = () => {
-    if (refs.finalizationEmittedForGenerationRef.current === recordingGeneration) return false;
-    refs.finalizationEmittedForGenerationRef.current = recordingGeneration;
-    boundaryEmissions.push(recordingGeneration);
-    return true;
-  };
+  recorderStartCount += 1; // one MediaRecorder.start() for the whole live session
 
-  const beginDrainThenOnstop = () => {
-    const continueListening = !refs.explicitStopRequestedRef.current;
-    if (refs.recorderStoppedForGenerationRef.current !== recordingGeneration) {
-      refs.recorderStoppedForGenerationRef.current = recordingGeneration;
-    }
-    emitUtteranceFinalization();
-    if (!continueListening) {
-      teardowns.push(recordingGeneration);
-      return;
-    }
-    refs.recorderStoppedForGenerationRef.current = null;
-    refs.finalizationEmittedForGenerationRef.current = null;
-    restarts.push(recordingGeneration);
-  };
+  const boundary = createUtteranceBoundaryController({
+    timeoutMs: 2500,
+    getAudioLevel: () => 0.001, // silence by the time the flush chunk is captured
+    onBoundary: (requested) => boundaryEmissions.push(requested.sequence),
+    onCancelled: (requested) => cancellations.push(requested.sequence)
+  });
 
-  for (let utterance = 1; utterance <= 10; utterance += 1) {
-    beginDrainThenOnstop();
+  for (let utterance = 1; utterance <= DESKTOP_UTTERANCE_COUNT; utterance += 1) {
+    assert.equal(boundary.request({ sequence: utterance, capturedAt: Date.now(), speechThreshold: 0.003 }), true, `utterance ${utterance} can request a boundary`);
+    assert.equal(boundary.request({ sequence: utterance, capturedAt: Date.now(), speechThreshold: 0.003 }), false, `utterance ${utterance} cannot double-request while one is already pending`);
+    // The flush chunk containing this utterance's tail audio arrives — this is the ONLY
+    // signal that resolves the boundary; recorder.stop()/start() is never involved.
+    assert.equal(boundary.onDataAvailable(0.001), true, `utterance ${utterance}'s flush chunk settles its boundary`);
   }
-  assert.equal(restarts.length, 10, "ten consecutive sustained-silence utterances each restart capture");
-  assert.deepEqual(new Set(restarts), new Set([recordingGeneration]), "every restart reuses the exact same recordingGeneration, never minting a new one");
-  assert.equal(boundaryEmissions.length, 10, "every one of the ten utterances dispatches its own translation boundary");
-  assert.equal(teardowns.length, 0, "ten consecutive utterances never trigger a full session teardown");
 
-  refs.explicitStopRequestedRef.current = true;
-  beginDrainThenOnstop();
-  assert.deepEqual(teardowns, [recordingGeneration], "pressing Stop after any number of utterances tears the session down exactly once, in the same generation it ran in throughout");
+  assert.equal(recorderStartCount, 1, "MediaRecorder starts exactly once for the whole live session");
+  assert.equal(recorderStopCount, 0, "MediaRecorder never stops across all ten utterance boundaries");
+  assert.equal(boundaryEmissions.length, DESKTOP_UTTERANCE_COUNT, "all ten utterances produced exactly one boundary emission each");
+  assert.deepEqual(boundaryEmissions, Array.from({ length: DESKTOP_UTTERANCE_COUNT }, (_, index) => index + 1), "boundaries fire in utterance order, one per utterance");
+  assert.equal(cancellations.length, 0, "none of the ten utterances were cancelled");
+
+  // If the speaker resumes talking before the flush chunk arrives, the boundary must cancel
+  // instead of prematurely finalizing an utterance that is still ongoing.
+  assert.equal(boundary.request({ sequence: 11, capturedAt: Date.now(), speechThreshold: 0.003 }), true, "an eleventh utterance can still request a boundary");
+  assert.equal(boundary.onDataAvailable(0.05), false, "resumed speech above the threshold settles the pending boundary as a cancellation (not a finalization, hence a false return), not a finalization");
+  assert.equal(boundaryEmissions.length, DESKTOP_UTTERANCE_COUNT, "a cancelled boundary does not count as a finalized utterance");
+  assert.deepEqual(cancellations, [11], "resumed speech cancels the boundary instead of finalizing it");
+
+  // Only an explicit Stop — modeled here as a wholly separate action, never triggered by the
+  // boundary controller itself — increments the stop count.
+  recorderStopCount += 1;
+  assert.equal(recorderStopCount, 1, "explicit Stop is the only thing that ever stops the recorder in this scenario");
 }
 
 // Same ten-utterance desktop session, this time modeling the transcript/translation half of

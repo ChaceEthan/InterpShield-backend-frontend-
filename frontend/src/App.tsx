@@ -283,7 +283,6 @@ const MAX_CONTAINER_HEADER_RETRIES = 3;
 const VAD_POLL_INTERVAL_MS = 30;
 const FINAL_CHUNK_ACK_TIMEOUT_MS = 2500;
 const RECORDING_DRAIN_TIMEOUT_MS = 8000;
-const UTTERANCE_RECOVERY_TIMEOUT_MS = 8000;
 const MAX_SOCKET_RECONNECT_ATTEMPTS = 8;
 const CAPTION_WATCHDOG_MS = 12000;
 const isDesktopChrome = () => typeof navigator !== "undefined" && /Chrome\//i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent);
@@ -1549,12 +1548,10 @@ export default function App() {
   const audioRestartAttemptsRef = useRef(0);
   const silenceTimerRef = useRef<number | null>(null);
   const drainTimeoutRef = useRef<number | null>(null);
-  const utteranceRecoveryTimeoutRef = useRef<number | null>(null);
   const awaitingFinalTranscriptRef = useRef(false);
   const drainPendingLanguagesRef = useRef<Set<string>>(new Set());
   const finishDrainRef = useRef<(reason: "processed" | "timeout") => void>(() => undefined);
   const explicitStopRequestedRef = useRef(false);
-  const continueListeningAfterStopRef = useRef(false);
   const lastServerHeartbeatAtRef = useRef(0);
   const sessionStartedAtRef = useRef<number | null>(null);
   const lastInterimRef = useRef("");
@@ -2211,8 +2208,6 @@ export default function App() {
     utteranceBoundaryRef.current = null;
     if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
     captionWatchdogTimerRef.current = null;
-    if (utteranceRecoveryTimeoutRef.current) window.clearTimeout(utteranceRecoveryTimeoutRef.current);
-    utteranceRecoveryTimeoutRef.current = null;
     vadControllerRef.current.stop();
     pendingSpeechChunksRef.current = [];
     getAudioLevelRef.current = () => 0;
@@ -2310,42 +2305,53 @@ export default function App() {
   // on finishDrain's teardown-based timeout to recover from an utterance whose final
   // transcript never arrives (e.g. Deepgram genuinely found no speech to transcribe). Without
   // this, awaitingFinalTranscriptRef would stay stuck forever, permanently blocking every
-  // later utterance's beginDrain call and leaving the card frozen on a non-"ready" status.
-  const recoverStuckUtterance = useCallback((generation: number) => {
-    utteranceRecoveryTimeoutRef.current = null;
-    if (activeRecordingGenerationRef.current !== generation || !awaitingFinalTranscriptRef.current) return;
-    console.warn("[UTTERANCE_RECOVERY_TIMEOUT]", { recordingGeneration: generation, message: "No final transcript arrived for this utterance; resuming listening without blocking later utterances." });
-    awaitingFinalTranscriptRef.current = false;
-    setAwaitingFinalTranscript(false);
-    drainPendingLanguagesRef.current.clear();
-    setTranslationsPending([]);
-    const readyStatuses = Object.fromEntries(targetLanguagesRef.current.map((language) => [language, "ready" as TranslationLifecycleState]));
-    setTranslationStatuses(readyStatuses);
-    setTranslationDiagnostics({});
-    setStatus("listening");
-    setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
-  }, []);
-
   const beginDrain = useCallback((reason = "vad_sustained_silence", generation = activeRecordingGenerationRef.current) => {
-    if (!recordingRef.current || awaitingFinalTranscriptRef.current) return false;
+    if (!recordingRef.current) return false;
     if (generation !== activeRecordingGenerationRef.current) return false;
+
+    // Desktop live mode keeps ONE continuous MediaRecorder/stream/socket/Deepgram session for
+    // the whole live session: an ordinary sustained-silence utterance boundary never stops the
+    // recorder. It only requests the current buffer be flushed and arms utteranceBoundaryRef
+    // to emit the audio_utterance_end boundary once that flush is confirmed captured (see the
+    // onBoundary wiring below, which also resets VAD/utterance-lifecycle state for the next
+    // sentence). Only an explicit user Stop reaches the full-teardown path further below.
+    const continueListening = reason === "vad_sustained_silence" && isDesktopChrome() && !explicitStopRequestedRef.current;
+    if (continueListening) {
+      const transition = utteranceLifecycleRef.current.requestFinalization(reason, generation);
+      if (!transition.accepted) return false;
+      const recorder = mediaRecorderRef.current;
+      console.info("[UTTERANCE_FINALIZATION]", { reason: transition.reason, recordingGeneration: generation, phaseBefore: transition.phaseBefore, phaseAfter: transition.phaseAfter, recorderState: recorder?.state, continuousDesktopSession: true });
+      if (recorder?.state === "recording") {
+        try { recorder.requestData(); } catch { /* MediaRecorder may already be mid-flush. */ }
+        const armed = utteranceBoundaryRef.current?.request({ sequence: sequenceRef.current, capturedAt: Date.now(), speechThreshold: utteranceLifecycleRef.current.snapshot().threshold }) ?? false;
+        if (!armed) {
+          // A boundary was already pending (should not happen given requestFinalization's own
+          // phase guard, but stay safe): fall back to resetting for the next utterance directly.
+          const sessionId = utteranceLifecycleRef.current.snapshot().sessionId;
+          vadControllerRef.current.markPaused();
+          utteranceLifecycleRef.current.start({ now: Date.now(), recordingGeneration: generation, sessionId });
+          setStatus("listening");
+          setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
+        }
+      }
+      return true;
+    }
+
+    // Mobile (and any desktop path outside ordinary sustained-silence, e.g. an explicit Stop
+    // already in progress) fully finalizes this utterance: stop capture, wait for the
+    // transcript/translation to resolve, then return to idle.
+    if (awaitingFinalTranscriptRef.current) return false;
     const transition = utteranceLifecycleRef.current.requestFinalization(reason, generation);
     if (!transition.accepted) return false;
-    // Desktop live mode keeps the same MediaRecorder/stream/socket session alive across
-    // utterances: only a sustained-silence auto-finalization (not an explicit Stop) resets
-    // to listen for the next sentence instead of tearing the session down.
-    const continueListening = reason === "vad_sustained_silence" && isDesktopChrome() && !explicitStopRequestedRef.current;
     awaitingFinalTranscriptRef.current = true;
     setAwaitingFinalTranscript(true);
     drainPendingLanguagesRef.current.clear();
     setTranslationsPending([]);
-    setStatus(continueListening ? "translating" : "draining");
-    setAudioDiagnostic((current) => ({ ...current, state: "ready", message: continueListening ? "Finishing translation" : "Finishing recording" }));
+    setStatus("draining");
+    setAudioDiagnostic((current) => ({ ...current, state: "ready", message: "Finishing recording" }));
     const recorder = mediaRecorderRef.current;
-    console.info("[UTTERANCE_FINALIZATION]", { reason: transition.reason, recordingGeneration: generation, phaseBefore: transition.phaseBefore, phaseAfter: transition.phaseAfter, recorderState: recorder?.state, transcriptPending: true, translationsPending: drainPendingLanguagesRef.current.size, continueListening });
-    const recorderWasRecording = recorder?.state === "recording";
-    continueListeningAfterStopRef.current = continueListening && recorderWasRecording;
-    if (recorderWasRecording) {
+    console.info("[UTTERANCE_FINALIZATION]", { reason: transition.reason, recordingGeneration: generation, phaseBefore: transition.phaseBefore, phaseAfter: transition.phaseAfter, recorderState: recorder?.state, transcriptPending: true, translationsPending: drainPendingLanguagesRef.current.size });
+    if (recorder?.state === "recording") {
       try { recorder.requestData(); } catch { /* MediaRecorder may already be stopping. */ }
       if (recorderStoppedForGenerationRef.current !== activeRecordingGenerationRef.current) {
         recorderStoppedForGenerationRef.current = activeRecordingGenerationRef.current;
@@ -2353,18 +2359,6 @@ export default function App() {
         recorder.stop();
       }
     }
-    if (continueListening && recorderWasRecording) {
-      // The recorder's onstop handler restarts capture into the same generation/session
-      // once the just-finished utterance's final chunk is flushed; nothing else to tear down.
-      // A bounded safety timeout still recovers this specific utterance's pending state if
-      // Deepgram never produces a final transcript for it (see recoverStuckUtterance above).
-      if (utteranceRecoveryTimeoutRef.current) window.clearTimeout(utteranceRecoveryTimeoutRef.current);
-      utteranceRecoveryTimeoutRef.current = window.setTimeout(() => recoverStuckUtterance(generation), UTTERANCE_RECOVERY_TIMEOUT_MS);
-      return true;
-    }
-    // continueListening was requested but the recorder was not actively capturing, so onstop
-    // will never fire to restart it — fall through to a full, safe teardown instead of
-    // leaving the session stuck mid-utterance.
     recordingRef.current = false;
     setMicrophoneActive(false);
     setMediaRecorderActive(false);
@@ -2379,7 +2373,7 @@ export default function App() {
     vadControllerRef.current.stop();
     drainTimeoutRef.current = window.setTimeout(() => finishDrain("timeout"), RECORDING_DRAIN_TIMEOUT_MS);
     return true;
-  }, [finishDrain, recoverStuckUtterance]);
+  }, [finishDrain]);
 
   const scheduleAudioRecovery = useCallback((reason: string) => {
     const phase = utteranceLifecycleRef.current.snapshot().phase;
@@ -2814,10 +2808,6 @@ export default function App() {
       console.info("[DESKTOP_PIPELINE_SPEECH_FINAL]", { sessionId, jobId, sequence, chars: originalText.length });
       const transcriptEventKey = `${sessionId || "session"}:${jobId ?? "job"}:${sequence ?? "sequence"}`;
       if (!originalText || transcriptEventKey === lastFinalTranscriptEventKeyRef.current) return;
-      if (utteranceRecoveryTimeoutRef.current) {
-        window.clearTimeout(utteranceRecoveryTimeoutRef.current);
-        utteranceRecoveryTimeoutRef.current = null;
-      }
       if (detectedLanguage) setDetectedLanguage(detectedLanguage);
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
       trackLatency(latencyMs, provider);
@@ -3375,7 +3365,6 @@ export default function App() {
     const recordingGeneration = activeRecordingGenerationRef.current + 1;
     activeRecordingGenerationRef.current = recordingGeneration;
     explicitStopRequestedRef.current = false;
-    continueListeningAfterStopRef.current = false;
     startInFlightRef.current = true;
     stopInFlightRef.current = false;
     recorderStartedForGenerationRef.current = null;
@@ -3587,7 +3576,7 @@ export default function App() {
           const isCurrentStream = streamRef.current === stream;
           const recordingExpected = recordingRef.current;
           const intentionalStopInProgress = explicitStopRequestedRef.current || stopInFlightRef.current;
-          const recorderTransitionInProgress = continueListeningAfterStopRef.current || recorderGenerationRestartRef.current;
+          const recorderTransitionInProgress = recorderGenerationRestartRef.current;
           const expected = isTrackEndExpected({
             isCurrentGeneration,
             isCurrentStream,
@@ -3637,6 +3626,10 @@ export default function App() {
         finalizationEmittedForGenerationRef.current = activeRecordingGenerationRef.current;
         socketRef.current?.emit("audio_utterance_end", { sequence: sequenceRef.current, capturedAt, finalChunk });
         logFrontendDebug("audio", "UTTERANCE_BOUNDARY_EMITTED", { sequence: sequenceRef.current, reason });
+        // Desktop's recordingGeneration stays constant across many utterances in one live
+        // session, so this per-generation dedup guard is reset immediately after firing —
+        // otherwise only the FIRST utterance in the whole session could ever emit a boundary.
+        finalizationEmittedForGenerationRef.current = null;
         return true;
       };
 
@@ -3653,6 +3646,15 @@ export default function App() {
           if (utteranceLifecycleRef.current.snapshot().phase !== "draining") return;
           pendingSpeechChunksRef.current = [];
           emitUtteranceFinalization(boundary.capturedAt, reason === "dataavailable", reason);
+          // The flush chunk containing this utterance's tail audio is now confirmed captured
+          // and sent (or the timeout fallback fired): only now is it safe to reset VAD/
+          // utterance-lifecycle state for the next sentence — resetting any earlier would let
+          // the flush chunk itself get buffered as "next utterance" audio instead of sent.
+          const sessionId = utteranceLifecycleRef.current.snapshot().sessionId;
+          vadControllerRef.current.markPaused();
+          utteranceLifecycleRef.current.start({ now: Date.now(), recordingGeneration: activeRecordingGenerationRef.current, sessionId });
+          setStatus("listening");
+          setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
         }
       });
 
@@ -3678,6 +3680,13 @@ export default function App() {
                 meaningfulSpeechDetected: speechSnapshot.meaningfulSpeechDetected,
                 bytes: event.data.size
               });
+              console.info("[DESKTOP_RECORDER_STATE]", {
+                recorderState: recorder.state,
+                recordingGeneration: activeRecordingGenerationRef.current,
+                streamGeneration: audioStreamGenerationRef.current,
+                sequence: sequenceRef.current,
+                sessionId: activeSessionIdRef.current || clientSessionIdRef.current
+              });
             }
           }
           const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
@@ -3688,14 +3697,18 @@ export default function App() {
             signature = containerSignature(await event.data.slice(0, 16).arrayBuffer());
             if (!signature.valid) {
               console.error("[AUDIO_CONTAINER_HEADER_INVALID]", { mimeType: recorderMimeType, streamGeneration: audioStreamGenerationRef.current, signature: signature.hex, retryCount: containerHeaderRetryCountRef.current });
-              // A missing/invalid header right after a desktop continue-listening restart is a
-              // transient MediaRecorder timing hiccup, not proof the whole capture pipeline is
-              // broken: retry the in-place restart a bounded number of times before treating it
-              // as a real failure that needs the full session torn down.
+              // A missing/invalid header (e.g. right after a Deepgram-triggered stream reset)
+              // is a transient MediaRecorder timing hiccup, not proof the whole capture
+              // pipeline is broken: retry an in-place restart, reusing the same tested
+              // generation/header recovery path as a genuine Deepgram reconnect, a bounded
+              // number of times before treating it as a real failure needing full teardown.
               if (isDesktopChrome() && containerHeaderRetryCountRef.current < MAX_CONTAINER_HEADER_RETRIES && recordingRef.current && !explicitStopRequestedRef.current) {
                 containerHeaderRetryCountRef.current += 1;
                 console.warn("[AUDIO_CONTAINER_HEADER_RETRY]", { attempt: containerHeaderRetryCountRef.current, maxAttempts: MAX_CONTAINER_HEADER_RETRIES, streamGeneration: audioStreamGenerationRef.current });
-                continueListeningAfterStopRef.current = true;
+                pendingAudioStreamGenerationRef.current = audioStreamGenerationRef.current + 1;
+                queuedAudioChunksRef.current = [];
+                pendingSpeechChunksRef.current = [];
+                recorderGenerationRestartRef.current = true;
                 if (recorder.state === "recording" && recorderStoppedForGenerationRef.current !== activeRecordingGenerationRef.current) {
                   recorderStoppedForGenerationRef.current = activeRecordingGenerationRef.current;
                   recorderStopReasonRef.current = "container_header_retry";
@@ -3727,6 +3740,14 @@ export default function App() {
           }
           if (dubbingTransmissionGatedRef.current) return;
           if (utteranceLifecycleRef.current.snapshot().phase === "draining") {
+            finalChunkSent = sendCapturedChunk(chunk);
+            return;
+          }
+          if (isDesktopChrome()) {
+            // Desktop trusts Deepgram's own VAD/endpointing (vad_events, endpointing,
+            // utterance_end_ms) to decide what is speech. Client-side RMS/VAD is diagnostic
+            // and UI-only here — it must never gate whether a valid, already-encoded chunk is
+            // delivered, even at genuinely low microphone RMS (e.g. audioLevel ~0.0054).
             finalChunkSent = sendCapturedChunk(chunk);
             return;
           }
@@ -3775,26 +3796,6 @@ export default function App() {
           setMediaRecorderActive(true);
           return;
         }
-        if (continueListeningAfterStopRef.current && recordingRef.current && !explicitStopRequestedRef.current) {
-          continueListeningAfterStopRef.current = false;
-          audioStreamGenerationRef.current += 1;
-          sequenceRef.current = 0;
-          pendingSpeechChunksRef.current = [];
-          awaitingContainerHeaderRef.current = true;
-          recorderStoppedForGenerationRef.current = null;
-          finalizationEmittedForGenerationRef.current = null;
-          vadControllerRef.current.markPaused();
-          utteranceLifecycleRef.current.start({ now: Date.now(), recordingGeneration: lifecycle.recordingGeneration, sessionId: lifecycle.sessionId });
-          const previousState = recorder.state;
-          recorder.start(audioChunkMsRef.current);
-          console.info("[MEDIARECORDER_START]", { reason: "utterance_boundary_continue", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, previousState, mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
-          setMediaRecorderActive(true);
-          setMicrophoneActive(true);
-          setStatus("listening");
-          setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
-          return;
-        }
-        continueListeningAfterStopRef.current = false;
         stopInFlightRef.current = false;
         // recorderStoppedForGenerationRef is set by our own code immediately before every
         // intentional recorder.stop() call (beginDrain, cleanupMedia). If it doesn't match
