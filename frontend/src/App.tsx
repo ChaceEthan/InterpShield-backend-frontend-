@@ -1552,6 +1552,11 @@ export default function App() {
   const pendingAudioStreamGenerationRef = useRef(1);
   const awaitingContainerHeaderRef = useRef(true);
   const containerHeaderRetryCountRef = useRef(0);
+  // A single failed header probe is never, by itself, proof the container is genuinely corrupt
+  // (see the awaitingContainerHeaderRef exemptions above) — it just skips that one chunk and
+  // waits for the next. Only a SECOND consecutive failure for the same generation escalates to
+  // the existing stop/restart recovery path below.
+  const containerHeaderProbeFailuresRef = useRef(0);
   const recorderGenerationRestartRef = useRef(false);
   const lastAudioChunkSentAtRef = useRef(0);
   const queuedAudioChunksRef = useRef<AudioChunkPayload[]>([]);
@@ -2709,6 +2714,7 @@ export default function App() {
       } else if (recorder?.state === "inactive") {
         audioStreamGenerationRef.current = nextGeneration;
         awaitingContainerHeaderRef.current = true;
+        containerHeaderProbeFailuresRef.current = 0;
         recorderGenerationRestartRef.current = false;
         const previousState = recorder.state;
         console.info("[MEDIARECORDER_START_REQUEST]", { reason: "deepgram_generation_change", recordingGeneration: activeRecordingGenerationRef.current, previousState });
@@ -3637,6 +3643,7 @@ export default function App() {
     recorderStoppedForGenerationRef.current = null;
     finalizationEmittedForGenerationRef.current = null;
     containerHeaderRetryCountRef.current = 0;
+    containerHeaderProbeFailuresRef.current = 0;
     activeSessionIdRef.current = "";
     lastVadSilenceDurationRef.current = 0;
     utteranceLifecycleRef.current.start({ now: Date.now(), recordingGeneration, sessionId: clientSessionIdRef.current });
@@ -3942,7 +3949,16 @@ export default function App() {
         const audioLevel = enhancedAudio.getAudioLevel();
         let finalChunkSent = false;
         try {
-          if (event.data.size < MIN_MEDIA_CHUNK_BYTES) return;
+          // While still awaiting this generation's container header, a chunk must never be
+          // dropped by the small-chunk filter below: MediaRecorder's WebM muxer can legitimately
+          // flush the EBML header alone as its own small (sometimes just a few bytes) blob before
+          // any audio cluster exists yet. Dropping that chunk here left awaitingContainerHeaderRef
+          // still true for the NEXT (larger, but no longer byte-0-of-file) chunk, which then
+          // failed the signature check for a completely different reason: it genuinely was not
+          // the start of the file anymore (see containerSignature below) — this, not a real
+          // corrupt/invalid stream, is what was triggering AUDIO_CONTAINER_HEADER_INVALID /
+          // AUDIO_CONTAINER_HEADER_RETRY on otherwise perfectly valid desktop capture.
+          if (!awaitingContainerHeaderRef.current && event.data.size < MIN_MEDIA_CHUNK_BYTES) return;
           if (isDesktopChrome()) {
             const speechSnapshot = utteranceLifecycleRef.current.observeAudio({ audioLevel, noiseFloor: vadControllerRef.current.getNoiseFloor(), bytes: event.data.size, containerAudio: /audio\/(webm|ogg)/i.test(recorderMimeType), now: capturedAt });
             if (speechSnapshot.speechLikeSample && speechSnapshot.meaningfulSpeechDetected) {
@@ -3968,13 +3984,28 @@ export default function App() {
             }
           }
           const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
-          if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.002) return;
+          // Same reasoning as the size filter above: a fast recorder restart (including the
+          // container-header retry path itself) can leave lastAudioChunkSentAtRef close enough
+          // in time that this throttle would otherwise swallow the new generation's true first,
+          // header-bearing chunk.
+          if (!awaitingContainerHeaderRef.current && elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.002) return;
           const isGenerationHeader = awaitingContainerHeaderRef.current;
           let signature = { valid: false, container: "unknown", hex: "" };
           if (isGenerationHeader) {
             signature = containerSignature(await event.data.slice(0, 16).arrayBuffer());
             if (!signature.valid) {
-              console.error("[AUDIO_CONTAINER_HEADER_INVALID]", { mimeType: recorderMimeType, streamGeneration: audioStreamGenerationRef.current, signature: signature.hex, retryCount: containerHeaderRetryCountRef.current });
+              containerHeaderProbeFailuresRef.current += 1;
+              console.error("[AUDIO_CONTAINER_HEADER_INVALID]", { mimeType: recorderMimeType, streamGeneration: audioStreamGenerationRef.current, signature: signature.hex, retryCount: containerHeaderRetryCountRef.current, probeFailures: containerHeaderProbeFailuresRef.current });
+              // A single failed probe is not, by itself, proof the container is genuinely
+              // corrupt — a fast MediaRecorder chunk boundary can leave this chunk simply not
+              // starting at byte 0 of the file without any real encoding problem. Skip only this
+              // one chunk (still awaiting the header, recorder untouched) and let the next chunk
+              // be evaluated fresh, exactly as the mobile MIN_MEDIA_CHUNK_BYTES/timing exemptions
+              // above already protect the true first chunk from being discarded before this
+              // point. Only a second consecutive failure for the same generation escalates to
+              // the stop/restart recovery path — real, sustained container corruption fails
+              // again immediately, so it is still caught just as reliably as before.
+              if (containerHeaderProbeFailuresRef.current < 2) return;
               // A missing/invalid header (e.g. right after a Deepgram-triggered stream reset)
               // is a transient MediaRecorder timing hiccup, not proof the whole capture
               // pipeline is broken: retry an in-place restart, reusing the same tested
@@ -3982,6 +4013,7 @@ export default function App() {
               // number of times before treating it as a real failure needing full teardown.
               if (isDesktopChrome() && containerHeaderRetryCountRef.current < MAX_CONTAINER_HEADER_RETRIES && recordingRef.current && !explicitStopRequestedRef.current) {
                 containerHeaderRetryCountRef.current += 1;
+                containerHeaderProbeFailuresRef.current = 0;
                 console.warn("[AUDIO_CONTAINER_HEADER_RETRY]", { attempt: containerHeaderRetryCountRef.current, maxAttempts: MAX_CONTAINER_HEADER_RETRIES, streamGeneration: audioStreamGenerationRef.current });
                 pendingAudioStreamGenerationRef.current = audioStreamGenerationRef.current + 1;
                 queuedAudioChunksRef.current = [];
@@ -3999,6 +4031,7 @@ export default function App() {
             }
             awaitingContainerHeaderRef.current = false;
             containerHeaderRetryCountRef.current = 0;
+            containerHeaderProbeFailuresRef.current = 0;
           }
           const chunk = {
             audio: event.data,
@@ -4068,6 +4101,7 @@ export default function App() {
           sequenceRef.current = 0;
           pendingSpeechChunksRef.current = [];
           awaitingContainerHeaderRef.current = true;
+          containerHeaderProbeFailuresRef.current = 0;
           const previousState = recorder.state;
           console.info("[MEDIARECORDER_START_REQUEST]", { reason: "deepgram_generation_change_onstop", recordingGeneration: activeRecordingGenerationRef.current, previousState });
           recorder.start(audioChunkMsRef.current);

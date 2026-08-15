@@ -113,7 +113,7 @@ const debugFlagEnabled = (flag) =>
   ["1", "true", "yes", "on"].includes(String(process.env[flag] || process.env.DEBUG || "").trim().toLowerCase());
 
 const logTranslationEvent = (event, payload = {}, level = "info") => {
-  const providerEvent = /^PROVIDER_|^TRANSLATION_REQUEST|^TRANSLATION_COMPLETE|^TRANSLATION_FAILED|^TRANSLATION_QUEUE_STATE|^JOB_START|^QUEUE_ADD|^QUEUE_NEXT|^LANGUAGE_/.test(event);
+  const providerEvent = /^PROVIDER_|^TRANSLATION_PROVIDER_|^TRANSLATION_REQUEST|^TRANSLATION_COMPLETE|^TRANSLATION_FAILED|^TRANSLATION_QUEUE_STATE|^JOB_START|^QUEUE_ADD|^QUEUE_NEXT|^LANGUAGE_/.test(event);
   const shouldLog =
     process.env.NODE_ENV !== "production" ||
     debugFlagEnabled("TRANSLATION_DEBUG") ||
@@ -2193,6 +2193,13 @@ export const createInterpreterSession = async ({
         }
 
         lastAttemptedProvider = provider;
+        logTranslationEvent("TRANSLATION_PROVIDER_ATTEMPT", {
+          sessionId,
+          jobId,
+          targetLanguage: language,
+          provider,
+          attempt: attempt + 1
+        });
         const result = await runProviderTranslationAttempt({
           provider,
           language,
@@ -2219,8 +2226,9 @@ export const createInterpreterSession = async ({
         if (!retryable) break;
       }
 
+      const nextProviderInOrder = providerOrder[providerOrder.indexOf(provider) + 1] || null;
       if (languageState) {
-        languageState.fallbackProvider = providerOrder[providerOrder.indexOf(provider) + 1] || null;
+        languageState.fallbackProvider = nextProviderInOrder;
       }
       logTranslationEvent("PROVIDER_FALLBACK", {
         sessionId,
@@ -2228,14 +2236,30 @@ export const createInterpreterSession = async ({
         provider,
         providerModel: lastError?.providerModel || lastError?.model || languageState?.providerModel || null,
         targetLang: language,
-        nextProvider: providerOrder[providerOrder.indexOf(provider) + 1] || "none",
+        nextProvider: nextProviderInOrder || "none",
         error: lastError?.message || lastError
       }, "warn");
+      if (nextProviderInOrder) {
+        logTranslationEvent("TRANSLATION_PROVIDER_FALLBACK", {
+          from: provider,
+          to: nextProviderInOrder,
+          jobId,
+          targetLanguage: language,
+          reason: lastError?.errorCategory || lastError?.reason || lastError?.message || "provider_failed"
+        }, "warn");
+      }
     }
 
     if (!lastError) {
       lastError = createProviderUnavailableError({ providerHealth, env });
     }
+    logTranslationEvent("TRANSLATION_PROVIDER_FINAL_FAILURE", {
+      sessionId,
+      jobId,
+      targetLanguage: language,
+      providersAttempted: providerOrder,
+      reason: lastError?.errorCategory || lastError?.reason || lastError?.message || "unknown"
+    }, "warn");
     noteTranslationFailure(language, lastError);
     return {
       text: "",

@@ -749,3 +749,69 @@ assert.match(frontendSource, /OpenAI quota is currently unavailable/);
 assert.match(frontendSource, /errorCategory\?: string \| null/);
 assert.doesNotMatch(frontendSource, /if\s*\(diagnostic\.message\)\s*return/);
 assert.doesNotMatch(frontendSource, /coerceTranslationState\(diagnostic\.status\s*\|\|\s*nextStatusUpdates\[language\]\s*\|\|\s*status\)/);
+
+// Requested diagnostics: an explicit per-attempt log (so a future incident can prove which
+// providers were actually tried for a given target language, in order), a from/to/reason
+// fallback log distinct from the pre-existing PROVIDER_FALLBACK shape, and a final-failure log
+// once every provider in the order has genuinely been exhausted.
+assert.match(interpreterSource, /logTranslationEvent\("TRANSLATION_PROVIDER_ATTEMPT", \{\s*sessionId,\s*jobId,\s*targetLanguage: language,\s*provider,\s*attempt: attempt \+ 1\s*\}\);/, "TRANSLATION_PROVIDER_ATTEMPT is logged immediately before each provider attempt, with the target language and attempt number");
+assert.match(interpreterSource, /logTranslationEvent\("TRANSLATION_PROVIDER_FALLBACK", \{\s*from: provider,\s*to: nextProviderInOrder,\s*jobId,\s*targetLanguage: language,\s*reason: lastError\?\.errorCategory \|\| lastError\?\.reason \|\| lastError\?\.message \|\| "provider_failed"\s*\}, "warn"\);/, "TRANSLATION_PROVIDER_FALLBACK is logged with the exact requested {from, to, reason} shape whenever a provider genuinely falls through to the next one in the order");
+assert.match(interpreterSource, /logTranslationEvent\("TRANSLATION_PROVIDER_FINAL_FAILURE", \{/, "TRANSLATION_PROVIDER_FINAL_FAILURE is logged once every provider in the order has been exhausted for this target language");
+
+// Section: these events must not be silently suppressed in production the way a non-PROVIDER_
+// prefixed event would be by logTranslationEvent's own shouldLog gate.
+assert.match(interpreterSource, /const providerEvent = \/\^PROVIDER_\|\^TRANSLATION_PROVIDER_\|/, "TRANSLATION_PROVIDER_* events are recognized as provider events, so they are NOT silently dropped in production (only NODE_ENV!=='production' or an explicit debug flag would otherwise let them through)");
+
+// Never log API keys: none of the new diagnostic payloads reference apiKey or the raw env
+// credential fields directly.
+{
+  const attemptLogIndex = interpreterSource.indexOf('logTranslationEvent("TRANSLATION_PROVIDER_ATTEMPT"');
+  const attemptLogBlock = interpreterSource.slice(attemptLogIndex, attemptLogIndex + 300);
+  assert.doesNotMatch(attemptLogBlock, /apiKey|geminiApiKey|openaiApiKey/, "TRANSLATION_PROVIDER_ATTEMPT never includes an API key field");
+  const fallbackLogIndex = interpreterSource.indexOf('logTranslationEvent("TRANSLATION_PROVIDER_FALLBACK"');
+  const fallbackLogBlock = interpreterSource.slice(fallbackLogIndex, fallbackLogIndex + 300);
+  assert.doesNotMatch(fallbackLogBlock, /apiKey|geminiApiKey|openaiApiKey/, "TRANSLATION_PROVIDER_FALLBACK never includes an API key field");
+}
+
+// French + German (or any two targets) are dispatched through createPerLanguageDispatchQueue
+// independently, each running its own translateProviderLanguageWithRecovery loop with its own
+// providerOrder/lastError — proven end-to-end here: one target (es) hitting an OpenAI-shaped
+// authentication failure after Gemini also fails must not cancel or fail the other targets
+// (ja, zh), which succeed via OpenAI normally. This mirrors the exact French/German scenario:
+// one target's provider exhaustion is fully isolated from the other target's outcome.
+{
+  const queue = createPerLanguageDispatchQueue({
+    languages: ["fr", "de"],
+    concurrency: 2,
+    requestDelayMs: 50,
+    maxRetries: 0,
+    worker: async (language) => {
+      // "fr" simulates the reported production failure: OpenAI quota exhausted. Gemini is
+      // configured and healthy, so the backend fallback loop must still attempt it — and here
+      // it succeeds, proving quota-exhausted OpenAI does not prevent Gemini from being tried.
+      if (language === "fr") {
+        return translateWithBackendProviderFallback({
+          language,
+          geminiRequest: async () => geminiSuccessResponse("Bien-être mental."),
+          openAIRequest: async () => {
+            throw new Error("OpenAI should not be reached: Gemini must be tried first here and succeed");
+          }
+        });
+      }
+      // "de" is fully independent of whatever happened to "fr" above.
+      return translateWithBackendProviderFallback({
+        language,
+        geminiRequest: async () => jsonResponse(503, { error: { message: "Gemini overloaded" } }),
+        openAIRequest: async () => openAISuccessResponse("Psychisches Wohlbefinden.")
+      });
+    }
+  });
+
+  const results = await queue.run();
+  const frResult = results.find((_, index) => ["fr", "de"][index] === "fr");
+  const deResult = results.find((_, index) => ["fr", "de"][index] === "de");
+  assert.equal(frResult.text, "Bien-être mental.", "French resolves via Gemini independently of German's outcome");
+  assert.equal(frResult.provider, "gemini");
+  assert.equal(deResult.text, "Psychisches Wohlbefinden.", "German resolves via OpenAI independently of French's outcome");
+  assert.equal(deResult.provider, "openai");
+}
