@@ -305,6 +305,8 @@ const AUTH_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 // far closer to what a live captioning experience actually requires.
 const STALE_TRANSLATION_STATE_MS = 18000;
 const SOCKET_HEARTBEAT_STALE_MS = 75000;
+let socketInstanceCounter = 0;
+const nextSocketInstanceId = () => `socket-${++socketInstanceCounter}-${Date.now().toString(36)}`;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
 const VIEWS: View[] = ["landing", "login", "signup", "dashboard", "pricing", "subscription", "history", "help", "settings", "admin-login", "admin"];
 const PROTECTED_VIEWS = new Set<View>(["dashboard", "subscription", "history", "settings", "admin"]);
@@ -2572,6 +2574,9 @@ export default function App() {
       }, CLIENT_HEARTBEAT_MS);
     };
 
+    const socketInstanceId = nextSocketInstanceId();
+    const previousInstanceId = socketRef.current ? (socketRef.current as { __instanceId?: string }).__instanceId : null;
+
     const socket = io(SOCKET_URL, {
       auth: {
         token: tokenRef.current,
@@ -2588,10 +2593,17 @@ export default function App() {
       autoConnect: true
     });
 
+    (socket as unknown as { __instanceId: string }).__instanceId = socketInstanceId;
+    console.info("[SOCKET_INSTANCE_CREATED]", { instanceId: socketInstanceId, reason: previousInstanceId ? "effect_rerun" : "initial_mount", transports: SOCKET_TRANSPORTS });
+    if (previousInstanceId) {
+      console.info("[SOCKET_INSTANCE_REPLACED]", { oldInstanceId: previousInstanceId, newInstanceId: socketInstanceId, reason: "effect_rerun" });
+    }
+
     socketRef.current = socket;
 
     socket.on("connect", () => {
       logFrontendDebug("socket", "SOCKET_CONNECTED", { id: socket.id, url: SOCKET_URL });
+      console.info("[SOCKET_CONNECTED]", { instanceId: socketInstanceId, socketId: socket.id, activeSessionId: activeSessionIdRef.current || clientSessionIdRef.current });
       setSocketConnected(true);
       setSocketReconnecting(false);
       lastServerHeartbeatAtRef.current = Date.now();
@@ -2619,8 +2631,9 @@ export default function App() {
       }
     });
 
-    socket.on("disconnect", () => {
-      logFrontendDebug("socket", "SOCKET_DISCONNECTED", { recording: recordingRef.current });
+    socket.on("disconnect", (reason: string) => {
+      logFrontendDebug("socket", "SOCKET_DISCONNECTED", { recording: recordingRef.current, reason });
+      console.info("[SOCKET_DISCONNECTED]", { instanceId: socketInstanceId, reason, activeSessionId: activeSessionIdRef.current || clientSessionIdRef.current });
       stopClientHeartbeat();
       setSocketConnected(false);
       if (recordingRef.current) {
@@ -2992,6 +3005,36 @@ export default function App() {
       const previewJob = typeof jobId === "string" && jobId.startsWith("preview-");
       const streamingPreview = Boolean(streaming || previewJob);
       console.info("[DESKTOP_PIPELINE_TRANSLATION_RECEIVED]", { sessionId, jobId, sequence, original: updateOriginal, languages: Object.keys(translations || {}), status, partial, complete });
+      console.info("[TRANSLATION_SOCKET_PAYLOAD]", { sessionId, jobId, sequence, provider, hasStatusByLanguage: Boolean(statusByLanguage), failedLanguages: failedLanguages || [] });
+      {
+        // Classify each language BEFORE any card is updated, so a "retrying"/"failed" diagnostic
+        // payload can never be mistaken for a completed translation just because the socket event
+        // fired — [DESKTOP_PIPELINE_TRANSLATION_RECEIVED] alone does not mean success.
+        const classificationLanguages = new Set([
+          ...Object.keys(translations || {}),
+          ...Object.keys(statusByLanguage || {}),
+          ...(failedLanguages || []),
+          ...(lang ? [lang] : [])
+        ]);
+        for (const language of classificationLanguages) {
+          const rawText = String(translations?.[language] ?? (language === lang ? text : "") ?? "").trim();
+          const hasText = rawText.length > 0;
+          const languageStatus = coerceTranslationState(statusByLanguage?.[language] ?? (language === lang ? status : undefined)) || (failedLanguages?.includes(language) ? "failed" : "");
+          const terminal = languageStatus === "translated" || languageStatus === "failed" || (hasText && complete !== false && !partial);
+          const successful = hasText && languageStatus !== "failed";
+          console.info("[DESKTOP_TRANSLATION_PAYLOAD_CLASSIFIED]", {
+            targetLanguage: language,
+            status: languageStatus || (hasText ? "translated" : "unknown"),
+            terminal,
+            successful,
+            hasText,
+            provider,
+            errorCategory: diagnosticsByLanguage?.[language]?.errorCategory || (language === lang ? diagnostics?.errorCategory : undefined) || null,
+            sequence,
+            utteranceId: jobId ?? sequence ?? "unknown"
+          });
+        }
+      }
       for (const language of Object.keys(translations || {})) {
         console.info("[TRANSLATION_RECEIVED]", { sessionId, utteranceId: jobId ?? sequence ?? "unknown", targetLanguage: language, lifecyclePhase: complete !== false && !partial ? "completed" : "translating", reason: "socket_event" });
       }

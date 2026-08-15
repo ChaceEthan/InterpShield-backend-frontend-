@@ -77,10 +77,10 @@ export const listGeminiGenerateContentModels = async ({ apiKey, request = global
     error.httpStatus = response.status;
     error.reason = reason;
     error.headers = response.headers;
-    error.retryAfterMs = getRetryAfterMs(error);
     error.errorStatus = data?.error?.status || null;
     error.errorCode = data?.error?.code || null;
     error.errorDetails = Array.isArray(data?.error?.details) ? data.error.details : [];
+    error.retryAfterMs = getRetryAfterMs(error) ?? parseGeminiRetryDelayMs(error);
     error.errorCategory = classifyGeminiError(error);
     throw error;
   }
@@ -108,7 +108,7 @@ export const selectVerifiedGeminiFlashFallback = (models = [], excludedModels = 
 const flattenGeminiErrorDetails = (error = {}) => {
   const details = Array.isArray(error?.errorDetails) ? error.errorDetails : [];
   const quotaViolations = details.flatMap((detail) => detail?.violations || detail?.quotaFailure?.violations || []);
-  return [
+  const raw = [
     error?.errorStatus,
     error?.errorCode,
     error?.reason,
@@ -117,6 +117,24 @@ const flattenGeminiErrorDetails = (error = {}) => {
     ...details.map((detail) => detail?.reason || detail?.message || detail?.quotaMetric || detail?.quotaId),
     ...quotaViolations.flatMap((violation) => [violation?.quotaMetric, violation?.quotaId, violation?.description])
   ].filter(Boolean).join(" ").replace(/[_-]+/g, " ");
+  // Google's real quotaId values (e.g. "GenerateRequestsPerMinutePerProjectPerModel") are
+  // camelCase with no separators, so "per minute"/"per day" never appear as space-separated
+  // words unless camelCase boundaries are split first.
+  return raw.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+};
+
+// Google's structured google.rpc.RetryInfo detail (retryDelay like "24s") is how the Gemini API
+// actually communicates "retry shortly" for a rate limit — unlike OpenAI it does not use a
+// Retry-After HTTP header for this. Its presence is a reliable signal that a 429 is a transient,
+// self-healing rate limit rather than a genuine billing/account block, which never includes one.
+const parseGeminiRetryDelayMs = (error = {}) => {
+  const details = Array.isArray(error?.errorDetails) ? error.errorDetails : [];
+  const retryInfo = details.find(
+    (detail) => detail?.["@type"] === "type.googleapis.com/google.rpc.RetryInfo" && detail?.retryDelay
+  );
+  const match = retryInfo ? /^(\d+(?:\.\d+)?)s$/.exec(String(retryInfo.retryDelay).trim()) : null;
+  const seconds = match ? Number(match[1]) : NaN;
+  return Number.isFinite(seconds) ? Math.round(seconds * 1000) : null;
 };
 
 export const classifyGeminiError = (error = {}) => {
@@ -125,9 +143,15 @@ export const classifyGeminiError = (error = {}) => {
   if (status === 401 || /\b(?:api key not valid|invalid api key|unauthenticated)\b/i.test(details)) return "authentication_failure";
   if (status === 403 || /\bpermission denied\b/i.test(details)) return "permission_failure";
   if (status === 404 || /\b(?:model not found|unsupported model|model unavailable)\b/i.test(details)) return "model_unavailable";
-  if (/\b(?:billing|current quota exceeded|check your plan|credit balance|spend limit|usage limit)\b/i.test(details)) return "billing_quota_exhausted";
-  if (/\b(?:requests per day|daily quota|rpd|per day|quota limit reached|limit\s*:?\s*0|quota value["']?\s*:?\s*["']?0)\b/i.test(details)) return "daily_quota_exhausted";
+  // Structured, per-period quota signals are checked BEFORE Google's generic "check your plan
+  // and billing details" boilerplate. That boilerplate is included on every 429 Gemini returns —
+  // including the free-tier per-minute cap, which self-heals in seconds — so it cannot by itself
+  // distinguish a transient rate limit from an actual billing failure. The quotaId/quotaMetric
+  // (and, failing that, a present RetryInfo.retryDelay) can.
   if (/\b(?:requests per minute|tokens per minute|rpm|tpm|too many requests)\b/i.test(details)) return "temporary_rate_limit";
+  if (/\b(?:requests per day|daily quota|rpd|per day|quota limit reached|limit\s*:?\s*0|quota value["']?\s*:?\s*["']?0)\b/i.test(details)) return "daily_quota_exhausted";
+  if (status === 429 && parseGeminiRetryDelayMs(error) !== null) return "temporary_rate_limit";
+  if (/\b(?:billing|current quota exceeded|check your plan|credit balance|spend limit|usage limit)\b/i.test(details)) return "billing_quota_exhausted";
   if (status === 429) return "daily_quota_exhausted";
   if (status === 503 || /\b(?:overloaded|service unavailable|resource exhausted temporarily)\b/i.test(details)) return "provider_overloaded";
   if (error?.name === "AbortError" || /\b(?:timed? out|timeout|econnreset|fetch failed|network)\b/i.test(details)) return "network_timeout";
@@ -341,10 +365,10 @@ const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, tran
     error.httpStatus = response.status;
     error.reason = reason;
     error.headers = response.headers;
-    error.retryAfterMs = getRetryAfterMs(error);
     error.errorStatus = data?.error?.status || null;
     error.errorCode = data?.error?.code || null;
     error.errorDetails = Array.isArray(data?.error?.details) ? data.error.details : [];
+    error.retryAfterMs = getRetryAfterMs(error) ?? parseGeminiRetryDelayMs(error);
     error.errorCategory = classifyGeminiError(error);
     throw error;
   }

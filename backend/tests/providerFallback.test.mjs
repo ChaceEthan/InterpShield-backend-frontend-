@@ -333,6 +333,72 @@ assert.equal(classifyGeminiError({ httpStatus: 403, reason: "Permission denied" 
 assert.equal(classifyGeminiError({ reason: "Network timeout" }), "network_timeout");
 
 {
+  // Real production bug: Gemini's actual free-tier per-minute 429 response reuses the exact
+  // same "check your plan and billing details" boilerplate Google sends for a genuine billing
+  // block, and its quotaId ("GenerateRequestsPerMinutePerProjectPerModel-FreeTier") is camelCase
+  // with no spaces, so naive phrase matching on the message text alone misclassified this
+  // self-healing, seconds-long rate limit as a 30-minute billing failure — starving every other
+  // in-flight language/session of Gemini even though the paid provider was never actually broken.
+  const realGeminiPerMinuteRateLimitError = {
+    httpStatus: 429,
+    errorStatus: "RESOURCE_EXHAUSTED",
+    reason: "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits.",
+    errorDetails: [
+      {
+        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+        violations: [
+          {
+            quotaMetric: "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+            quotaId: "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+            quotaValue: "15"
+          }
+        ]
+      },
+      { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "24s" }
+    ]
+  };
+
+  assert.equal(
+    classifyGeminiError(realGeminiPerMinuteRateLimitError),
+    "temporary_rate_limit",
+    "a real Gemini per-minute quotaId must win over Google's shared 'check your plan and billing details' boilerplate"
+  );
+
+  const geminiHealth = { failures: 0, cooldownUntil: 0, lastSuccessAt: 0, lastFailure: null };
+  const now = Date.now();
+  const outcome = applyProviderFailureToHealth({
+    provider: "gemini",
+    health: geminiHealth,
+    error: Object.assign(new Error(realGeminiPerMinuteRateLimitError.reason), realGeminiPerMinuteRateLimitError),
+    now
+  });
+  assert.equal(outcome.reason, "temporary_rate_limit");
+  assert.ok(
+    geminiHealth.cooldownUntil < now + 60000,
+    "a genuine per-minute rate limit must self-heal in well under a minute, not the 30-minute billing cooldown"
+  );
+  assert.equal(geminiHealth.quotaExhausted, false, "a per-minute rate limit is not quota exhaustion");
+  assert.equal(isProviderAvailableFromHealth({ gemini: geminiHealth }, "gemini", now + 60000), true, "Gemini must be usable again well before 30 minutes pass");
+
+  // A genuine billing/account block — no quotaId, no RetryInfo — must still be treated as a real
+  // 30-minute failure; the fix must not make InterpShield blind to actual billing exhaustion.
+  const genuineBillingFailure = {
+    httpStatus: 429,
+    errorStatus: "RESOURCE_EXHAUSTED",
+    reason: "You exceeded your current quota, please check your plan and billing details."
+  };
+  assert.equal(classifyGeminiError(genuineBillingFailure), "billing_quota_exhausted");
+  const billingHealth = { failures: 0, cooldownUntil: 0, lastSuccessAt: 0, lastFailure: null };
+  applyProviderFailureToHealth({
+    provider: "gemini",
+    health: billingHealth,
+    error: Object.assign(new Error(genuineBillingFailure.reason), genuineBillingFailure),
+    now
+  });
+  assert.ok(billingHealth.cooldownUntil >= now + 30 * 60 * 1000, "a genuine billing block must still receive the full 30-minute cooldown");
+}
+
+{
   let calls = 0;
   const sleeps = [];
   const result = await translateWithOpenAI({
