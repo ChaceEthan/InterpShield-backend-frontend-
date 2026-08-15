@@ -2287,16 +2287,22 @@ export default function App() {
       pendingFinalTranscriptsRef.current.clear();
     }
     utteranceLifecycleRef.current.setPhase("finalizing");
-    cleanupMedia({ preserveTranslationPipeline: true, stopReason: `drain_${reason}`, caller: "finishDrain" });
-    socketRef.current?.emit("end_session", { reason });
-    activeSessionPayloadRef.current = null;
-    activeBackendSessionIdRef.current = "";
-    activeBackendTranslationJobIdRef.current = "";
-    sessionActionInFlightRef.current = false;
-    setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
-    setStatus("idle");
-    utteranceLifecycleRef.current.resetToIdle();
-    stopInFlightRef.current = false;
+    try {
+      cleanupMedia({ preserveTranslationPipeline: true, stopReason: `drain_${reason}`, caller: "finishDrain" });
+      socketRef.current?.emit("end_session", { reason });
+      activeSessionPayloadRef.current = null;
+      activeBackendSessionIdRef.current = "";
+      activeBackendTranslationJobIdRef.current = "";
+    } finally {
+      // A completed mobile utterance must always land back at a pressable idle state, even if
+      // cleanup above threw — otherwise the mic button silently stops responding to the next
+      // press with no visible error, exactly the "poisoned next start" failure mode.
+      sessionActionInFlightRef.current = false;
+      setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
+      setStatus("idle");
+      utteranceLifecycleRef.current.resetToIdle();
+      stopInFlightRef.current = false;
+    }
     void refreshMe();
   }, [cleanupMedia, refreshMe]);
   finishDrainRef.current = finishDrain;
@@ -2388,11 +2394,16 @@ export default function App() {
       : `${failureMessage} Press the microphone to try again.`;
     setAudioDiagnostic({ state: "failed", message: failureMessage, lastRestartReason: reason });
     setAlert(alertMessage);
-    cleanupMedia({ stopReason: reason });
-    socketRef.current?.emit("end_session", { reason });
-    setStatus("idle");
-    utteranceLifecycleRef.current.resetToIdle();
-    stopInFlightRef.current = false;
+    try {
+      cleanupMedia({ stopReason: reason });
+      socketRef.current?.emit("end_session", { reason });
+    } finally {
+      // Whatever cleanup did, the session must land back in a pressable idle state — never
+      // stuck mid-recovery, which would permanently block the next Start.
+      setStatus("idle");
+      utteranceLifecycleRef.current.resetToIdle();
+      stopInFlightRef.current = false;
+    }
   }, [cleanupMedia]);
 
   const emitAudioChunkPayload = useCallback((payload: AudioChunkPayload) => {
@@ -2441,19 +2452,24 @@ export default function App() {
     stopInFlightRef.current = true;
     sessionActionInFlightRef.current = true;
     setStatus("stopping");
-    cleanupMedia({ stopReason: "explicit_user_stop", caller: "stopSession" });
-    if (drainTimeoutRef.current) window.clearTimeout(drainTimeoutRef.current);
-    drainTimeoutRef.current = null;
-    awaitingFinalTranscriptRef.current = false;
-    setAwaitingFinalTranscript(false);
-    drainPendingLanguagesRef.current.clear();
-    setTranslationsPending([]);
-    socketRef.current?.emit("end_session");
-    sessionActionInFlightRef.current = false;
-    setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
-    setStatus("idle");
-    utteranceLifecycleRef.current.resetToIdle();
-    stopInFlightRef.current = false;
+    try {
+      cleanupMedia({ stopReason: "explicit_user_stop", caller: "stopSession" });
+      if (drainTimeoutRef.current) window.clearTimeout(drainTimeoutRef.current);
+      drainTimeoutRef.current = null;
+      awaitingFinalTranscriptRef.current = false;
+      setAwaitingFinalTranscript(false);
+      drainPendingLanguagesRef.current.clear();
+      setTranslationsPending([]);
+      socketRef.current?.emit("end_session");
+    } finally {
+      // However cleanup went, the mic button must never stay stuck disabled on "stopping" —
+      // that would silently block every future press with no way to recover but a page reload.
+      sessionActionInFlightRef.current = false;
+      setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
+      setStatus("idle");
+      utteranceLifecycleRef.current.resetToIdle();
+      stopInFlightRef.current = false;
+    }
     void refreshMe();
   }, [cleanupMedia, refreshMe, status]);
 
@@ -3362,7 +3378,40 @@ export default function App() {
       return;
     }
 
+    // Every guard/support check that can bail out lives here, BEFORE any state is mutated —
+    // in particular before utteranceLifecycleRef.current.start() moves the lifecycle phase
+    // away from "idle". Previously several of these checks returned early without reverting
+    // that phase, permanently blocking every future press's entry guard (phase !== "idle")
+    // even for a totally different audio source. Once we're past this point we're fully
+    // committed to starting, and the try/catch below already reverts everything correctly.
+    const activeAudioSource = audioSourceRef.current;
+    console.info("[AUDIO_START_REQUEST]", { source: activeAudioSource, platform: isDesktopChrome() ? "desktop" : "mobile", previousStatus: status });
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setStatus("error");
+      setMicrophonePermission("unsupported");
+      setMicrophoneAvailable(false);
+      setAudioDiagnostic({ state: "failed", message: "Microphone unsupported" });
+      setAlert("Microphone access is not supported in this browser.");
+      return;
+    }
+
+    if (!("MediaRecorder" in window)) {
+      setStatus("error");
+      setAudioDiagnostic({ state: "failed", message: "Recording unsupported" });
+      setAlert("Microphone recording is not supported in this browser.");
+      return;
+    }
+
+    if (activeAudioSource === "tab" && !isTabAudioCaptureSupported(navigator.mediaDevices)) {
+      setStatus("error");
+      setAudioDiagnostic({ state: "failed", message: "Tab/system audio capture is unavailable" });
+      setAlert("This browser does not support sharing tab or system audio. Switch to Microphone mode to continue.");
+      return;
+    }
+
     const recordingGeneration = activeRecordingGenerationRef.current + 1;
+    console.info("[INPUT_SOURCE_SELECTED]", { source: activeAudioSource, desktopChrome: isDesktopChrome(), recordingGeneration });
     activeRecordingGenerationRef.current = recordingGeneration;
     explicitStopRequestedRef.current = false;
     startInFlightRef.current = true;
@@ -3408,35 +3457,6 @@ export default function App() {
     if (interimTimerRef.current) {
       window.clearTimeout(interimTimerRef.current);
       interimTimerRef.current = null;
-    }
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      sessionActionInFlightRef.current = false;
-      setStatus("error");
-      setMicrophonePermission("unsupported");
-      setMicrophoneAvailable(false);
-      setAudioDiagnostic({ state: "failed", message: "Microphone unsupported" });
-      setAlert("Microphone access is not supported in this browser.");
-      return;
-    }
-
-    if (!("MediaRecorder" in window)) {
-      sessionActionInFlightRef.current = false;
-      setStatus("error");
-      setAudioDiagnostic({ state: "failed", message: "Recording unsupported" });
-      setAlert("Microphone recording is not supported in this browser.");
-      return;
-    }
-
-    const activeAudioSource = audioSourceRef.current;
-    console.info("[INPUT_SOURCE_SELECTED]", { source: activeAudioSource, desktopChrome: isDesktopChrome(), recordingGeneration });
-    if (activeAudioSource === "tab" && !isTabAudioCaptureSupported(navigator.mediaDevices)) {
-      sessionActionInFlightRef.current = false;
-      startInFlightRef.current = false;
-      setStatus("error");
-      setAudioDiagnostic({ state: "failed", message: "Tab/system audio capture is unavailable" });
-      setAlert("This browser does not support sharing tab or system audio. Switch to Microphone mode to continue.");
-      return;
     }
 
     try {
@@ -3490,7 +3510,33 @@ export default function App() {
         state: "requesting",
         message: activeAudioSource === "tab" ? "Waiting for tab/system audio selection" : "Requesting microphone permission"
       });
-      const stream = activeAudioSource === "tab" ? await requestTabAudioStream(navigator.mediaDevices) : await requestMicrophoneStream(audio, fallbackAudio);
+      let stream: MediaStream;
+      if (activeAudioSource === "tab") {
+        console.info("[GET_DISPLAY_MEDIA_REQUEST]", { recordingGeneration });
+        try {
+          stream = await requestTabAudioStream(navigator.mediaDevices);
+        } catch (error) {
+          console.error("[GET_DISPLAY_MEDIA_ERROR]", { recordingGeneration, name: error instanceof Error ? error.name : "unknown" });
+          throw error;
+        }
+        console.info("[GET_DISPLAY_MEDIA_SUCCESS]", { recordingGeneration, audioTracks: stream.getAudioTracks().length });
+        console.info("[TAB_AUDIO_CAPTURE]", {
+          audioTracks: stream.getAudioTracks().length,
+          videoTracks: stream.getVideoTracks().length,
+          audioReadyState: stream.getAudioTracks()[0]?.readyState,
+          audioEnabled: stream.getAudioTracks()[0]?.enabled,
+          audioMuted: stream.getAudioTracks()[0]?.muted
+        });
+      } else {
+        console.info("[GET_USER_MEDIA_REQUEST]", { recordingGeneration });
+        try {
+          stream = await requestMicrophoneStream(audio, fallbackAudio);
+        } catch (error) {
+          console.error("[GET_USER_MEDIA_ERROR]", { recordingGeneration, name: error instanceof Error ? error.name : "unknown" });
+          throw error;
+        }
+        console.info("[GET_USER_MEDIA_SUCCESS]", { recordingGeneration, audioTracks: stream.getAudioTracks().length });
+      }
       if (activeRecordingGenerationRef.current !== recordingGeneration || explicitStopRequestedRef.current) {
         stream.getTracks().forEach((track) => track.stop());
         sessionActionInFlightRef.current = false;
@@ -3961,6 +4007,52 @@ export default function App() {
     }
   }, [autoGainControl, beginDrain, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, scheduleAudioRecovery, shareableMode, sourceLang, targetLang, targetLanguages, user?.id, user?.plan, status]);
 
+  const handleMicClick = useCallback(() => {
+    const phase = utteranceLifecycleRef.current.snapshot().phase;
+    console.info("[MIC_BUTTON_CLICK]", {
+      isRecording,
+      status,
+      audioSource,
+      sessionActionInFlight: sessionActionInFlightRef.current,
+      startInFlight: startInFlightRef.current,
+      stopInFlight: stopInFlightRef.current,
+      recordingActive: recordingRef.current,
+      phase
+    });
+    if (isRecording) {
+      stopSession();
+      return;
+    }
+    // The click registers (the button is not natively disabled here), but startSession()'s
+    // own entry guard can still silently no-op if any of these are stuck non-idle/true from
+    // a prior session that failed to fully reset — log exactly which one so a real device
+    // report can show precisely why nothing happened.
+    const blockedReasons = {
+      sessionActionInFlight: sessionActionInFlightRef.current,
+      startInFlight: startInFlightRef.current,
+      recordingActive: recordingRef.current,
+      utteranceLifecyclePhaseNotIdle: phase !== "idle",
+      notAuthenticated: !isAuthed,
+      trialExhausted: Boolean(user?.role === "user" && user.subscription && !user.subscription.canUseInterpreter)
+    };
+    if (Object.values(blockedReasons).some(Boolean)) {
+      console.warn("[MIC_BUTTON_DISABLED_REASON]", blockedReasons);
+    }
+    void startSession();
+  }, [isAuthed, isRecording, startSession, status, stopSession, user?.role, user?.subscription]);
+
+  useEffect(() => {
+    // TranslationPanel natively disables the mic button (unclickable, no onClick fires at
+    // all) while status === "stopping". If stopSession() ever throws before reaching its own
+    // setStatus("idle"), the button would stay disabled forever with no click to diagnose
+    // from — this watchdog surfaces exactly that condition on its own.
+    if (status !== "stopping") return undefined;
+    const timer = window.setTimeout(() => {
+      console.warn("[MIC_BUTTON_DISABLED_REASON]", { reason: "status_stuck_stopping", status, stopInFlight: stopInFlightRef.current, recordingActive: recordingRef.current });
+    }, 4000);
+    return () => window.clearTimeout(timer);
+  }, [status]);
+
   const selectMode = (nextMode: Mode) => {
     if (isRecording) return;
     setMode(nextMode);
@@ -4354,7 +4446,7 @@ export default function App() {
           microphoneLabel={microphoneStatusLabel}
           alert={alert || microphoneNotice}
           aiDegraded={aiDegraded}
-          onMicClick={!isRecording ? () => void startSession() : stopSession}
+          onMicClick={handleMicClick}
           onSpeakTranslation={speakTranslatedCaption}
           onClear={clearLiveSession}
           onSave={saveHistoryAsPdf}

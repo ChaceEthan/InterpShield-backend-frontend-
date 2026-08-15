@@ -53,8 +53,8 @@ await assert.rejects(
   };
   await assert.rejects(
     () => requestTabAudioStream(mediaDevices),
-    (error) => error.name === "TabAudioNoTrackError" && /audio/i.test(error.message),
-    "no shared audio track produces a controlled error instead of silently recording silence"
+    (error) => error.name === "TabAudioNoTrackError" && error.message === "Shared source has no audio. In Chrome, choose the browser tab containing the video and enable Share tab audio.",
+    "no shared audio track produces the exact required controlled error message instead of silently recording silence"
   );
   assert.equal(videoTrack.stopped, true, "the video track is released even when no audio was shared");
 }
@@ -77,7 +77,13 @@ await assert.rejects(
 
 const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
 assert.match(appSource, /import \{ isTabAudioCaptureSupported, requestTabAudioStream \} from "\.\/audio\/tabAudioSource\.mjs"/, "App.tsx wires the live session to the tested tab-audio module");
-assert.match(appSource, /activeAudioSource === "tab" \? await requestTabAudioStream\(navigator\.mediaDevices\) : await requestMicrophoneStream/, "desktop live sessions route tab/system audio through the same capture-then-record pipeline as the microphone");
+assert.match(appSource, /if \(activeAudioSource === "tab"\) \{\s*console\.info\("\[GET_DISPLAY_MEDIA_REQUEST\]"/, "tab mode calls getDisplayMedia (via requestTabAudioStream), never getUserMedia, for the actual STT input");
+assert.match(appSource, /stream = await requestTabAudioStream\(navigator\.mediaDevices\);/, "the tab branch acquires its stream through the tested tab-audio module");
+assert.match(appSource, /stream = await requestMicrophoneStream\(audio, fallbackAudio\);/, "the microphone branch acquires its stream through getUserMedia, never getDisplayMedia");
+assert.match(appSource, /console\.info\("\[GET_DISPLAY_MEDIA_SUCCESS\]", \{ recordingGeneration, audioTracks: stream\.getAudioTracks\(\)\.length \}\);/, "a successful tab-audio acquisition is logged with track counts only, no stream contents");
+assert.match(appSource, /console\.info\("\[GET_USER_MEDIA_SUCCESS\]", \{ recordingGeneration, audioTracks: stream\.getAudioTracks\(\)\.length \}\);/, "a successful microphone acquisition is logged the same way");
+assert.match(appSource, /console\.error\("\[GET_DISPLAY_MEDIA_ERROR\]"/, "a failed tab-audio acquisition is logged without swallowing the error");
+assert.match(appSource, /console\.error\("\[GET_USER_MEDIA_ERROR\]"/, "a failed microphone acquisition is logged without swallowing the error");
 assert.match(appSource, /activeAudioSource === "tab" && !isTabAudioCaptureSupported\(navigator\.mediaDevices\)/, "starting tab/system audio mode on an unsupported browser is rejected before requesting anything");
 assert.match(appSource, /This browser does not support sharing tab or system audio\. Switch to Microphone mode to continue\./, "an unsupported browser gets a concise, actionable message rather than a silent failure");
 assert.match(appSource, /<AudioSourceTabs activeSource=\{audioSource\} disabled=\{isRecording\} onChange=\{handleAudioSourceChange\} \/>/, "the Microphone / Tab & System Audio switch is rendered on the live screen");

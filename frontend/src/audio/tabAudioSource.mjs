@@ -16,7 +16,7 @@ export const requestTabAudioStream = async (mediaDevices, createMediaStream = (t
   for (const track of displayStream.getVideoTracks()) track.stop();
 
   if (audioTracks.length === 0) {
-    const error = new Error('No audio was shared. Reopen the picker and enable "Share tab audio" (or share a screen/window with audio).');
+    const error = new Error("Shared source has no audio. In Chrome, choose the browser tab containing the video and enable Share tab audio.");
     error.name = "TabAudioNoTrackError";
     throw error;
   }
