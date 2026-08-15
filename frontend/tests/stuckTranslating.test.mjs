@@ -35,6 +35,21 @@ for (const state of ["failed", "stale", "cancelled"]) {
   assert.notEqual(translationPlaceholder(cardState, true), "Translating...", "a completed translation does not fall back to Translating... (real UI renders entry.text instead once state is translated)");
 }
 
+// Real production evidence: "CHINESE (ZH) / DONE / Waiting for speech..." — a card showing a
+// done/translated badge while its body falls back to the empty-state placeholder. The real UI
+// (TranscriptArea.tsx) only ever calls translationPlaceholder() when its own translated text is
+// empty (`entry.text || translationPlaceholder(...)`), so this exact input combination — state
+// "translated"/"done" with no text to show — is the literal shape of that bug. It must never
+// claim "Waiting for speech...", which falsely implies no translation was ever attempted.
+for (const state of ["translated", "done"]) {
+  assert.equal(
+    translationPlaceholder(state, true),
+    "Translation unavailable — retry",
+    `a "${state}" card with no text to show (should be structurally unreachable, but must fail safely if it ever happens) must never render "Waiting for speech..."`
+  );
+  assert.notEqual(translationPlaceholder(state, true), "Waiting for speech…");
+}
+
 const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
 
 // Desktop's continuous live session structurally cannot get stuck waiting for a transcript:

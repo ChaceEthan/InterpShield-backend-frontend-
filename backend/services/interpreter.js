@@ -1219,6 +1219,12 @@ export const createInterpreterSession = async ({
   let lastProviderStreamingPreviewAt = 0;
   let lastProviderStreamingPreviewSignature = "";
   let providerStreamingPreviewSequence = 0;
+  // At most one in-flight preview provider request per target language: a newer preview
+  // supersedes (and actually cancels, not merely ignores the result of) an older one for the
+  // same language, so interim speech never floods Gemini with an unbounded chain of concurrent
+  // preview-1-zh/preview-2-zh/preview-3-zh style requests competing for the same provider
+  // capacity that final translation jobs also need.
+  const activePreviewJobIdByLanguage = new Map();
   let lastAdminStatsAt = 0;
   const sessionId = createSessionId();
   const providerHealth = sharedProviderHealth;
@@ -1505,10 +1511,14 @@ export const createInterpreterSession = async ({
       job.runningLanguages?.clear?.();
       abortJobLanguageStates(job);
     }
+    if (providerAbortControllersByJob.size > 0) {
+      logTranslationEvent("TRANSLATION_ABORT_REQUESTED", { sessionId, reason: "translation_state_reset", scope: "session" });
+    }
     for (const controllers of providerAbortControllersByJob.values()) {
       for (const controller of controllers) controller?.abort?.();
     }
     providerAbortControllersByJob.clear();
+    activePreviewJobIdByLanguage.clear();
     activeSequentialTranslationJob = null;
     activeTranslationLanguageLocks.clear();
     sessionTranslationQueue.currentAbortController?.abort?.();
@@ -1570,9 +1580,18 @@ export const createInterpreterSession = async ({
     };
   };
 
-  const abortProviderRequestsForJob = (jobId) => {
+  const abortProviderRequestsForJob = (jobId, { reason = "unspecified", scope = "job", targetLanguage = null, provider = null } = {}) => {
     const controllers = providerAbortControllersByJob.get(jobId);
-    if (!controllers) return;
+    if (!controllers || controllers.size === 0) return;
+
+    logTranslationEvent("TRANSLATION_ABORT_REQUESTED", {
+      sessionId,
+      jobId,
+      targetLanguage,
+      provider,
+      reason,
+      scope
+    });
 
     for (const controller of controllers) {
       controller?.abort?.();
@@ -2327,7 +2346,7 @@ export const createInterpreterSession = async ({
       }
       activeTranslationLanguageLocks.delete(language);
     }
-    abortProviderRequestsForJob(job.id);
+    abortProviderRequestsForJob(job.id, { reason, scope: "job" });
     removeTranslationJob(job.id);
     if (activeSequentialTranslationJob?.id === job.id) {
       activeSequentialTranslationJob = null;
@@ -2596,14 +2615,46 @@ export const createInterpreterSession = async ({
     emitTranslationStatusUpdate(job, language, "failed", provider);
   };
 
+  // Cancels whatever preview provider request is currently in flight for this target language
+  // (if any) and clears its tracking entry. This is the ONLY thing that ever gets aborted here —
+  // it is keyed by the exact preview jobId, so it can never reach a final job's jobId or a
+  // different language's preview, both of which live under entirely distinct jobId namespaces.
+  const cancelActivePreviewForLanguage = (language, { reason = "superseded", newPreviewJobId = null } = {}) => {
+    const previousPreviewJobId = activePreviewJobIdByLanguage.get(language);
+    if (!previousPreviewJobId || previousPreviewJobId === newPreviewJobId) return;
+
+    abortProviderRequestsForJob(previousPreviewJobId, { reason, scope: "preview", targetLanguage: language });
+    activePreviewJobIdByLanguage.delete(language);
+    logTranslationEvent("PREVIEW_TRANSLATION_SUPERSEDED", {
+      sessionId,
+      targetLanguage: language,
+      previousPreviewJobId,
+      newPreviewJobId,
+      reason
+    });
+  };
+
   const emitStreamingProviderPreviewForLanguage = ({ previewId, cleanSentence, translationInput, direction, detectedLanguage, language }) => {
     const providers = getHealthyProviders();
     if (providers.length === 0) return;
 
-    const languageTranslationContext = languageTranslationContextFor(
-      language,
-      buildTranslationContext({ sentence: cleanSentence, direction, detectedLanguage })
-    );
+    const previewJobId = `preview-${previewId}-${language}`;
+    cancelActivePreviewForLanguage(language, { reason: "newer_preview", newPreviewJobId: previewJobId });
+    activePreviewJobIdByLanguage.set(language, previewJobId);
+    const clearActivePreviewTracking = () => {
+      if (activePreviewJobIdByLanguage.get(language) === previewJobId) {
+        activePreviewJobIdByLanguage.delete(language);
+      }
+    };
+
+    // Previews are interim and routinely superseded/discarded within ~500ms — they never affect
+    // what a user ultimately sees, so the accumulated styleMemory (past translation samples,
+    // which is by far the largest and least-bounded part of the context this builds for a final
+    // job) is skipped here. The final job for this same utterance still gets the full context.
+    const languageTranslationContext = {
+      ...languageTranslationContextFor(language, buildTranslationContext({ sentence: cleanSentence, direction, detectedLanguage })),
+      styleMemory: null
+    };
 
     logTranslationEvent("STREAMING_PREVIEW_REQUEST", {
       sessionId,
@@ -2625,7 +2676,7 @@ export const createInterpreterSession = async ({
             translationInput,
             direction,
             languageTranslationContext,
-            jobId: `preview-${previewId}-${language}`
+            jobId: previewJobId
           });
 
           if (previewId !== providerStreamingPreviewSequence || result?.stale || sessionStopped) return;
@@ -2700,6 +2751,8 @@ export const createInterpreterSession = async ({
           targetLang: language,
           error: error?.message || String(error)
         }, "warn");
+      } finally {
+        clearActivePreviewTracking();
       }
     })();
   };
@@ -3755,6 +3808,18 @@ export const createInterpreterSession = async ({
       isFinalizedSentence
     };
 
+    // A real final translation job always outranks interim preview work for the same target
+    // languages: once this utterance's source text is finalized, further preview translations of
+    // it are wasted effort that only competes with the final job for the same Gemini capacity.
+    for (const language of direction.targets.slice(0, MAX_TARGET_LANGUAGES)) {
+      cancelActivePreviewForLanguage(language, { reason: "final_job_started" });
+      logTranslationEvent("FINAL_TRANSLATION_PRIORITY", {
+        sessionId,
+        jobId,
+        targetLanguage: language
+      });
+    }
+
     onResult?.({
       original: sentence,
       originalText: sentence,
@@ -4018,10 +4083,14 @@ export const createInterpreterSession = async ({
       lane.activeTasks.clear();
       lane.drainScheduled = false;
     }
+    if (providerAbortControllersByJob.size > 0) {
+      logTranslationEvent("TRANSLATION_ABORT_REQUESTED", { sessionId, reason: "session_stop", scope: "session" });
+    }
     for (const controllers of providerAbortControllersByJob.values()) {
       for (const controller of controllers) controller?.abort?.();
     }
     providerAbortControllersByJob.clear();
+    activePreviewJobIdByLanguage.clear();
     sessionTranslationQueue.currentAbortController?.abort?.();
     sessionTranslationQueue.currentAbortController = null;
     sessionTranslationQueue.queue.length = 0;

@@ -28,7 +28,8 @@ import {
   createProviderUnavailableError,
   createPerLanguageDispatchQueue,
   isProviderAvailableFromHealth,
-  isRetryableProviderError
+  isRetryableProviderError,
+  shouldDegradeProviderHealth
 } from "../services/interpreter.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1010,4 +1011,98 @@ assert.match(interpreterSource, /: DEFAULT_TRANSLATION_PROVIDER;\s*\n\s*const or
   assert.equal(failure.httpStatus, 429);
   assert.equal(failure.errorCategory, "billing_quota_exhausted");
   assert.equal(failure.providerRetryExhausted, true, "a terminal OpenAI billing failure must not be retried further, so the target can settle into FAILED instead of staying RETRYING/Translating forever");
+}
+
+// Real production evidence: many concurrent preview-1-zh/preview-2-zh/preview-3-zh/preview-4-zh
+// requests were observed in flight at once for the SAME target language, none of them actually
+// cancelled — only their eventual result was discarded if superseded. That flood is what drove
+// genuine Gemini 503 provider_overloaded responses, which in turn applied a real cooldown that
+// then starved unrelated final jobs (French failing while Chinese succeeded). The fix bounds each
+// target language to exactly one in-flight preview request, cancels the previous one the moment a
+// newer one supersedes it, and makes any real final translation job outrank/cancel preview work
+// for the same languages the instant the source utterance is finalized.
+assert.match(
+  interpreterSource,
+  /const activePreviewJobIdByLanguage = new Map\(\);/,
+  "at most one in-flight preview provider request is tracked per target language"
+);
+assert.match(
+  interpreterSource,
+  /const cancelActivePreviewForLanguage = \(language, \{ reason = "superseded", newPreviewJobId = null \} = \{\}\) => \{/,
+  "a single, reusable cancellation helper exists for retiring a target language's in-flight preview"
+);
+{
+  const emitPreviewIndex = interpreterSource.indexOf("const emitStreamingProviderPreviewForLanguage = (");
+  const emitPreviewBody = interpreterSource.slice(emitPreviewIndex, emitPreviewIndex + 700);
+  assert.match(
+    emitPreviewBody,
+    /cancelActivePreviewForLanguage\(language, \{ reason: "newer_preview", newPreviewJobId: previewJobId \}\);/,
+    "starting a new preview for a language must first cancel that SAME language's previous in-flight preview (never a different language's, never a final job's)"
+  );
+  assert.match(
+    emitPreviewBody,
+    /activePreviewJobIdByLanguage\.set\(language, previewJobId\);/,
+    "the newly started preview must register itself as the active preview for this language"
+  );
+}
+{
+  const finalPriorityIndex = interpreterSource.indexOf('cancelActivePreviewForLanguage(language, { reason: "final_job_started" });');
+  assert.ok(finalPriorityIndex >= 0, "creating a real final translation job must cancel any still-running preview for each of its target languages — a final job always outranks preview work");
+  const finalJobFollowup = interpreterSource.slice(finalPriorityIndex, finalPriorityIndex + 200);
+  assert.match(finalJobFollowup, /logTranslationEvent\("FINAL_TRANSLATION_PRIORITY", \{/);
+}
+assert.match(interpreterSource, /logTranslationEvent\("PREVIEW_TRANSLATION_SUPERSEDED", \{/);
+assert.match(interpreterSource, /logTranslationEvent\("TRANSLATION_ABORT_REQUESTED", \{/);
+// Isolation is structural, not just behavioral: a preview's jobId always embeds its own target
+// language (`preview-${previewId}-${language}`), and cancellation is always looked up by the
+// exact jobId string — so cancelling one language's preview can never resolve to a different
+// language's entry in providerAbortControllersByJob, and can never match a final job's numeric id.
+assert.match(interpreterSource, /const previewJobId = `preview-\$\{previewId\}-\$\{language\}`;/);
+
+// Preview cancellation must never look like a real Gemini failure to provider-health tracking.
+// noteProviderFailure() is only reached through isProviderNonRetryableFailure(), which matches on
+// HTTP status (400/401/403/404) or billing/quota/permission keywords in the error message — an
+// intentional cancellation's message ("Gemini translation aborted") matches neither, so a run of
+// preview supersessions during continuous speech can never accumulate into a false Gemini cooldown.
+{
+  const intentionalAbort = Object.assign(new Error("Gemini translation aborted"), {});
+  assert.equal(
+    shouldDegradeProviderHealth({ error: intentionalAbort, provider: "gemini" }),
+    false,
+    "an intentional cancellation (plain Error, not a real AbortError, no timedOut flag) must not be treated as a provider health signal"
+  );
+
+  // A GENUINE timeout/abort (native fetch AbortError, or the explicit timedOut flag) must still
+  // count as a real signal — the fix must not blind the app to actual Gemini outages.
+  const genuineAbortError = Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+  assert.equal(
+    shouldDegradeProviderHealth({ error: genuineAbortError, provider: "gemini" }),
+    true,
+    "a genuine AbortError (e.g. the provider's own request truly timed out) must still degrade provider health"
+  );
+  assert.equal(
+    shouldDegradeProviderHealth({ result: { timedOut: true }, provider: "gemini" }),
+    true,
+    "an explicit timedOut result must still degrade provider health"
+  );
+}
+
+// Production evidence: sourceChars: 50, contextChars: 1787 — a 35x context-to-source ratio,
+// dominated by accumulated styleMemory (past translation samples). Previews are interim and
+// routinely superseded within ~500ms, so they never need that context; the final job for the
+// same utterance still gets it in full. This does not remove styleMemory from translation
+// memory — only from the interim preview requests that immediately discard their own context.
+assert.match(
+  interpreterSource,
+  /const languageTranslationContext = \{\s*\.\.\.languageTranslationContextFor\(language, buildTranslationContext\(\{ sentence: cleanSentence, direction, detectedLanguage \}\)\),\s*styleMemory: null\s*\};/,
+  "preview provider requests strip styleMemory from their translation context to avoid sending unnecessarily large context for interim, soon-discarded text"
+);
+{
+  // Final jobs must NOT be affected by the preview-only context trim: languageTranslationContextFor
+  // itself (used by every final-job translation path) still attaches styleMemory unconditionally.
+  assert.match(
+    interpreterSource,
+    /const languageTranslationContextFor = \(language, translationContext\) => \(\{\s*\.\.\.translationContext,\s*styleMemory: styleMemoryByLanguage\.get\(language\) \|\| null\s*\}\);/,
+    "the shared context builder used by final jobs still includes full styleMemory"
+  );
 }
