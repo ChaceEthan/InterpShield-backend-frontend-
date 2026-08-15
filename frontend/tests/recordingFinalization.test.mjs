@@ -81,7 +81,8 @@ assert.match(appSource, /const continueListeningAfterStopRef = useRef\(false\)/,
 assert.match(appSource, /explicitStopRequestedRef\.current = true;\s*stopInFlightRef\.current = true;/, "pressing Stop marks the session as explicitly ended before cleanup runs");
 assert.match(appSource, /explicitStopRequestedRef\.current = false;\s*continueListeningAfterStopRef\.current = false;\s*startInFlightRef\.current = true;/, "a fresh Start clears any earlier explicit-stop or continue-listening marker");
 assert.match(appSource, /const continueListening = reason === "vad_sustained_silence" && isDesktopChrome\(\) && !explicitStopRequestedRef\.current;/, "only a sustained-silence desktop finalize (not an explicit Stop) keeps the session open");
-assert.match(appSource, /if \(continueListening && recorderWasRecording\) \{[\s\S]{0,260}return true;\s*\}[\s\S]{0,260}recordingRef\.current = false;/, "continuing utterances skip the full stream/socket teardown that mobile and explicit stops still run");
+assert.match(appSource, /if \(continueListening && recorderWasRecording\) \{[\s\S]{0,800}return true;\s*\}/, "a continuing utterance returns early instead of falling into the teardown code below it");
+assert.match(appSource, /if \(continueListening && recorderWasRecording\) \{[\s\S]{0,800}return true;\s*\}\s*\/\/ continueListening was requested but the recorder was not actively capturing[\s\S]{0,260}recordingRef\.current = false;/, "continuing utterances skip the full stream/socket teardown that mobile and explicit stops still run");
 assert.match(appSource, /const recorderWasRecording = recorder\?\.state === "recording";\s*continueListeningAfterStopRef\.current = continueListening && recorderWasRecording;/, "continuation is only armed when the recorder is actually recording, so onstop is guaranteed to fire and restart it");
 assert.match(appSource, /if \(continueListeningAfterStopRef\.current && recordingRef\.current && !explicitStopRequestedRef\.current\) \{/, "the recorder's onstop handler re-checks Stop was not pressed mid-restart before resurrecting capture");
 assert.match(appSource, /recorderStoppedForGenerationRef\.current = null;\s*finalizationEmittedForGenerationRef\.current = null;/, "per-generation dedup guards reset after each utterance so the next utterance's stop/boundary can fire again");
@@ -138,6 +139,55 @@ assert.doesNotMatch(appSource, /RECORDING_SESSION_CONTINUES|CONTINUOUS_INACTIVIT
   refs.explicitStopRequestedRef.current = true;
   beginDrainThenOnstop();
   assert.deepEqual(teardowns, [recordingGeneration], "pressing Stop after any number of utterances tears the session down exactly once, in the same generation it ran in throughout");
+}
+
+// Same ten-utterance desktop session, this time modeling the transcript/translation half of
+// the real App.tsx flow: awaitingFinalTranscriptRef blocks a new beginDrain until this
+// utterance's final transcript resolves (mirroring the real guard at the top of beginDrain),
+// interim transcripts never dispatch a job, and exactly one final transcript per utterance
+// creates exactly one translation job before the card completes and the next utterance
+// becomes possible.
+{
+  let awaitingFinalTranscript = false;
+  const interimEvents = [];
+  const translationJobsCreated = [];
+  const cardsCompleted = [];
+
+  const beginDrainForUtterance = (utteranceId) => {
+    if (awaitingFinalTranscript) return false; // mirrors: if (awaitingFinalTranscriptRef.current) return false;
+    awaitingFinalTranscript = true;
+    return true;
+  };
+  const receiveInterim = (utteranceId, text) => {
+    interimEvents.push({ utteranceId, text }); // interim only ever updates the live caption
+  };
+  const receiveFinal = (utteranceId, text) => {
+    if (!awaitingFinalTranscript) return; // a final for an utterance nobody is awaiting is ignored
+    translationJobsCreated.push({ utteranceId, text }); // exactly one job per final transcript
+    awaitingFinalTranscript = false; // mirrors transcript_final clearing awaitingFinalTranscriptRef
+  };
+  const receiveTranslationResult = (utteranceId) => {
+    cardsCompleted.push(utteranceId);
+  };
+
+  for (let utterance = 1; utterance <= 10; utterance += 1) {
+    assert.equal(beginDrainForUtterance(utterance), true, `utterance ${utterance} can begin draining because no earlier utterance is still awaited`);
+    receiveInterim(utterance, `partial ${utterance}`);
+    receiveInterim(utterance, `partial ${utterance} continued`);
+    receiveFinal(utterance, `final sentence ${utterance}`);
+    receiveTranslationResult(utterance);
+  }
+
+  assert.equal(interimEvents.length, 20, "every utterance's interim updates are captured (caption-only, never counted as jobs)");
+  assert.equal(translationJobsCreated.length, 10, "exactly ten translation jobs exist for ten utterances — one each, never zero, never duplicated");
+  assert.deepEqual(translationJobsCreated.map((job) => job.utteranceId), Array.from({ length: 10 }, (_, index) => index + 1), "each job belongs to its own utterance in order");
+  assert.equal(cardsCompleted.length, 10, "every utterance's card reaches completion");
+  assert.equal(awaitingFinalTranscript, false, "the tenth utterance's completion leaves the session ready for an eleventh, not stuck awaiting a transcript");
+
+  // A duplicate final for an already-resolved utterance (e.g. is_final followed by a
+  // duplicate speech_final) must not create a second translation job.
+  receiveFinal(10, "duplicate final sentence 10");
+  assert.equal(translationJobsCreated.length, 10, "a duplicate final/speech_final for an already-resolved utterance cannot double-dispatch translation");
 }
 
 assert.deepEqual(phases.slice(0, 4), ["listening", "draining", "translating", "idle"], "the mobile/explicit-stop lifecycle has one bounded utterance path");

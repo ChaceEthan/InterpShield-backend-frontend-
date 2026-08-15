@@ -83,4 +83,18 @@ assert.match(appSource, /This browser does not support sharing tab or system aud
 assert.match(appSource, /<AudioSourceTabs activeSource=\{audioSource\} disabled=\{isRecording\} onChange=\{handleAudioSourceChange\} \/>/, "the Microphone / Tab & System Audio switch is rendered on the live screen");
 assert.match(appSource, /isDesktopChrome\(\) && isTabAudioCaptureSupported\(typeof navigator !== "undefined" \? navigator\.mediaDevices : undefined\)/, "the source switch itself is only shown where the browser can actually honor it");
 
+// D: when the user stops sharing the tab/screen from Chrome's own UI, the audio track's
+// `ended` event must trigger a real, visible cleanup — not leave the session hanging in
+// "Listening"/"Translating" forever.
+assert.match(appSource, /track\.onended = \(\) => \{/, "the shared audio track's ended event is handled");
+assert.match(appSource, /console\.info\("\[TAB_AUDIO_CAPTURE\]", \{\s*event: "track_ended",\s*audioTracks: stream\.getAudioTracks\(\)\.length,\s*trackReadyState: track\.readyState,\s*muted: track\.muted,\s*enabled: track\.enabled\s*\}\);/, "ending the shared source logs track diagnostics without any sensitive data");
+assert.match(appSource, /scheduleAudioRecovery\("track_ended"\);\s*\};\s*\}/, "track ended routes through the same controlled recovery path used for any other capture failure, which fully cleans up and returns to idle");
+assert.match(appSource, /isTabSource \? "Tab\/system audio sharing stopped\." : "Microphone stopped unexpectedly\."/, "the recovery message correctly names the tab/system audio source instead of always blaming the microphone");
+
+// E: after a Tab/System Audio session ends (however it ended), starting a fresh Microphone
+// session must not be blocked by any leftover tab-session state — startSession() always
+// re-reads the currently selected source and re-initializes every generation-scoped ref.
+assert.match(appSource, /const activeAudioSource = audioSourceRef\.current;/, "each new session re-reads the current source selection instead of reusing a stale one");
+assert.match(appSource, /const recordingGeneration = activeRecordingGenerationRef\.current \+ 1;/, "every explicit Start (mic or tab, in either order) begins a fresh, independent generation");
+
 console.log("Tab/system audio capture regression tests passed.");

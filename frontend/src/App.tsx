@@ -278,9 +278,11 @@ const HISTORY_PERSIST_DEBOUNCE_MS = 250;
 const DUBBING_UTTERANCE_TTL_MS = 15000;
 const MIN_MEDIA_CHUNK_BYTES = 96;
 const MIN_AUDIO_CHUNK_INTERVAL_MS = 45;
+const MAX_CONTAINER_HEADER_RETRIES = 3;
 const VAD_POLL_INTERVAL_MS = 30;
 const FINAL_CHUNK_ACK_TIMEOUT_MS = 2500;
 const RECORDING_DRAIN_TIMEOUT_MS = 8000;
+const UTTERANCE_RECOVERY_TIMEOUT_MS = 8000;
 const MAX_SOCKET_RECONNECT_ATTEMPTS = 8;
 const CAPTION_WATCHDOG_MS = 12000;
 const isDesktopChrome = () => typeof navigator !== "undefined" && /Chrome\//i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent);
@@ -1536,6 +1538,7 @@ export default function App() {
   const audioStreamGenerationRef = useRef(1);
   const pendingAudioStreamGenerationRef = useRef(1);
   const awaitingContainerHeaderRef = useRef(true);
+  const containerHeaderRetryCountRef = useRef(0);
   const recorderGenerationRestartRef = useRef(false);
   const lastAudioChunkSentAtRef = useRef(0);
   const queuedAudioChunksRef = useRef<AudioChunkPayload[]>([]);
@@ -1545,6 +1548,7 @@ export default function App() {
   const audioRestartAttemptsRef = useRef(0);
   const silenceTimerRef = useRef<number | null>(null);
   const drainTimeoutRef = useRef<number | null>(null);
+  const utteranceRecoveryTimeoutRef = useRef<number | null>(null);
   const awaitingFinalTranscriptRef = useRef(false);
   const drainPendingLanguagesRef = useRef<Set<string>>(new Set());
   const finishDrainRef = useRef<(reason: "processed" | "timeout") => void>(() => undefined);
@@ -2206,6 +2210,8 @@ export default function App() {
     utteranceBoundaryRef.current = null;
     if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
     captionWatchdogTimerRef.current = null;
+    if (utteranceRecoveryTimeoutRef.current) window.clearTimeout(utteranceRecoveryTimeoutRef.current);
+    utteranceRecoveryTimeoutRef.current = null;
     vadControllerRef.current.stop();
     pendingSpeechChunksRef.current = [];
     getAudioLevelRef.current = () => 0;
@@ -2299,6 +2305,26 @@ export default function App() {
   }, [cleanupMedia, refreshMe]);
   finishDrainRef.current = finishDrain;
 
+  // Desktop's continue-listening drain never destroys the recorder/session, so it can't rely
+  // on finishDrain's teardown-based timeout to recover from an utterance whose final
+  // transcript never arrives (e.g. Deepgram genuinely found no speech to transcribe). Without
+  // this, awaitingFinalTranscriptRef would stay stuck forever, permanently blocking every
+  // later utterance's beginDrain call and leaving the card frozen on a non-"ready" status.
+  const recoverStuckUtterance = useCallback((generation: number) => {
+    utteranceRecoveryTimeoutRef.current = null;
+    if (activeRecordingGenerationRef.current !== generation || !awaitingFinalTranscriptRef.current) return;
+    console.warn("[UTTERANCE_RECOVERY_TIMEOUT]", { recordingGeneration: generation, message: "No final transcript arrived for this utterance; resuming listening without blocking later utterances." });
+    awaitingFinalTranscriptRef.current = false;
+    setAwaitingFinalTranscript(false);
+    drainPendingLanguagesRef.current.clear();
+    setTranslationsPending([]);
+    const readyStatuses = Object.fromEntries(targetLanguagesRef.current.map((language) => [language, "ready" as TranslationLifecycleState]));
+    setTranslationStatuses(readyStatuses);
+    setTranslationDiagnostics({});
+    setStatus("listening");
+    setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
+  }, []);
+
   const beginDrain = useCallback((reason = "vad_sustained_silence", generation = activeRecordingGenerationRef.current) => {
     if (!recordingRef.current || awaitingFinalTranscriptRef.current) return false;
     if (generation !== activeRecordingGenerationRef.current) return false;
@@ -2329,6 +2355,10 @@ export default function App() {
     if (continueListening && recorderWasRecording) {
       // The recorder's onstop handler restarts capture into the same generation/session
       // once the just-finished utterance's final chunk is flushed; nothing else to tear down.
+      // A bounded safety timeout still recovers this specific utterance's pending state if
+      // Deepgram never produces a final transcript for it (see recoverStuckUtterance above).
+      if (utteranceRecoveryTimeoutRef.current) window.clearTimeout(utteranceRecoveryTimeoutRef.current);
+      utteranceRecoveryTimeoutRef.current = window.setTimeout(() => recoverStuckUtterance(generation), UTTERANCE_RECOVERY_TIMEOUT_MS);
       return true;
     }
     // continueListening was requested but the recorder was not actively capturing, so onstop
@@ -2348,14 +2378,21 @@ export default function App() {
     vadControllerRef.current.stop();
     drainTimeoutRef.current = window.setTimeout(() => finishDrain("timeout"), RECORDING_DRAIN_TIMEOUT_MS);
     return true;
-  }, [finishDrain]);
+  }, [finishDrain, recoverStuckUtterance]);
 
   const scheduleAudioRecovery = useCallback((reason: string) => {
     const phase = utteranceLifecycleRef.current.snapshot().phase;
     if (!recordingRef.current || phase === "draining" || phase === "finalizing") return;
     logFrontendDebug("audio", "AUDIO_RECOVERY_BLOCKED", { reason, recordingGeneration: activeRecordingGenerationRef.current });
-    setAudioDiagnostic({ state: "failed", message: "Microphone stopped unexpectedly", lastRestartReason: reason });
-    setAlert("Microphone stopped unexpectedly. Press the microphone to try again.");
+    const isTabSource = audioSourceRef.current === "tab";
+    const failureMessage = reason === "track_ended"
+      ? (isTabSource ? "Tab/system audio sharing stopped." : "Microphone stopped unexpectedly.")
+      : (isTabSource ? "Tab/system audio capture stopped unexpectedly." : "Microphone stopped unexpectedly.");
+    const alertMessage = isTabSource
+      ? `${failureMessage} Select Tab / System Audio and press the microphone to start a new session.`
+      : `${failureMessage} Press the microphone to try again.`;
+    setAudioDiagnostic({ state: "failed", message: failureMessage, lastRestartReason: reason });
+    setAlert(alertMessage);
     cleanupMedia({ stopReason: reason });
     socketRef.current?.emit("end_session", { reason });
     setStatus("idle");
@@ -2776,6 +2813,10 @@ export default function App() {
       console.info("[DESKTOP_PIPELINE_SPEECH_FINAL]", { sessionId, jobId, sequence, chars: originalText.length });
       const transcriptEventKey = `${sessionId || "session"}:${jobId ?? "job"}:${sequence ?? "sequence"}`;
       if (!originalText || transcriptEventKey === lastFinalTranscriptEventKeyRef.current) return;
+      if (utteranceRecoveryTimeoutRef.current) {
+        window.clearTimeout(utteranceRecoveryTimeoutRef.current);
+        utteranceRecoveryTimeoutRef.current = null;
+      }
       if (detectedLanguage) setDetectedLanguage(detectedLanguage);
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
       trackLatency(latencyMs, provider);
@@ -3339,6 +3380,7 @@ export default function App() {
     recorderStartedForGenerationRef.current = null;
     recorderStoppedForGenerationRef.current = null;
     finalizationEmittedForGenerationRef.current = null;
+    containerHeaderRetryCountRef.current = 0;
     activeSessionIdRef.current = "";
     lastVadSilenceDurationRef.current = 0;
     utteranceLifecycleRef.current.start({ now: Date.now(), recordingGeneration, sessionId: clientSessionIdRef.current });
@@ -3397,6 +3439,7 @@ export default function App() {
     }
 
     const activeAudioSource = audioSourceRef.current;
+    console.info("[INPUT_SOURCE_SELECTED]", { source: activeAudioSource, desktopChrome: isDesktopChrome(), recordingGeneration });
     if (activeAudioSource === "tab" && !isTabAudioCaptureSupported(navigator.mediaDevices)) {
       sessionActionInFlightRef.current = false;
       startInFlightRef.current = false;
@@ -3470,6 +3513,21 @@ export default function App() {
         setMicrophoneAvailable(true);
         void refreshMicrophones();
       }
+      for (const track of stream.getAudioTracks()) {
+        const settings = track.getSettings?.() || {};
+        console.info("[INPUT_AUDIO_TRACK]", {
+          source: activeAudioSource,
+          label: track.label,
+          readyState: track.readyState,
+          enabled: track.enabled,
+          muted: track.muted,
+          sampleRate: settings.sampleRate,
+          channelCount: settings.channelCount,
+          echoCancellation: settings.echoCancellation,
+          noiseSuppression: settings.noiseSuppression,
+          autoGainControl: settings.autoGainControl
+        });
+      }
 
       const enhancedAudio = createAmplifiedAudioStream(stream);
       getAudioLevelRef.current = enhancedAudio.getAudioLevel;
@@ -3506,9 +3564,29 @@ export default function App() {
         webAudio: Boolean(enhancedAudio.audioContext),
         deviceLabel
       });
+      console.info("[MEDIARECORDER_FORMAT]", {
+        source: activeAudioSource,
+        requestedMimeType: mimeType,
+        actualMimeType: recorder.mimeType,
+        audioBitsPerSecond: (recorder as MediaRecorder & { audioBitsPerSecond?: number }).audioBitsPerSecond,
+        recorderSource: recorderSetup.source,
+        chunkIntervalMs: audioChunkMsRef.current,
+        recordingGeneration
+      });
 
       for (const track of stream.getAudioTracks()) {
-        track.onended = () => scheduleAudioRecovery("track_ended");
+        track.onended = () => {
+          if (activeAudioSource === "tab") {
+            console.info("[TAB_AUDIO_CAPTURE]", {
+              event: "track_ended",
+              audioTracks: stream.getAudioTracks().length,
+              trackReadyState: track.readyState,
+              muted: track.muted,
+              enabled: track.enabled
+            });
+          }
+          scheduleAudioRecovery("track_ended");
+        };
       }
 
       const sendCapturedChunk = (chunk: Omit<AudioChunkPayload, "sequence">) => {
@@ -3558,6 +3636,16 @@ export default function App() {
               if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
               captionWatchdogTimerRef.current = null;
             }
+            if (sequenceRef.current % 25 === 0) {
+              console.info("[DESKTOP_AUDIO_LEVEL]", {
+                audioLevel,
+                noiseFloor: vadControllerRef.current.getNoiseFloor(),
+                threshold: speechSnapshot.threshold,
+                speechLikeSample: speechSnapshot.speechLikeSample,
+                meaningfulSpeechDetected: speechSnapshot.meaningfulSpeechDetected,
+                bytes: event.data.size
+              });
+            }
           }
           const elapsedSinceLastChunk = capturedAt - lastAudioChunkSentAtRef.current;
           if (elapsedSinceLastChunk < MIN_AUDIO_CHUNK_INTERVAL_MS && audioLevel < 0.002) return;
@@ -3566,11 +3654,27 @@ export default function App() {
           if (isGenerationHeader) {
             signature = containerSignature(await event.data.slice(0, 16).arrayBuffer());
             if (!signature.valid) {
-              console.error("[AUDIO_CONTAINER_HEADER_INVALID]", { mimeType: recorderMimeType, streamGeneration: audioStreamGenerationRef.current, signature: signature.hex });
+              console.error("[AUDIO_CONTAINER_HEADER_INVALID]", { mimeType: recorderMimeType, streamGeneration: audioStreamGenerationRef.current, signature: signature.hex, retryCount: containerHeaderRetryCountRef.current });
+              // A missing/invalid header right after a desktop continue-listening restart is a
+              // transient MediaRecorder timing hiccup, not proof the whole capture pipeline is
+              // broken: retry the in-place restart a bounded number of times before treating it
+              // as a real failure that needs the full session torn down.
+              if (isDesktopChrome() && containerHeaderRetryCountRef.current < MAX_CONTAINER_HEADER_RETRIES && recordingRef.current && !explicitStopRequestedRef.current) {
+                containerHeaderRetryCountRef.current += 1;
+                console.warn("[AUDIO_CONTAINER_HEADER_RETRY]", { attempt: containerHeaderRetryCountRef.current, maxAttempts: MAX_CONTAINER_HEADER_RETRIES, streamGeneration: audioStreamGenerationRef.current });
+                continueListeningAfterStopRef.current = true;
+                if (recorder.state === "recording" && recorderStoppedForGenerationRef.current !== activeRecordingGenerationRef.current) {
+                  recorderStoppedForGenerationRef.current = activeRecordingGenerationRef.current;
+                  recorderStopReasonRef.current = "container_header_retry";
+                  recorder.stop();
+                }
+                return;
+              }
               scheduleAudioRecovery("container_header_missing");
               return;
             }
             awaitingContainerHeaderRef.current = false;
+            containerHeaderRetryCountRef.current = 0;
           }
           const chunk = {
             audio: event.data,

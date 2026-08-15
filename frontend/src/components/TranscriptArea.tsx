@@ -1,5 +1,6 @@
 import { Languages, Volume2 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
+import { translationPlaceholder } from "../translationLifecycle.mjs";
 
 export interface TranscriptTranslationEntry {
   language: string;
@@ -90,7 +91,7 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
                   </span>
                 </div>
                 <p className="min-h-16 whitespace-pre-wrap break-words text-base font-semibold leading-7 text-gray-950">
-                  {entry.text || (isRecording ? "Translating..." : "Translation will appear here.")}
+                  {entry.text || translationPlaceholder(entry.state, isRecording)}
                 </p>
                 {entry.diagnostic && (
                   <pre className="mt-3 whitespace-pre-wrap break-words rounded-lg border border-red-200 bg-white/80 p-3 text-xs font-semibold leading-5 text-red-800">

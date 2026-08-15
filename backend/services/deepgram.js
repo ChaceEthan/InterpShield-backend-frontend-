@@ -292,6 +292,15 @@ export const createDeepgramSession = ({
       const now = Date.now();
       const lastActivityAt = Math.max(health.lastMessageAt || 0, health.lastTranscriptAt || 0, health.lastOpenAt || 0);
       const audioActive = health.lastAudioSentAt && now - health.lastAudioSentAt < DEEPGRAM_STALL_MS * 2;
+      console.info("[DEEPGRAM_AUDIO_CONTINUITY]", {
+        socketGeneration: connectionGeneration,
+        audioActive,
+        sentChunks: health.sentChunks,
+        transcripts: health.transcripts,
+        msSinceLastAudio: health.lastAudioSentAt ? now - health.lastAudioSentAt : null,
+        msSinceLastMessage: health.lastMessageAt ? now - health.lastMessageAt : null,
+        msSinceLastTranscript: health.lastTranscriptAt ? now - health.lastTranscriptAt : null
+      });
 
       if (audioActive && lastActivityAt && now - lastActivityAt > DEEPGRAM_STALL_MS) {
         health.stallDetectedAt = now;
@@ -394,10 +403,22 @@ export const createDeepgramSession = ({
       const transcript = alternative?.transcript?.trim();
 
       if (!transcript) {
+        // Deepgram received and processed real audio but found no recognizable speech in this
+        // window (silence, noise-floor-only audio, or audio too quiet to transcribe). This is
+        // NOT a pipeline failure by itself; it's the expected result for genuinely non-speech
+        // audio. Logged explicitly so it's distinguishable from audio never reaching Deepgram.
+        console.info("[DEEPGRAM_RESULTS_EMPTY]", {
+          socketGeneration: generation,
+          isFinal: Boolean(message.is_final),
+          speechFinal: Boolean(message.speech_final),
+          duration: message.duration,
+          start: message.start
+        });
         return;
       }
 
       console.info(message.is_final ? "[DEEPGRAM_FINAL_TRANSCRIPT]" : "[DEEPGRAM_PARTIAL_TRANSCRIPT]", { socketGeneration: generation, chars: transcript.length, speechFinal: Boolean(message.speech_final) });
+      console.info(message.is_final ? "[DEEPGRAM_FINAL]" : "[DEEPGRAM_INTERIM]", { socketGeneration: generation, chars: transcript.length, speechFinal: Boolean(message.speech_final) });
 
       if (process.env.NODE_ENV !== "production") {
         console.debug(message.is_final ? "[DEEPGRAM_FINAL_RECEIVED]" : "[DEEPGRAM_INTERIM_RECEIVED]", {

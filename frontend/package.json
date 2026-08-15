@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "lint": "tsc -b --noEmit",
     "clean": "rimraf dist",
-    "test": "node tests/vadController.test.mjs && node tests/recordingFinalization.test.mjs && node tests/mediaRecorderFormat.test.mjs && node tests/adminDubbingPricing.test.mjs && node tests/tabAudioSource.test.mjs && node tests/trialUsage.test.mjs"
+    "test": "node tests/vadController.test.mjs && node tests/recordingFinalization.test.mjs && node tests/mediaRecorderFormat.test.mjs && node tests/adminDubbingPricing.test.mjs && node tests/tabAudioSource.test.mjs && node tests/trialUsage.test.mjs && node tests/stuckTranslating.test.mjs"
   },
   "engines": {
     "node": "20.x"
