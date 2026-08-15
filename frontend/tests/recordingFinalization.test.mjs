@@ -41,10 +41,13 @@ lifecycle.noteDubbingSubmitted("fr");
 assert.equal(lifecycle.snapshot().phase, "idle", "translated/Dubbed utterance returns the microphone button to idle");
 assert.deepEqual(sessionClosed, ["processed"], "backend closes only after valid transcript, translations, and Dubbing handoff");
 
-// Each later press owns a fresh generation and behaves identically.
+// Each later press owns a fresh generation and behaves identically. Mobile presses the mic,
+// completes an utterance, and returns to idle — the user must be able to repeat this at least
+// 5 times in a row, each cycle fully independent of the last.
+const MOBILE_CYCLE_COUNT = 5;
 const starts = [], stops = [];
 const recorder = createRecorderGenerationController({ onStart: (event) => starts.push(event), onStop: (event) => stops.push(event) });
-for (const expectedGeneration of [1, 2, 3]) {
+for (let expectedGeneration = 1; expectedGeneration <= MOBILE_CYCLE_COUNT; expectedGeneration += 1) {
   assert.equal(recorder.explicitStart(), expectedGeneration, `press ${expectedGeneration} creates a fresh generation`);
   assert.equal(recorder.sessionReady(expectedGeneration - 1), false, "stale session acknowledgement is ignored");
   assert.equal(recorder.sessionReady(expectedGeneration), true, "current session acknowledgement starts capture once");
@@ -52,11 +55,11 @@ for (const expectedGeneration of [1, 2, 3]) {
   assert.equal(recorder.beginDrain(), true, "current generation can enter draining once");
   assert.equal(recorder.beginDrain(), false, "stale or duplicate drain cannot stop capture twice");
   assert.equal(recorder.finish("processed"), true, "completed drain releases this recorder generation");
-  assert.equal(recorder.snapshot().phase, "idle", "there is no automatic return to continuous listening");
+  assert.equal(recorder.snapshot().phase, "idle", "there is no automatic return to continuous listening — mobile returns to idle, ready for the next press");
 }
-assert.equal(starts.length, 3, "three explicit presses produce exactly three recorder starts");
-assert.equal(stops.length, 3, "each completed utterance stops its recorder exactly once");
-assert.deepEqual(stops.map(({ generation }) => generation), [1, 2, 3], "late events cannot affect the next generation");
+assert.equal(starts.length, MOBILE_CYCLE_COUNT, "five explicit presses produce exactly five recorder starts");
+assert.equal(stops.length, MOBILE_CYCLE_COUNT, "each of the five completed utterances stops its recorder exactly once");
+assert.deepEqual(stops.map(({ generation }) => generation), Array.from({ length: MOBILE_CYCLE_COUNT }, (_, index) => index + 1), "late events cannot affect the next generation, across all five cycles");
 
 const mobileLifecycle = createRecordingStateMachine({ silenceMs: 1400, setTimer(callback, delay) { const id = ++timerId; timers.set(id, { callback, delay }); return id; }, clearTimer(id) { timers.delete(id); } });
 mobileLifecycle.start(); mobileLifecycle.noteMeaningfulSpeech(); mobileLifecycle.noteSilence();

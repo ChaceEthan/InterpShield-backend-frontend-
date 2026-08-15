@@ -44,6 +44,7 @@ import { createDubbingLifecycle } from "./audio/dubbingLifecycle.mjs";
 import { containerSignature, selectDeepgramMediaRecorderMimeType } from "./audio/mediaRecorderFormat.mjs";
 import { createMeaningfulSpeechGate } from "./audio/meaningfulSpeechGate.mjs";
 import { isTabAudioCaptureSupported, requestTabAudioStream } from "./audio/tabAudioSource.mjs";
+import { classifyRecorderStop, isTrackEndExpected, shouldRecoverFromRecorderStop } from "./audio/trackEndPolicy.mjs";
 import { isAdminRole, normalizeAuthUser } from "./auth/roles.mjs";
 import { PLAN_CATALOG, PRICING_PLAN_IDS, yearlyMonthlyPrice } from "../../shared/plans.mjs";
 import {
@@ -1655,7 +1656,7 @@ export default function App() {
           : status === "paused"
             ? "Paused — start speaking"
             : status === "idle"
-              ? "Microphone stopped"
+              ? (audioDiagnostic.state === "failed" ? "Microphone stopped" : "Ready")
       : {
           ready: "Ready",
           connecting: "Connecting",
@@ -3576,6 +3577,38 @@ export default function App() {
 
       for (const track of stream.getAudioTracks()) {
         track.onended = () => {
+          // A track ending is only a real failure if InterpShield still expects it to be
+          // live. Every intentional stop/replacement path (explicit Stop, mobile utterance
+          // completion, desktop generation restart, cleanupMedia teardown) already flips one
+          // of these flags/refs before it ever calls track.stop(), so this is a defense-in-
+          // depth check against exactly one signal being missed, not a guess.
+          const phase = utteranceLifecycleRef.current.snapshot().phase;
+          const isCurrentGeneration = activeRecordingGenerationRef.current === recordingGeneration;
+          const isCurrentStream = streamRef.current === stream;
+          const recordingExpected = recordingRef.current;
+          const intentionalStopInProgress = explicitStopRequestedRef.current || stopInFlightRef.current;
+          const recorderTransitionInProgress = continueListeningAfterStopRef.current || recorderGenerationRestartRef.current;
+          const expected = isTrackEndExpected({
+            isCurrentGeneration,
+            isCurrentStream,
+            recordingExpected,
+            intentionalStopInProgress,
+            recorderTransitionInProgress,
+            phase
+          });
+          console.info("[AUDIO_TRACK_ENDED]", {
+            expected,
+            source: activeAudioSource,
+            generation: recordingGeneration,
+            activeGeneration: activeRecordingGenerationRef.current,
+            phase,
+            recordingExpected,
+            isCurrentGeneration,
+            isCurrentStream,
+            intentionalStopInProgress,
+            recorderTransitionInProgress
+          });
+          if (expected) return;
           if (activeAudioSource === "tab") {
             console.info("[TAB_AUDIO_CAPTURE]", {
               event: "track_ended",
@@ -3763,8 +3796,21 @@ export default function App() {
         }
         continueListeningAfterStopRef.current = false;
         stopInFlightRef.current = false;
-        if (recordingRef.current && status !== "stopping") {
-          scheduleAudioRecovery("recorder_stopped");
+        // recorderStoppedForGenerationRef is set by our own code immediately before every
+        // intentional recorder.stop() call (beginDrain, cleanupMedia). If it doesn't match
+        // the active generation, this recorder stopped on its own — a genuine unexpected
+        // failure, not one of the tracked reasons above. `status` (React state) is not used
+        // here: it's captured in this closure once at session start and never updates, so it
+        // can never reliably distinguish an expected stop from an unexpected one.
+        const stopWasIntentional = recorderStoppedForGenerationRef.current === activeRecordingGenerationRef.current;
+        console.info("[MEDIARECORDER_STOP_CLASSIFIED]", {
+          reason: classifyRecorderStop({ stopWasIntentional, trackedReason: recorderStopReasonRef.current }),
+          stopWasIntentional,
+          recordingExpected: recordingRef.current,
+          recordingGeneration: activeRecordingGenerationRef.current
+        });
+        if (shouldRecoverFromRecorderStop({ recordingExpected: recordingRef.current, stopWasIntentional })) {
+          scheduleAudioRecovery("unexpected_recorder_stop");
         }
       };
 
