@@ -81,7 +81,7 @@ const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8
 // The status label must not call a completely normal idle state a failure. `audioDiagnostic`
 // (a ref-backed piece of state set explicitly by the failure paths) is the real signal for
 // whether idle means "successfully finished" vs "genuinely stopped unexpectedly".
-assert.match(appSource, /status === "idle"\s*\?\s*\(audioDiagnostic\.state === "failed" \? "Microphone stopped" : "Ready"\)/, 'the idle status label only says "Microphone stopped" for a real recorded failure, not for every successful completion');
+assert.match(appSource, /status === "idle"\s*\?\s*\(audioDiagnostic\.state === "failed"\s*\?\s*audioDiagnostic\.message\s*:\s*\(audioSource === "tab" \? "Ready to share tab audio" : "Ready"\)\)/, 'the idle status label only reports a failure message for a real recorded failure, not for every successful completion, and distinguishes "Ready" (microphone) from "Ready to share tab audio" (tab/system audio)');
 assert.doesNotMatch(appSource, /status === "idle"\s*\n?\s*\?\s*"Microphone stopped"\s*\n?\s*:/, 'the old unconditional "idle -> Microphone stopped" mapping is gone');
 
 // The actual wiring: track.onended and recorder.onstop both route through the tested policy

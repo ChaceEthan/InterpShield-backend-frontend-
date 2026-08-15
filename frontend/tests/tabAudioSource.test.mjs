@@ -53,7 +53,7 @@ await assert.rejects(
   };
   await assert.rejects(
     () => requestTabAudioStream(mediaDevices),
-    (error) => error.name === "TabAudioNoTrackError" && error.message === "Shared source has no audio. In Chrome, choose the browser tab containing the video and enable Share tab audio.",
+    (error) => error.name === "TabAudioNoTrackError" && error.message === "Shared source has no audio. Select the browser tab containing the video and enable Share tab audio.",
     "no shared audio track produces the exact required controlled error message instead of silently recording silence"
   );
   assert.equal(videoTrack.stopped, true, "the video track is released even when no audio was shared");
@@ -95,7 +95,7 @@ assert.match(appSource, /isDesktopChrome\(\) && isTabAudioCaptureSupported\(type
 assert.match(appSource, /track\.onended = \(\) => \{/, "the shared audio track's ended event is handled");
 assert.match(appSource, /console\.info\("\[TAB_AUDIO_CAPTURE\]", \{\s*event: "track_ended",\s*audioTracks: stream\.getAudioTracks\(\)\.length,\s*trackReadyState: track\.readyState,\s*muted: track\.muted,\s*enabled: track\.enabled\s*\}\);/, "ending the shared source logs track diagnostics without any sensitive data");
 assert.match(appSource, /scheduleAudioRecovery\("track_ended"\);\s*\};\s*\}/, "track ended routes through the same controlled recovery path used for any other capture failure, which fully cleans up and returns to idle");
-assert.match(appSource, /isTabSource \? "Tab\/system audio sharing stopped\." : "Microphone stopped unexpectedly\."/, "the recovery message correctly names the tab/system audio source instead of always blaming the microphone");
+assert.match(appSource, /isTabSource \? "Tab\/system audio sharing stopped unexpectedly\." : "Microphone stopped unexpectedly\."/, "the recovery message correctly names the tab/system audio source instead of always blaming the microphone");
 
 // E: after a Tab/System Audio session ends (however it ended), starting a fresh Microphone
 // session must not be blocked by any leftover tab-session state — startSession() always

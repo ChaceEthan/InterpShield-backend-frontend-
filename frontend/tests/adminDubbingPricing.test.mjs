@@ -36,7 +36,7 @@ assert.match(appSource, /EXPECTED_SPEECH_CANCELLATIONS = new Set\(\["interrupted
 assert.match(appSource, /if \(isExpectedSpeechCancellation\(reason\)\)[\s\S]*?onError\(\)/, "expected cancellation settles the queue without displaying a new failure");
 assert.match(appSource, /const createdAt = Date\.now\(\)/, "completed translations are fresh when submitted to speech synthesis");
 assert.doesNotMatch(appSource, /recordingRef\.current = isRecording/, "dubbing UI status cannot reactivate a stopped microphone");
-assert.match(appSource, /recordingRef\.current = true;\s*recorder\.start/, "actual MediaRecorder startup activates the microphone ref");
+assert.match(appSource, /recordingRef\.current = true;\s*console\.info\("\[MEDIARECORDER_START_REQUEST\]"[\s\S]{0,200}?recorder\.start/, "actual MediaRecorder startup activates the microphone ref");
 assert.match(appSource, /socketRef\.current\?\.emit\("audio_utterance_end"/, "auto-stop requests backend finalization after capture has stopped");
 assert.match(appSource, /cleanupMedia\(\{ preserveTranslationPipeline: true, stopReason: `drain_\$\{reason\}`/, "capture cleanup preserves valid translation and Dubbing work while draining completes");
 assert.match(appSource, /const speakTranslatedCaption[\s\S]*?stopDubbingPlayback\(false\)/, "manual translated-card replay stops current speech without erasing automatic deduplication");

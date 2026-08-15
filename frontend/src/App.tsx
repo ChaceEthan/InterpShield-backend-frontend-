@@ -1653,7 +1653,9 @@ export default function App() {
           : status === "paused"
             ? "Paused — start speaking"
             : status === "idle"
-              ? (audioDiagnostic.state === "failed" ? "Microphone stopped" : "Ready")
+              ? (audioDiagnostic.state === "failed"
+                  ? audioDiagnostic.message
+                  : (audioSource === "tab" ? "Ready to share tab audio" : "Ready"))
       : {
           ready: "Ready",
           connecting: "Connecting",
@@ -2386,9 +2388,7 @@ export default function App() {
     if (!recordingRef.current || phase === "draining" || phase === "finalizing") return;
     logFrontendDebug("audio", "AUDIO_RECOVERY_BLOCKED", { reason, recordingGeneration: activeRecordingGenerationRef.current });
     const isTabSource = audioSourceRef.current === "tab";
-    const failureMessage = reason === "track_ended"
-      ? (isTabSource ? "Tab/system audio sharing stopped." : "Microphone stopped unexpectedly.")
-      : (isTabSource ? "Tab/system audio capture stopped unexpectedly." : "Microphone stopped unexpectedly.");
+    const failureMessage = isTabSource ? "Tab/system audio sharing stopped unexpectedly." : "Microphone stopped unexpectedly.";
     const alertMessage = isTabSource
       ? `${failureMessage} Select Tab / System Audio and press the microphone to start a new session.`
       : `${failureMessage} Press the microphone to try again.`;
@@ -2674,8 +2674,9 @@ export default function App() {
         awaitingContainerHeaderRef.current = true;
         recorderGenerationRestartRef.current = false;
         const previousState = recorder.state;
+        console.info("[MEDIARECORDER_START_REQUEST]", { reason: "deepgram_generation_change", recordingGeneration: activeRecordingGenerationRef.current, previousState });
         recorder.start(audioChunkMsRef.current);
-        console.info("[MEDIARECORDER_START]", { reason: "deepgram_generation_change", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, previousState, mimeType: recorder.mimeType, streamGeneration: nextGeneration });
+        console.info("[MEDIARECORDER_STARTED]", { reason: "deepgram_generation_change", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, previousState, mimeType: recorder.mimeType, streamGeneration: nextGeneration });
       }
     };
     socket.on("deepgram_stream_reset", handleDeepgramStreamReset);
@@ -2697,8 +2698,9 @@ export default function App() {
       if (initialReady && recorder?.state === "inactive" && recorderStartedForGenerationRef.current !== readyGeneration) {
         recorderStartedForGenerationRef.current = readyGeneration;
         recordingRef.current = true;
+        console.info("[MEDIARECORDER_START_REQUEST]", { reason: "session_ready", recordingGeneration: readyGeneration, previousState: "inactive" });
         recorder.start(audioChunkMsRef.current);
-        console.info("[MEDIARECORDER_START]", { reason: "session_ready", recordingGeneration: readyGeneration, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, previousState: "inactive", mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
+        console.info("[MEDIARECORDER_STARTED]", { reason: "session_ready", recordingGeneration: readyGeneration, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, previousState: "inactive", mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
         setMicrophoneActive(true);
         setMediaRecorderActive(true);
       } else if (recorder?.state === "paused") {
@@ -3358,21 +3360,34 @@ export default function App() {
   }, [fetchHistory, view]);
 
   const startSession = useCallback(async () => {
-    if (sessionActionInFlightRef.current || startInFlightRef.current || recordingRef.current || utteranceLifecycleRef.current.snapshot().phase !== "idle") return;
+    if (sessionActionInFlightRef.current || startInFlightRef.current || recordingRef.current || utteranceLifecycleRef.current.snapshot().phase !== "idle") {
+      console.warn("[MIC_START_BLOCKED]", {
+        reason: "session_action_in_progress",
+        sessionActionInFlight: sessionActionInFlightRef.current,
+        startInFlight: startInFlightRef.current,
+        recordingActive: recordingRef.current,
+        phase: utteranceLifecycleRef.current.snapshot().phase
+      });
+      return;
+    }
+    console.info("[MIC_START_ENTERED]", { phase: utteranceLifecycleRef.current.snapshot().phase, source: audioSourceRef.current });
     primeSpeechSynthesis();
 
     if (!isAuthed) {
+      console.warn("[MIC_START_BLOCKED]", { reason: "not_authenticated" });
       navigate("login");
       return;
     }
 
     if (user?.role === "user" && user.subscription && !user.subscription.canUseInterpreter) {
+      console.warn("[MIC_START_BLOCKED]", { reason: "trial_exhausted" });
       setAlert("Your 5-minute free trial has ended. Choose a plan to continue using InterpShield.");
       navigate("subscription");
       return;
     }
 
     if (!FRONTEND_CONFIG_DIAGNOSTICS.ok) {
+      console.warn("[MIC_START_BLOCKED]", { reason: "config_invalid" });
       setStatus("error");
       setAlert(FRONTEND_CONFIG_DIAGNOSTICS.errors[0] || "Frontend environment configuration is invalid.");
       return;
@@ -3388,6 +3403,7 @@ export default function App() {
     console.info("[AUDIO_START_REQUEST]", { source: activeAudioSource, platform: isDesktopChrome() ? "desktop" : "mobile", previousStatus: status });
 
     if (!navigator.mediaDevices?.getUserMedia) {
+      console.warn("[MIC_START_BLOCKED]", { reason: "getusermedia_unsupported" });
       setStatus("error");
       setMicrophonePermission("unsupported");
       setMicrophoneAvailable(false);
@@ -3397,6 +3413,7 @@ export default function App() {
     }
 
     if (!("MediaRecorder" in window)) {
+      console.warn("[MIC_START_BLOCKED]", { reason: "mediarecorder_unsupported" });
       setStatus("error");
       setAudioDiagnostic({ state: "failed", message: "Recording unsupported" });
       setAlert("Microphone recording is not supported in this browser.");
@@ -3404,6 +3421,7 @@ export default function App() {
     }
 
     if (activeAudioSource === "tab" && !isTabAudioCaptureSupported(navigator.mediaDevices)) {
+      console.warn("[MIC_START_BLOCKED]", { reason: "tab_audio_unsupported" });
       setStatus("error");
       setAudioDiagnostic({ state: "failed", message: "Tab/system audio capture is unavailable" });
       setAlert("This browser does not support sharing tab or system audio. Switch to Microphone mode to continue.");
@@ -3459,40 +3477,49 @@ export default function App() {
       interimTimerRef.current = null;
     }
 
+    // getUserMedia/getDisplayMedia must be requested as close to the original click as
+    // possible: mobile browsers only honor these permission prompts within a bounded "user
+    // activation" window after a real gesture. Previously this function awaited the socket
+    // connection (which can legitimately take seconds, or up to its 30s timeout, whenever the
+    // socket wasn't already connected — the common case right after login, backgrounding, or
+    // a network hiccup) BEFORE ever calling getUserMedia, which could silently push the media
+    // request past that window on real mobile devices ("sometimes works, sometimes doesn't").
+    // The socket connection is awaited further below, once the stream is already in hand.
+    const connectSocketIfNeeded = async () => {
+      if (socketRef.current?.connected) return;
+      socketRef.current?.connect();
+      await new Promise<void>((resolve, reject) => {
+        const activeSocket = socketRef.current;
+        if (!activeSocket) {
+          reject(new Error("Live socket is unavailable."));
+          return;
+        }
+        if (activeSocket.connected) {
+          resolve();
+          return;
+        }
+
+        const timer = window.setTimeout(() => {
+          activeSocket.off("connect", handleConnect);
+          activeSocket.off("connect_error", handleError);
+          reject(new Error("Live socket connection timed out."));
+        }, 30000);
+        const handleConnect = () => {
+          window.clearTimeout(timer);
+          activeSocket.off("connect_error", handleError);
+          resolve();
+        };
+        const handleError = (error: Error) => {
+          window.clearTimeout(timer);
+          activeSocket.off("connect", handleConnect);
+          reject(error);
+        };
+        activeSocket.once("connect", handleConnect);
+        activeSocket.once("connect_error", handleError);
+      });
+    };
+
     try {
-      if (!socketRef.current?.connected) {
-        socketRef.current?.connect();
-        await new Promise<void>((resolve, reject) => {
-          const activeSocket = socketRef.current;
-          if (!activeSocket) {
-            reject(new Error("Live socket is unavailable."));
-            return;
-          }
-          if (activeSocket.connected) {
-            resolve();
-            return;
-          }
-
-          const timer = window.setTimeout(() => {
-            activeSocket.off("connect", handleConnect);
-            activeSocket.off("connect_error", handleError);
-            reject(new Error("Live socket connection timed out."));
-          }, 30000);
-          const handleConnect = () => {
-            window.clearTimeout(timer);
-            activeSocket.off("connect_error", handleError);
-            resolve();
-          };
-          const handleError = (error: Error) => {
-            window.clearTimeout(timer);
-            activeSocket.off("connect", handleConnect);
-            reject(error);
-          };
-          activeSocket.once("connect", handleConnect);
-          activeSocket.once("connect_error", handleError);
-        });
-      }
-
       const audio = buildAudioConstraints({
         microphoneId,
         echoCancellation,
@@ -3544,6 +3571,10 @@ export default function App() {
         return;
       }
       streamRef.current = stream;
+      // Kick off the socket connection now, in parallel with the WebAudio/MediaRecorder setup
+      // below — it's awaited just before it's actually needed, right before emitting
+      // start_session, so it never delays the getUserMedia/getDisplayMedia call itself.
+      const socketReadyPromise = connectSocketIfNeeded();
       if (activeAudioSource === "microphone") {
         setMicrophonePermission("granted");
         setMicrophoneAvailable(true);
@@ -3584,6 +3615,7 @@ export default function App() {
       recorderGenerationRestartRef.current = false;
       lastHandledDeepgramGenerationRef.current = 1;
       mediaRecorderRef.current = recorder;
+      console.info("[MEDIARECORDER_CREATED]", { recordingGeneration, source: recorderSetup.source, mimeType: recorder.mimeType });
       const deviceLabel = stream.getAudioTracks()[0]?.label || (microphoneId === "default" ? "System default microphone" : "Selected microphone");
       setAudioDiagnostic({
         state: "ready",
@@ -3837,8 +3869,9 @@ export default function App() {
           pendingSpeechChunksRef.current = [];
           awaitingContainerHeaderRef.current = true;
           const previousState = recorder.state;
+          console.info("[MEDIARECORDER_START_REQUEST]", { reason: "deepgram_generation_change_onstop", recordingGeneration: activeRecordingGenerationRef.current, previousState });
           recorder.start(audioChunkMsRef.current);
-          console.info("[MEDIARECORDER_START]", { reason: "deepgram_generation_change", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, previousState, mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
+          console.info("[MEDIARECORDER_STARTED]", { reason: "deepgram_generation_change_onstop", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, previousState, mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
           setMediaRecorderActive(true);
           return;
         }
@@ -3953,6 +3986,13 @@ export default function App() {
       activeSessionPayloadRef.current = sessionPayload;
       shouldRestartSessionOnReconnectRef.current = false;
 
+      await socketReadyPromise;
+      if (activeRecordingGenerationRef.current !== recordingGeneration || explicitStopRequestedRef.current) {
+        sessionActionInFlightRef.current = false;
+        cleanupMedia({ stopReason: "session_start_superseded" });
+        return;
+      }
+
       socketRef.current?.timeout(30000).emit(
         "start_session",
         sessionPayload,
@@ -4040,6 +4080,23 @@ export default function App() {
     }
     void startSession();
   }, [isAuthed, isRecording, startSession, status, stopSession, user?.role, user?.subscription]);
+
+  useEffect(() => {
+    // TranslationPanel's native disabled={isBusy} mirrors status === "stopping" exactly (see
+    // TranslationPanel.tsx). Logging this snapshot on every relevant transition — not only on
+    // click — is what lets a real device report show a button stuck disabled even when no
+    // click ever registered to trigger [MIC_BUTTON_CLICK] in the first place.
+    console.info("[MIC_BUTTON_STATE]", {
+      disabled: status === "stopping",
+      status,
+      recording: isRecording,
+      startInFlight: startInFlightRef.current,
+      stopInFlight: stopInFlightRef.current,
+      sessionActionInFlight: sessionActionInFlightRef.current,
+      awaitingFinalTranscript: awaitingFinalTranscriptRef.current,
+      source: audioSource
+    });
+  }, [status, isRecording, audioSource]);
 
   useEffect(() => {
     // TranslationPanel natively disables the mic button (unclickable, no onClick fires at

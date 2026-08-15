@@ -76,4 +76,50 @@ assert.match(appSource, /utteranceLifecycleRef\.current\.setPhase\("finalizing"\
   assert.equal(recorder.beginDrain(), false, "stale drain requests for an old generation cannot affect the new one before it is even ready");
 }
 
+// THIS TURN'S ROOT-CAUSE FIX: mobile browsers only honor getUserMedia/getDisplayMedia within a
+// bounded "user activation" window after a real click. startSession() previously awaited the
+// socket connection (which can legitimately take seconds, or up to a 30s timeout, right after
+// login/backgrounding/a network hiccup) BEFORE ever requesting media — silently pushing the
+// permission prompt past that window on real devices ("sometimes works, sometimes doesn't").
+// Confirm the media request now happens strictly before the socket connection is awaited.
+{
+  const getUserMediaRequestIndex = startSessionBody.indexOf("[GET_USER_MEDIA_REQUEST]");
+  const getDisplayMediaRequestIndex = startSessionBody.indexOf("[GET_DISPLAY_MEDIA_REQUEST]");
+  const connectSocketDefIndex = startSessionBody.indexOf("const connectSocketIfNeeded = async ()");
+  const socketReadyAwaitIndex = startSessionBody.indexOf("await socketReadyPromise;");
+
+  assert.ok(getUserMediaRequestIndex > -1 && getDisplayMediaRequestIndex > -1 && connectSocketDefIndex > -1 && socketReadyAwaitIndex > -1, "all four markers exist in startSession");
+  assert.ok(connectSocketDefIndex < getUserMediaRequestIndex, "connectSocketIfNeeded is only defined (not yet awaited) before the microphone request");
+  assert.ok(connectSocketDefIndex < getDisplayMediaRequestIndex, "connectSocketIfNeeded is only defined (not yet awaited) before the tab/system audio request");
+  assert.ok(getUserMediaRequestIndex < socketReadyAwaitIndex, "the microphone permission request fires strictly before the socket connection is ever awaited");
+  assert.ok(getDisplayMediaRequestIndex < socketReadyAwaitIndex, "the tab/system audio permission request fires strictly before the socket connection is ever awaited");
+}
+
+// A press that goes stale while the (now-deferred) socket connection is being awaited — e.g.
+// the user hit Stop, or pressed again, while a slow reconnect was in flight — must fully clean
+// up (release the stream/recorder/VAD timers it already acquired) and clear both in-flight
+// flags, exactly like every other early-bailout path in this function. A bare early return here
+// would leave startInFlightRef/sessionActionInFlightRef stuck true forever, permanently wedging
+// the mic button — the exact class of bug this whole file exists to prevent.
+assert.match(
+  appSource,
+  /await socketReadyPromise;\s*if \(activeRecordingGenerationRef\.current !== recordingGeneration \|\| explicitStopRequestedRef\.current\) \{\s*sessionActionInFlightRef\.current = false;\s*cleanupMedia\(\{ stopReason: "session_start_superseded" \}\);\s*return;\s*\}/,
+  "a generation that goes stale while awaiting the deferred socket connection fully cleans up via cleanupMedia and clears sessionActionInFlightRef, instead of leaking a stuck in-flight flag"
+);
+
+// The explicitly requested entry/exit diagnostics exist so a real device report can show
+// exactly how far a press got: whether startSession was even entered, why it was blocked if it
+// was, and the full lifecycle of MediaRecorder creation/start.
+assert.match(appSource, /console\.warn\("\[MIC_START_BLOCKED\]", \{\s*reason: "session_action_in_progress"/, "MIC_START_BLOCKED fires with a reason when the entry guard itself blocks a press");
+assert.match(appSource, /console\.info\("\[MIC_START_ENTERED\]"/, "MIC_START_ENTERED fires once startSession is genuinely running");
+assert.match(appSource, /console\.warn\("\[MIC_START_BLOCKED\]", \{ reason: "not_authenticated" \}\)/, "MIC_START_BLOCKED fires with a reason for the unauthenticated guard");
+assert.match(appSource, /console\.warn\("\[MIC_START_BLOCKED\]", \{ reason: "trial_exhausted" \}\)/, "MIC_START_BLOCKED fires with a reason for the trial-exhausted guard");
+assert.match(appSource, /console\.warn\("\[MIC_START_BLOCKED\]", \{ reason: "getusermedia_unsupported" \}\)/, "MIC_START_BLOCKED fires with a reason for the getUserMedia-unsupported guard");
+assert.match(appSource, /console\.warn\("\[MIC_START_BLOCKED\]", \{ reason: "mediarecorder_unsupported" \}\)/, "MIC_START_BLOCKED fires with a reason for the MediaRecorder-unsupported guard");
+assert.match(appSource, /console\.warn\("\[MIC_START_BLOCKED\]", \{ reason: "tab_audio_unsupported" \}\)/, "MIC_START_BLOCKED fires with a reason for the tab/system-audio-unsupported guard");
+assert.match(appSource, /console\.info\("\[MEDIARECORDER_CREATED\]"/, "MEDIARECORDER_CREATED fires once the recorder is constructed");
+assert.match(appSource, /console\.info\("\[MEDIARECORDER_START_REQUEST\]"/, "MEDIARECORDER_START_REQUEST fires immediately before every recorder.start() call");
+assert.match(appSource, /console\.info\("\[MEDIARECORDER_STARTED\]"/, "MEDIARECORDER_STARTED fires immediately after every recorder.start() call");
+assert.match(appSource, /console\.info\("\[MIC_BUTTON_STATE\]", \{\s*disabled: status === "stopping",\s*status,\s*recording: isRecording,\s*startInFlight: startInFlightRef\.current,\s*stopInFlight: stopInFlightRef\.current,\s*sessionActionInFlight: sessionActionInFlightRef\.current,\s*awaitingFinalTranscript: awaitingFinalTranscriptRef\.current,\s*source: audioSource\s*\}\);/, "MIC_BUTTON_STATE logs the full requested field set on every relevant transition, not only on click");
+
 console.log("Mic button recovery / stale-guard regression tests passed.");
