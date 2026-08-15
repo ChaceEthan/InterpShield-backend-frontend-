@@ -28,6 +28,7 @@ import {
 import { AnimatePresence, motion } from "framer-motion";
 import { io, type Socket } from "socket.io-client";
 import { API, CLIENT_URL, FRONTEND_CONFIG_DIAGNOSTICS, GOOGLE_CLIENT_ID, SOCKET_TRANSPORTS, SOCKET_URL, WS_URL } from "./config/socket";
+import { AudioSourceTabs } from "./components/AudioSourceTabs";
 import { HeroSection } from "./components/HeroSection";
 import { LanguageSelector } from "./components/LanguageSelector";
 import { ModeTabs, type PrivacyMode } from "./components/ModeTabs";
@@ -42,6 +43,7 @@ import { createUtteranceBoundaryController, stableSessionStartTime } from "./aud
 import { createDubbingLifecycle } from "./audio/dubbingLifecycle.mjs";
 import { containerSignature, selectDeepgramMediaRecorderMimeType } from "./audio/mediaRecorderFormat.mjs";
 import { createMeaningfulSpeechGate } from "./audio/meaningfulSpeechGate.mjs";
+import { isTabAudioCaptureSupported, requestTabAudioStream } from "./audio/tabAudioSource.mjs";
 import { isAdminRole, normalizeAuthUser } from "./auth/roles.mjs";
 import { PLAN_CATALOG, PRICING_PLAN_IDS, yearlyMonthlyPrice } from "../../shared/plans.mjs";
 import {
@@ -54,6 +56,7 @@ import {
 
 type View = "landing" | "login" | "signup" | "dashboard" | "pricing" | "subscription" | "history" | "help" | "settings" | "admin-login" | "admin";
 type Mode = "transcribe" | "translate" | "dubbing";
+type AudioSourceMode = "microphone" | "tab";
 type SessionStatus = "idle" | "connecting" | "calibrating" | "listening" | "speaking" | "soft-pause" | "finalizing" | "draining" | "translating" | "paused" | "stopping" | "error";
 type TranslationLifecycleState = "ready" | "queued" | "processing" | "translating" | "retrying" | "translated" | "done" | "failed" | "stale" | "cancelled";
 type TranslationProviderDiagnostic = {
@@ -860,7 +863,20 @@ const createMediaRecorderWithFallback = (preferredStream: MediaStream, fallbackS
   throw new Error(`MediaRecorder could not start with available audio streams. ${errors.slice(-3).join(" | ")}`);
 };
 
-const mediaErrorMessage = (error: unknown) => {
+const mediaErrorMessage = (error: unknown, source: AudioSourceMode = "microphone") => {
+  if (source === "tab") {
+    if (error instanceof Error && (error.name === "TabAudioUnsupportedError" || error.name === "TabAudioNoTrackError")) {
+      return error.message;
+    }
+    if (error instanceof DOMException && ["NotAllowedError", "PermissionDeniedError", "AbortError"].includes(error.name)) {
+      return "Tab/system audio sharing was cancelled. Select a tab and enable \"Share tab audio\" to continue.";
+    }
+    if (error instanceof DOMException && error.name === "NotReadableError") {
+      return "The shared tab or screen audio could not be captured. Try sharing again.";
+    }
+    return "Unable to capture tab/system audio. Check browser support and try again.";
+  }
+
   if (error instanceof DOMException) {
     if (["NotAllowedError", "PermissionDeniedError", "SecurityError"].includes(error.name)) {
       return "Microphone permission denied. Allow microphone access to start live translation.";
@@ -1425,6 +1441,8 @@ export default function App() {
   });
 
   const [mode, setMode] = useState<Mode>("translate");
+  const [audioSource, setAudioSource] = useState<AudioSourceMode>("microphone");
+  const audioSourceRef = useRef<AudioSourceMode>("microphone");
   const [sourceLang, setSourceLang] = useState("en");
   const [preferredProvider, setPreferredProvider] = useState<string>("auto");
   const [targetLanguages, setTargetLanguages] = useState<string[]>(DEFAULT_TARGET_LANGUAGES);
@@ -1529,8 +1547,8 @@ export default function App() {
   const awaitingFinalTranscriptRef = useRef(false);
   const drainPendingLanguagesRef = useRef<Set<string>>(new Set());
   const finishDrainRef = useRef<(reason: "processed" | "timeout") => void>(() => undefined);
-  const startSessionRef = useRef<() => Promise<void>>(async () => undefined);
   const explicitStopRequestedRef = useRef(false);
+  const continueListeningAfterStopRef = useRef(false);
   const lastServerHeartbeatAtRef = useRef(0);
   const sessionStartedAtRef = useRef<number | null>(null);
   const lastInterimRef = useRef("");
@@ -1952,6 +1970,15 @@ export default function App() {
   }, [mode]);
 
   useEffect(() => {
+    audioSourceRef.current = audioSource;
+  }, [audioSource]);
+
+  useEffect(() => {
+    const tabSupported = isDesktopChrome() && isTabAudioCaptureSupported(typeof navigator !== "undefined" ? navigator.mediaDevices : undefined);
+    if (audioSource === "tab" && !tabSupported) setAudioSource("microphone");
+  }, [audioSource]);
+
+  useEffect(() => {
     tokenRef.current = token;
   }, [token]);
 
@@ -2254,16 +2281,10 @@ export default function App() {
     activeBackendSessionIdRef.current = "";
     activeBackendTranslationJobIdRef.current = "";
     sessionActionInFlightRef.current = false;
-    utteranceLifecycleRef.current.resetToIdle();
-    stopInFlightRef.current = false;
-    const shouldContinueListening = reason === "processed" && isDesktopChrome() && !explicitStopRequestedRef.current;
-    if (shouldContinueListening) {
-      console.info("[UTTERANCE_FINALIZED]", { recordingGeneration: activeRecordingGenerationRef.current, nextAction: "auto_restart_listening" });
-      void startSessionRef.current();
-      return;
-    }
     setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
     setStatus("idle");
+    utteranceLifecycleRef.current.resetToIdle();
+    stopInFlightRef.current = false;
   }, [cleanupMedia]);
   finishDrainRef.current = finishDrain;
 
@@ -2272,15 +2293,21 @@ export default function App() {
     if (generation !== activeRecordingGenerationRef.current) return false;
     const transition = utteranceLifecycleRef.current.requestFinalization(reason, generation);
     if (!transition.accepted) return false;
+    // Desktop live mode keeps the same MediaRecorder/stream/socket session alive across
+    // utterances: only a sustained-silence auto-finalization (not an explicit Stop) resets
+    // to listen for the next sentence instead of tearing the session down.
+    const continueListening = reason === "vad_sustained_silence" && isDesktopChrome() && !explicitStopRequestedRef.current;
     awaitingFinalTranscriptRef.current = true;
     setAwaitingFinalTranscript(true);
     drainPendingLanguagesRef.current.clear();
     setTranslationsPending([]);
-    setStatus("draining");
-    setAudioDiagnostic((current) => ({ ...current, state: "ready", message: "Finishing recording" }));
+    setStatus(continueListening ? "translating" : "draining");
+    setAudioDiagnostic((current) => ({ ...current, state: "ready", message: continueListening ? "Finishing translation" : "Finishing recording" }));
     const recorder = mediaRecorderRef.current;
-    console.info("[UTTERANCE_FINALIZATION]", { reason: transition.reason, recordingGeneration: generation, phaseBefore: transition.phaseBefore, phaseAfter: transition.phaseAfter, recorderState: recorder?.state, transcriptPending: true, translationsPending: drainPendingLanguagesRef.current.size });
-    if (recorder?.state === "recording") {
+    console.info("[UTTERANCE_FINALIZATION]", { reason: transition.reason, recordingGeneration: generation, phaseBefore: transition.phaseBefore, phaseAfter: transition.phaseAfter, recorderState: recorder?.state, transcriptPending: true, translationsPending: drainPendingLanguagesRef.current.size, continueListening });
+    const recorderWasRecording = recorder?.state === "recording";
+    continueListeningAfterStopRef.current = continueListening && recorderWasRecording;
+    if (recorderWasRecording) {
       try { recorder.requestData(); } catch { /* MediaRecorder may already be stopping. */ }
       if (recorderStoppedForGenerationRef.current !== activeRecordingGenerationRef.current) {
         recorderStoppedForGenerationRef.current = activeRecordingGenerationRef.current;
@@ -2288,6 +2315,14 @@ export default function App() {
         recorder.stop();
       }
     }
+    if (continueListening && recorderWasRecording) {
+      // The recorder's onstop handler restarts capture into the same generation/session
+      // once the just-finished utterance's final chunk is flushed; nothing else to tear down.
+      return true;
+    }
+    // continueListening was requested but the recorder was not actively capturing, so onstop
+    // will never fire to restart it — fall through to a full, safe teardown instead of
+    // leaving the session stuck mid-utterance.
     recordingRef.current = false;
     setMicrophoneActive(false);
     setMediaRecorderActive(false);
@@ -3281,6 +3316,7 @@ export default function App() {
     const recordingGeneration = activeRecordingGenerationRef.current + 1;
     activeRecordingGenerationRef.current = recordingGeneration;
     explicitStopRequestedRef.current = false;
+    continueListeningAfterStopRef.current = false;
     startInFlightRef.current = true;
     stopInFlightRef.current = false;
     recorderStartedForGenerationRef.current = null;
@@ -3343,6 +3379,16 @@ export default function App() {
       return;
     }
 
+    const activeAudioSource = audioSourceRef.current;
+    if (activeAudioSource === "tab" && !isTabAudioCaptureSupported(navigator.mediaDevices)) {
+      sessionActionInFlightRef.current = false;
+      startInFlightRef.current = false;
+      setStatus("error");
+      setAudioDiagnostic({ state: "failed", message: "Tab/system audio capture is unavailable" });
+      setAlert("This browser does not support sharing tab or system audio. Switch to Microphone mode to continue.");
+      return;
+    }
+
     try {
       if (!socketRef.current?.connected) {
         socketRef.current?.connect();
@@ -3390,8 +3436,11 @@ export default function App() {
         autoGainControl
       });
 
-      setAudioDiagnostic({ state: "requesting", message: "Requesting microphone permission" });
-      const stream = await requestMicrophoneStream(audio, fallbackAudio);
+      setAudioDiagnostic({
+        state: "requesting",
+        message: activeAudioSource === "tab" ? "Waiting for tab/system audio selection" : "Requesting microphone permission"
+      });
+      const stream = activeAudioSource === "tab" ? await requestTabAudioStream(navigator.mediaDevices) : await requestMicrophoneStream(audio, fallbackAudio);
       if (activeRecordingGenerationRef.current !== recordingGeneration || explicitStopRequestedRef.current) {
         stream.getTracks().forEach((track) => track.stop());
         sessionActionInFlightRef.current = false;
@@ -3399,9 +3448,11 @@ export default function App() {
         return;
       }
       streamRef.current = stream;
-      setMicrophonePermission("granted");
-      setMicrophoneAvailable(true);
-      void refreshMicrophones();
+      if (activeAudioSource === "microphone") {
+        setMicrophonePermission("granted");
+        setMicrophoneAvailable(true);
+        void refreshMicrophones();
+      }
 
       const enhancedAudio = createAmplifiedAudioStream(stream);
       getAudioLevelRef.current = enhancedAudio.getAudioLevel;
@@ -3570,6 +3621,26 @@ export default function App() {
           setMediaRecorderActive(true);
           return;
         }
+        if (continueListeningAfterStopRef.current && recordingRef.current && !explicitStopRequestedRef.current) {
+          continueListeningAfterStopRef.current = false;
+          audioStreamGenerationRef.current += 1;
+          sequenceRef.current = 0;
+          pendingSpeechChunksRef.current = [];
+          awaitingContainerHeaderRef.current = true;
+          recorderStoppedForGenerationRef.current = null;
+          finalizationEmittedForGenerationRef.current = null;
+          vadControllerRef.current.markPaused();
+          utteranceLifecycleRef.current.start({ now: Date.now(), recordingGeneration: lifecycle.recordingGeneration, sessionId: lifecycle.sessionId });
+          const previousState = recorder.state;
+          recorder.start(audioChunkMsRef.current);
+          console.info("[MEDIARECORDER_START]", { reason: "utterance_boundary_continue", recordingGeneration: activeRecordingGenerationRef.current, sessionId: activeSessionIdRef.current || clientSessionIdRef.current, previousState, mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
+          setMediaRecorderActive(true);
+          setMicrophoneActive(true);
+          setStatus("listening");
+          setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Listening" }));
+          return;
+        }
+        continueListeningAfterStopRef.current = false;
         stopInFlightRef.current = false;
         if (recordingRef.current && status !== "stopping") {
           scheduleAudioRecovery("recorder_stopped");
@@ -3693,26 +3764,26 @@ export default function App() {
       cleanupMedia({ stopReason: "session_start_exception" });
       utteranceLifecycleRef.current.resetToIdle();
       setStatus("error");
-      const message = mediaErrorMessage(error);
+      const message = mediaErrorMessage(error, activeAudioSource);
       setAudioDiagnostic({
         state: message.includes("permission") ? "blocked" : "failed",
         message,
         lastError: error instanceof Error ? `${error.name}: ${error.message}` : String(error)
       });
 
-      if (error instanceof DOMException && (error.name === "NotFoundError" || error.name === "DevicesNotFoundError")) {
+      if (activeAudioSource === "microphone" && error instanceof DOMException && (error.name === "NotFoundError" || error.name === "DevicesNotFoundError")) {
         setMicrophoneAvailable(false);
         setAlert(message);
         return;
       }
 
-      if (error instanceof DOMException && (error.name === "NotAllowedError" || error.name === "PermissionDeniedError")) {
+      if (activeAudioSource === "microphone" && error instanceof DOMException && (error.name === "NotAllowedError" || error.name === "PermissionDeniedError")) {
         setMicrophonePermission("denied");
         setAlert(message);
         return;
       }
 
-      if (isDeviceConstraintError(error)) {
+      if (activeAudioSource === "microphone" && isDeviceConstraintError(error)) {
         setMicrophoneId("default");
         setAlert(message);
         return;
@@ -3721,7 +3792,6 @@ export default function App() {
       setAlert(message);
     }
   }, [autoGainControl, beginDrain, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, scheduleAudioRecovery, shareableMode, sourceLang, targetLang, targetLanguages, user?.id, user?.plan, status]);
-  startSessionRef.current = startSession;
 
   const selectMode = (nextMode: Mode) => {
     if (isRecording) return;
@@ -4061,6 +4131,11 @@ export default function App() {
       persistSetting("preferredTargetLanguages", nextTargets);
     };
 
+    const handleAudioSourceChange = (source: AudioSourceMode) => {
+      if (isRecording) return;
+      setAudioSource(source);
+    };
+
     return (
       <main className="mx-auto w-full max-w-5xl space-y-8 px-4 pb-16 sm:px-6">
         <HeroSection />
@@ -4068,6 +4143,9 @@ export default function App() {
         <div className="space-y-6">
           <ModeTabs activeMode={privacyMode} disabled={isRecording} onChange={handlePrivacyModeChange} />
           <ToolTabs activeTool={mode} disabled={isRecording} onChange={selectMode} />
+          {isDesktopChrome() && isTabAudioCaptureSupported(typeof navigator !== "undefined" ? navigator.mediaDevices : undefined) && (
+            <AudioSourceTabs activeSource={audioSource} disabled={isRecording} onChange={handleAudioSourceChange} />
+          )}
           <LanguageSelector
             languages={LANGUAGES}
             sourceLanguage={sourceLang}
