@@ -49,7 +49,14 @@ assert.match(appSource, /const continueListening = reason === "vad_sustained_sil
 // and finishDrain's existing drain-timeout is still the safety net that resets a mobile
 // utterance's cards back to ready if no final transcript/translation ever arrives.
 assert.match(appSource, /if \(awaitingFinalTranscriptRef\.current\) return false;\s*const transition = utteranceLifecycleRef\.current\.requestFinalization\(reason, generation\);\s*if \(!transition\.accepted\) return false;\s*awaitingFinalTranscriptRef\.current = true;/, "mobile's full-finalize path still gates on and sets awaitingFinalTranscriptRef");
-assert.match(appSource, /const readyStatuses = Object\.fromEntries\(targetLanguagesRef\.current\.map\(\(language\) => \[language, "ready" as TranslationLifecycleState\]\)\);\s*setTranslationStatuses\(readyStatuses\);/, "finishDrain's timeout branch resets every target language back to ready, not stuck on its previous status");
+// A completed translation must win over an earlier timeout: only the languages that were STILL
+// pending when the timeout fired revert to "ready" — a language that already completed (e.g.
+// French arrived, German is still pending) keeps its translated status/text instead of both
+// being wiped back to ready together.
+assert.match(appSource, /const stillPendingLanguages = \[\.\.\.drainPendingLanguagesRef\.current\];/, "finishDrain captures which languages were still pending before clearing the set");
+assert.match(appSource, /const readyStatuses = Object\.fromEntries\(stillPendingLanguages\.map\(\(language\) => \[language, "ready" as TranslationLifecycleState\]\)\);\s*setTranslationStatuses\(\(current\) => \(\{ \.\.\.current, \.\.\.readyStatuses \}\)\);/, "finishDrain's timeout branch only reverts the still-pending target languages back to ready, preserving any language that already completed");
+assert.match(appSource, /const hasAnyCompletedTranslation = Object\.keys\(finalTranslationsRef\.current\)\.length > 0;/, "finishDrain checks whether any language actually completed before deciding which alert to show");
+assert.match(appSource, /\} else if \(!hasAnyCompletedTranslation\) \{\s*setAlert\("Translation did not finish\. Please try again\."\);/, '"Translation did not finish" is reserved for a genuine total failure (zero languages completed), not shown merely because one of several targets was still pending');
 assert.match(appSource, /drainTimeoutRef\.current = window\.setTimeout\(\(\) => finishDrain\("timeout"\), RECORDING_DRAIN_TIMEOUT_MS\);/, "mobile's full-finalize path still arms the bounded drain-timeout safety net");
 
 console.log("Stuck-Translating regression tests passed.");

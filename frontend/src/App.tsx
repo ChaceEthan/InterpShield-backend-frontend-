@@ -283,6 +283,13 @@ const MAX_CONTAINER_HEADER_RETRIES = 3;
 const VAD_POLL_INTERVAL_MS = 30;
 const FINAL_CHUNK_ACK_TIMEOUT_MS = 2500;
 const RECORDING_DRAIN_TIMEOUT_MS = 8000;
+// Once the final transcript has actually arrived, the only remaining work is translation — a
+// separate, network/provider-bound step whose latency has nothing to do with how long STT took.
+// This bound (and per-language allowance) governs that second, translation-only wait, so 2-3
+// target languages under normal provider latency are not killed by the same clock meant to
+// catch a genuinely missing STT final.
+const TRANSLATION_DRAIN_TIMEOUT_MS = 12000;
+const TRANSLATION_DRAIN_PER_LANGUAGE_MS = 4000;
 const MAX_SOCKET_RECONNECT_ATTEMPTS = 8;
 const CAPTION_WATCHDOG_MS = 12000;
 const isDesktopChrome = () => typeof navigator !== "undefined" && /Chrome\//i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent);
@@ -1467,6 +1474,12 @@ export default function App() {
   const [finalText, setFinalText] = useState("");
   const [finalTranslationText, setFinalTranslationText] = useState("");
   const [finalTranslations, setFinalTranslations] = useState<Record<string, string>>({});
+  // A rolling, per-language history of every completed utterance's translation, mirroring how
+  // finalText/originalSegments already accumulate source speech instead of replacing it. Once a
+  // new utterance begins, finalTranslations resets to accumulate that utterance's own text (see
+  // the transcript_final handler), but whatever was already shown for the previous utterance is
+  // folded in here first — so the live display only ever grows, never blanks mid-conversation.
+  const [translatedTextWindow, setTranslatedTextWindow] = useState<Record<string, string>>({});
   const [translationStatuses, setTranslationStatuses] = useState<Record<string, TranslationLifecycleState>>({});
   const [translationDiagnostics, setTranslationDiagnostics] = useState<Record<string, string>>({});
   const [interimOriginal, setInterimOriginal] = useState("");
@@ -1621,7 +1634,11 @@ export default function App() {
               ? "connected"
               : "ready";
   const displayTranslationEntries = targetLanguages.map((language) => {
-    const translatedText = finalTranslations[language]?.trim() || "";
+    // Rendered text is the rolling window (every completed prior utterance's translation for
+    // this language) plus whatever the current utterance has accumulated so far — never a bare
+    // replace, so a still-pending current utterance can never blank out a translation the user
+    // already saw.
+    const translatedText = appendTextWindow(translatedTextWindow[language] || "", finalTranslations[language]?.trim() || "");
     const state: TranslationLifecycleState = translatedText ? "translated" : translationStatuses[language] || "ready";
     return [language, translatedText, state, translationDiagnostics[language] || ""] as const;
   });
@@ -2277,16 +2294,36 @@ export default function App() {
     drainTimeoutRef.current = null;
     awaitingFinalTranscriptRef.current = false;
     setAwaitingFinalTranscript(false);
+    const stillPendingLanguages = [...drainPendingLanguagesRef.current];
     drainPendingLanguagesRef.current.clear();
     setTranslationsPending([]);
     const timeoutWithoutFinalOriginal = reason === "timeout" && !lastFinalOriginalRef.current;
     if (reason === "timeout") {
-      const readyStatuses = Object.fromEntries(targetLanguagesRef.current.map((language) => [language, "ready" as TranslationLifecycleState]));
-      setTranslationStatuses(readyStatuses);
-      setTranslationDiagnostics({});
-      setAlert(timeoutWithoutFinalOriginal ? "No final caption was received. Please try again." : "Translation did not finish. Please try again.");
-      pendingFinalTranscriptRef.current = null;
-      pendingFinalTranscriptsRef.current.clear();
+      // Section 6/7: a language that already completed must not be reverted just because a
+      // DIFFERENT, slower target timed out — only the languages still actually pending revert to
+      // "ready". "Translation did not finish" is reserved for a genuine total failure (zero
+      // languages ever completed); if at least one did, that's shown instead, not blanked.
+      const hasAnyCompletedTranslation = Object.keys(finalTranslationsRef.current).length > 0;
+      const readyStatuses = Object.fromEntries(stillPendingLanguages.map((language) => [language, "ready" as TranslationLifecycleState]));
+      setTranslationStatuses((current) => ({ ...current, ...readyStatuses }));
+      setTranslationDiagnostics((current) => {
+        if (stillPendingLanguages.length === 0) return current;
+        const next = { ...current };
+        for (const language of stillPendingLanguages) delete next[language];
+        return next;
+      });
+      if (timeoutWithoutFinalOriginal) {
+        setAlert("No final caption was received. Please try again.");
+      } else if (!hasAnyCompletedTranslation) {
+        setAlert("Translation did not finish. Please try again.");
+      }
+      // pendingFinalTranscriptRef/pendingFinalTranscriptsRef are intentionally left intact here
+      // (not cleared): if the backend had already computed a result before end_session below
+      // reaches it, that result can still arrive moments later — handleTranslationUpdate's
+      // explicit pending-transcript match (independent of the "current" pointer) can still
+      // recognize and commit it instead of it being silently unroutable. They still get
+      // naturally replaced by the next utterance's own pendingEntry, or evicted by the
+      // MAX_PENDING_FINAL_TRANSCRIPTS cap, so nothing accumulates unbounded.
     }
     utteranceLifecycleRef.current.setPhase("finalizing");
     try {
@@ -2826,6 +2863,7 @@ export default function App() {
       console.info("[DESKTOP_PIPELINE_SPEECH_FINAL]", { sessionId, jobId, sequence, chars: originalText.length });
       const transcriptEventKey = `${sessionId || "session"}:${jobId ?? "job"}:${sequence ?? "sequence"}`;
       if (!originalText || transcriptEventKey === lastFinalTranscriptEventKeyRef.current) return;
+      console.info("[UTTERANCE_FINALIZED]", { sessionId, utteranceId: transcriptEventKey, lifecyclePhase: "transcribing", reason: "stt_final_received" });
       if (detectedLanguage) setDetectedLanguage(detectedLanguage);
       if (typeof latencyMs === "number") setLastLatency(latencyMs);
       trackLatency(latencyMs, provider);
@@ -2866,6 +2904,12 @@ export default function App() {
       pendingFinalTranscriptRef.current = pendingEntry;
       rememberPendingFinalTranscript(pendingEntry);
       activeTranslationIdRef.current = translationId;
+      console.info("[UTTERANCE_CREATED]", { sessionId, utteranceId: translationId, lifecyclePhase: "transcribing", reason: "transcript_final" });
+      if (drainPendingLanguagesRef.current.size > 0) {
+        for (const language of drainPendingLanguagesRef.current) {
+          console.info("[TRANSLATION_REQUESTED]", { sessionId, utteranceId: translationId, targetLanguage: language, lifecyclePhase: "translating", reason: "transcript_final" });
+        }
+      }
       if (sessionId && activeBackendSessionIdRef.current !== sessionId) {
         activeBackendSessionIdRef.current = sessionId;
         latestTranslationSequenceRef.current = 0;
@@ -2880,6 +2924,21 @@ export default function App() {
       setFinalText((current) => appendTextWindow(current, originalText));
       setOriginalSegments((current) => [...current, originalText].slice(-MAX_LIVE_SEGMENTS));
       if (!keepStreamingTranslation) {
+        // A genuinely new utterance is starting: freeze whatever the previous utterance had
+        // accumulated into the rolling window before resetting the "current utterance" slot —
+        // otherwise a translation that hadn't rendered yet (still in flight when this utterance
+        // boundary landed) would be silently discarded instead of shown.
+        const previousTranslations = finalTranslationsRef.current;
+        if (Object.keys(previousTranslations).length > 0) {
+          setTranslatedTextWindow((current) => {
+            const next = { ...current };
+            for (const [language, text] of Object.entries(previousTranslations)) {
+              const trimmed = text?.trim();
+              if (trimmed) next[language] = appendTextWindow(next[language] || "", trimmed);
+            }
+            return next;
+          });
+        }
         finalTranslationsRef.current = {};
         lastFinalTranslationRef.current = "";
         setFinalTranslations({});
@@ -2890,12 +2949,22 @@ export default function App() {
       if (modeRef.current === "transcribe") {
         forgetPendingFinalTranscript(pendingEntry);
         pendingFinalTranscriptRef.current = null;
-        finishDrain("processed");
+        finishDrainRef.current("processed");
       } else if (awaitingFinalTranscriptRef.current) {
         awaitingFinalTranscriptRef.current = false;
         setAwaitingFinalTranscript(false);
         setStatus("translating");
         setAudioDiagnostic((current) => ({ ...current, state: "ready", message: "Finishing translations" }));
+        // The STT final has now arrived — the only remaining work is translation, a separate,
+        // provider-latency-bound step. Re-arm the drain timeout with a bound sized for that work
+        // (base + a per-language allowance) instead of leaving whatever was left of the
+        // STT-oriented RECORDING_DRAIN_TIMEOUT_MS window, so 2-3 target languages under normal
+        // provider latency are not killed by a clock meant to catch a missing STT final.
+        if (drainPendingLanguagesRef.current.size > 0) {
+          if (drainTimeoutRef.current) window.clearTimeout(drainTimeoutRef.current);
+          const translationBudgetMs = TRANSLATION_DRAIN_TIMEOUT_MS + Math.max(0, drainPendingLanguagesRef.current.size - 1) * TRANSLATION_DRAIN_PER_LANGUAGE_MS;
+          drainTimeoutRef.current = window.setTimeout(() => finishDrainRef.current("timeout"), translationBudgetMs);
+        }
       }
     });
 
@@ -2911,8 +2980,12 @@ export default function App() {
       const previewJob = typeof jobId === "string" && jobId.startsWith("preview-");
       const streamingPreview = Boolean(streaming || previewJob);
       console.info("[DESKTOP_PIPELINE_TRANSLATION_RECEIVED]", { sessionId, jobId, sequence, original: updateOriginal, languages: Object.keys(translations || {}), status, partial, complete });
+      for (const language of Object.keys(translations || {})) {
+        console.info("[TRANSLATION_RECEIVED]", { sessionId, utteranceId: jobId ?? sequence ?? "unknown", targetLanguage: language, lifecyclePhase: complete !== false && !partial ? "completed" : "translating", reason: "socket_event" });
+      }
 
       if (sessionId && activeBackendSessionIdRef.current && sessionId !== activeBackendSessionIdRef.current) {
+        console.info("[TRANSLATION_REJECTED]", { sessionId, utteranceId: jobId ?? sequence ?? "unknown", lifecyclePhase: "unknown", reason: "session_mismatch" });
         return;
       }
       if (sessionId && !activeBackendSessionIdRef.current) {
@@ -2920,14 +2993,22 @@ export default function App() {
       }
 
       const incomingSequence = Number(sequence);
-      const matchedPendingTranscript = streamingPreview
-        ? currentPendingTranscript
+      // The explicit lookup (by session/job/sequence/original text) is a strictly stronger
+      // signal than "whatever the current pending transcript happens to be" — an event that
+      // explicitly matches a still-tracked utterance is valid regardless of whether a newer
+      // utterance has since become current (see the sequence-staleness exemption below). Section
+      // 8's stale-event rule: only reject when the session/utterance truly no longer exists, or
+      // it's an older revision of the exact same target — never merely because the global
+      // "current" pointer has moved on.
+      const explicitPendingMatch = streamingPreview
+        ? null
         : findPendingFinalTranscript({
             sessionId,
             jobId,
             sequence: Number.isFinite(incomingSequence) ? incomingSequence : undefined,
             original: updateOriginal
-          }) || currentPendingTranscript;
+          });
+      const matchedPendingTranscript = streamingPreview ? currentPendingTranscript : explicitPendingMatch || currentPendingTranscript;
       const preFinalTranslation = Boolean(
         !streamingPreview &&
         updateOriginal &&
@@ -2936,8 +3017,9 @@ export default function App() {
         ((Number.isFinite(incomingSequence) && incomingSequence > latestTranslationSequenceRef.current) ||
           (!Number.isFinite(incomingSequence) && Boolean(jobId) && !activeBackendTranslationJobIdRef.current))
       );
-      const sequenceIsStale = Number.isFinite(incomingSequence) && incomingSequence < latestTranslationSequenceRef.current && !streamingPreview && !preFinalTranslation;
+      const sequenceIsStale = Number.isFinite(incomingSequence) && incomingSequence < latestTranslationSequenceRef.current && !streamingPreview && !preFinalTranslation && !explicitPendingMatch;
       if (sequenceIsStale) {
+        console.info("[TRANSLATION_REJECTED]", { sessionId, utteranceId: jobId ?? sequence ?? "unknown", lifecyclePhase: "unknown", reason: "older_revision_of_same_target" });
         return;
       }
       const isCurrentLiveTranslation = Boolean(
@@ -2953,12 +3035,15 @@ export default function App() {
       }
 
       if (matchedPendingTranscript && updateOriginal && updateOriginal !== matchedPendingTranscript.original) {
+        console.info("[TRANSLATION_REJECTED]", { sessionId, utteranceId: matchedPendingTranscript.translationId, lifecyclePhase: "unknown", reason: "original_text_mismatch" });
         return;
       }
       if (!streamingPreview && !preFinalTranslation && !matchedPendingTranscript && updateOriginal && lastFinalOriginalRef.current && updateOriginal !== lastFinalOriginalRef.current) {
+        console.info("[TRANSLATION_REJECTED]", { sessionId, utteranceId: jobId ?? sequence ?? "unknown", lifecyclePhase: "unknown", reason: "unknown_utterance" });
         return;
       }
       if (!streamingPreview && !preFinalTranslation && jobId && activeBackendTranslationJobIdRef.current && String(jobId) !== String(activeBackendTranslationJobIdRef.current) && !matchedPendingTranscript) {
+        console.info("[TRANSLATION_REJECTED]", { sessionId, utteranceId: jobId, lifecyclePhase: "unknown", reason: "job_mismatch_unknown_utterance" });
         return;
       }
 
@@ -2975,6 +3060,35 @@ export default function App() {
       const mergedTranslation = formatTranslationsText(mergedTranslations, nextTargetLanguages);
       const mergedTranslationSignature = JSON.stringify(orderedTranslationEntries(mergedTranslations, nextTargetLanguages));
       const isComplete = complete !== false && !partial;
+
+      // A completed translation whose utterance matched a still-tracked pending transcript, but
+      // is no longer the "current" one because a newer utterance already started (desktop's
+      // continuous re-arm can begin utterance N+1 before N's translation round-trip finishes).
+      // This used to be silently dropped from the live display entirely — it still reached
+      // "history" via appendTranscriptHistory further below, but never the visible subtitles.
+      // The utterance is still valid (its session and pending-transcript entry both still
+      // exist); it is simply not the newest one, so fold it into the rolling window rather than
+      // the current utterance's in-progress slot.
+      if (!shouldUpdateLiveTranslation && explicitPendingMatch && isComplete) {
+        const staleUtteranceLanguages = Object.entries(nextTranslations).filter(([language, translatedText]) =>
+          isValidTranslationText({ text: String(translatedText || "").trim(), sourceText, targetLang: language })
+        );
+        if (staleUtteranceLanguages.length > 0) {
+          setTranslatedTextWindow((current) => {
+            const next = { ...current };
+            for (const [language, translatedText] of staleUtteranceLanguages) {
+              next[language] = appendTextWindow(next[language] || "", String(translatedText).trim());
+            }
+            return next;
+          });
+          for (const [language] of staleUtteranceLanguages) {
+            console.info("[TRANSLATION_COMMITTED]", { sessionId, utteranceId: explicitPendingMatch.translationId, targetLanguage: language, lifecyclePhase: "superseded", reason: "completed_after_newer_utterance_started" });
+          }
+        } else {
+          console.info("[TRANSLATION_REJECTED]", { sessionId, utteranceId: explicitPendingMatch.translationId, lifecyclePhase: "superseded", reason: "no_valid_language_text" });
+        }
+      }
+
       for (const [language, translatedText] of Object.entries(nextTranslations)) {
         const incomingText = String(translatedText || "").trim();
         if (!isValidTranslationText({ text: incomingText, sourceText, targetLang: language })) continue;
@@ -3098,6 +3212,9 @@ export default function App() {
         finalTranslationsRef.current = mergedTranslations;
         setFinalTranslations(mergedTranslations);
         console.info("[DESKTOP_PIPELINE_REACT_TRANSLATIONS_UPDATE]", { jobId, sequence, languages: Object.keys(mergedTranslations), preFinalTranslation });
+        for (const language of Object.keys(nextTranslations)) {
+          console.info("[TRANSLATION_COMMITTED]", { sessionId, utteranceId: translationId, targetLanguage: language, lifecyclePhase: isComplete ? "completed" : "translating", reason: "current_utterance" });
+        }
         if (!streamingPreview && isComplete) queueDubbingTranslations(translationId, nextTranslations);
       }
 
@@ -3136,8 +3253,18 @@ export default function App() {
           }
         }
         setTranslationsPending([...drainPendingLanguagesRef.current]);
+        if (drainPendingLanguagesRef.current.size === 0) {
+          console.info("[UTTERANCE_COMPLETED]", { sessionId, utteranceId: matchedPendingTranscript?.translationId || translationId, lifecyclePhase: "completed", reason: "all_targets_settled" });
+        }
         if (utteranceLifecycleRef.current.snapshot().phase === "draining" && !awaitingFinalTranscriptRef.current && drainPendingLanguagesRef.current.size === 0) {
-          finishDrain("processed");
+          finishDrainRef.current("processed");
+        } else if (drainTimeoutRef.current && drainPendingLanguagesRef.current.size > 0) {
+          // Section 7: await every selected target independently. One target settling (complete
+          // or failed) is real, observable progress on this utterance — extend the mobile drain
+          // timeout so the remaining target(s) get their own fresh window instead of racing
+          // whatever was left of the very first target's budget.
+          window.clearTimeout(drainTimeoutRef.current);
+          drainTimeoutRef.current = window.setTimeout(() => finishDrainRef.current("timeout"), TRANSLATION_DRAIN_PER_LANGUAGE_MS + TRANSLATION_DRAIN_TIMEOUT_MS / 2);
         }
       }
     };
@@ -3172,7 +3299,16 @@ export default function App() {
       setSocketConnected(false);
       setSocketReconnecting(false);
     };
-  }, [isAuthed, finishDrain, queueDubbingTranslations, updateSocketAuth, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript]);
+    // finishDrain is intentionally NOT a dependency here: it transitively depends on
+    // refreshMe -> token, and /api/auth/me issues a fresh JWT (a new iat) on every call. The
+    // 15s trial-countdown poller (see the refreshMe effect above) calls refreshMe while
+    // recording, which reassigns `token` roughly every 15s, which would give finishDrain a new
+    // identity every 15s too. If finishDrain were a dependency, that churn would re-run this
+    // entire effect — disconnecting and recreating the live socket connection out from under
+    // any in-flight translation request, roughly every 15 seconds, for any trial user actively
+    // recording. finishDrainRef (kept fresh on every render, see finishDrainRef.current =
+    // finishDrain above) lets this effect call the latest finishDrain without depending on it.
+  }, [isAuthed, queueDubbingTranslations, updateSocketAuth, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript]);
 
   useEffect(() => {
     const reconnectSocket = () => {
@@ -3514,6 +3650,7 @@ export default function App() {
     setChunkCount(0);
     setLastLatency(null);
     setTranslationStatuses({});
+    setTranslatedTextWindow({});
     translationStatusUpdatedAtRef.current = {};
     sequenceRef.current = 0;
     lastInterimRef.current = "";
@@ -4229,6 +4366,7 @@ export default function App() {
     setFinalText("");
     setFinalTranslationText("");
     setFinalTranslations({});
+    setTranslatedTextWindow({});
     setTranslationStatuses({});
     translationStatusUpdatedAtRef.current = {};
     setInterimOriginal("");

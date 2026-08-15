@@ -201,7 +201,7 @@ assert.match(frontendSource, /mimeType:\s*recorderMimeType/, "the actual recorde
 assert.match(frontendSource, /streamGeneration:\s*audioStreamGenerationRef\.current/, "browser audio carries Deepgram generation ownership");
 assert.match(socketSource, /deepgram_stream_reset/, "Deepgram reconnect requests a fresh browser container generation");
 assert.match(frontendSource, /reason === "timeout" && !lastFinalOriginalRef\.current/, "a missing final transcript resets translation cards after drain timeout");
-assert.match(frontendSource, /setTranslationStatuses\(readyStatuses\)/, "no-final timeout returns cards to Ready");
+assert.match(frontendSource, /setTranslationStatuses\(\(current\) => \(\{ \.\.\.current, \.\.\.readyStatuses \}\)\)/, "no-final timeout returns only the still-pending target languages to Ready, preserving any that already completed");
 assert.match(frontendSource, /AUDIO_CHUNK_EMITTED/);
 assert.match(socketSource, /BACKEND_AUDIO_RECEIVED/);
 assert.match(socketSource, /AUDIO_CHUNK_DROPPED/);
