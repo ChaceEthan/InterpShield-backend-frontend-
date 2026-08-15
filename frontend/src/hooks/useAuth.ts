@@ -130,6 +130,9 @@ export const useAuth = () => {
         throw error;
       }
     },
+    // logout() is declared further below in this file and cannot be listed here without
+    // reordering the declarations (it would be a temporal-dead-zone reference otherwise).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [apiRequest, status.token]
   );
 
@@ -296,26 +299,22 @@ export const useAuth = () => {
     async (settings: Record<string, any>) => {
       if (!status.token) throw new Error('Not authenticated');
 
-      try {
-        const data = await apiRequest<{ user: User }>(
-          '/api/user/settings',
-          {
-            method: 'PATCH',
-            body: JSON.stringify(settings),
-          },
-          status.token
-        );
+      const data = await apiRequest<{ user: User }>(
+        '/api/user/settings',
+        {
+          method: 'PATCH',
+          body: JSON.stringify(settings),
+        },
+        status.token
+      );
 
-        setStatus((prev) => ({
-          ...prev,
-          user: data.user,
-        }));
+      setStatus((prev) => ({
+        ...prev,
+        user: data.user,
+      }));
 
-        localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(data.user));
-        return data.user;
-      } catch (error) {
-        throw error;
-      }
+      localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(data.user));
+      return data.user;
     },
     [apiRequest, status.token]
   );
@@ -323,6 +322,9 @@ export const useAuth = () => {
   // Cleanup
   useEffect(() => {
     return () => {
+      // refreshTimeoutRef holds a timer id (not a DOM node), so React never nulls it out from
+      // under this cleanup the way it can for a node ref; reading .current here is safe as-is.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
       if (refreshTimeoutRef.current) clearTimeout(refreshTimeoutRef.current);
     };
   }, []);

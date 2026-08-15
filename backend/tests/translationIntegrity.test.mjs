@@ -160,7 +160,11 @@ assert.match(interpreterSource, /createTranslationPayloadMetadata/);
 assert.match(interpreterSource, /sequence:\s*stableSequence\s*\|\|\s*translationEmitSequence/);
 assert.match(interpreterSource, /const providerOrder\s*=\s*\[/);
 assert.match(interpreterSource, /PROVIDER_MAX_ACTIVE_TRANSLATIONS\s*=\s*6/);
-assert.match(interpreterSource, /gemini:\s*25000/);
+// The Gemini timeout must come from gemini.js's single exported GEMINI_TIMEOUT_MS constant, not a
+// second hardcoded literal here that could silently drift out of sync with the value gemini.js's
+// own internal AbortController actually uses.
+assert.match(interpreterSource, /import\s*\{\s*GEMINI_TIMEOUT_MS\b/);
+assert.match(interpreterSource, /gemini:\s*GEMINI_TIMEOUT_MS/);
 assert.match(interpreterSource, /openai:\s*22000/);
 assert.match(interpreterSource, /QUEUED_JOB_TIMEOUT\s*=\s*10\s*\*\s*60\s*\*\s*1000/);
 assert.match(interpreterSource, /PROCESSING_JOB_TIMEOUT\s*=\s*3\s*\*\s*60\s*\*\s*1000/);

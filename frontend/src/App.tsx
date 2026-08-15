@@ -1,33 +1,20 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle,
-  ArrowRightLeft,
   BadgeHelp,
   Check,
   ChevronDown,
-  CircleStop,
-  Crown,
   Download,
-  FileText,
   KeyRound,
-  Languages,
   ListChecks,
   Lock,
   LogOut,
   Mic,
-  Settings,
-  Share2,
   Shield,
-  SlidersHorizontal,
   Sparkles,
-  Timer,
-  User,
-  Volume2,
-  type LucideIcon
+  User
 } from "lucide-react";
-import { AnimatePresence, motion } from "framer-motion";
 import { io, type Socket } from "socket.io-client";
-import { API, CLIENT_URL, FRONTEND_CONFIG_DIAGNOSTICS, GOOGLE_CLIENT_ID, SOCKET_TRANSPORTS, SOCKET_URL, WS_URL } from "./config/socket";
+import { API, FRONTEND_CONFIG_DIAGNOSTICS, GOOGLE_CLIENT_ID, SOCKET_TRANSPORTS, SOCKET_URL, WS_URL } from "./config/socket";
 import { AudioSourceTabs } from "./components/AudioSourceTabs";
 import { HeroSection } from "./components/HeroSection";
 import { LanguageSelector } from "./components/LanguageSelector";
@@ -49,7 +36,6 @@ import { isAdminRole, normalizeAuthUser } from "./auth/roles.mjs";
 import { PLAN_CATALOG, PRICING_PLAN_IDS, yearlyMonthlyPrice } from "../../shared/plans.mjs";
 import {
   LANGUAGE_CATALOG,
-  LANGUAGE_FLAGS,
   SPEECH_SYNTHESIS_LANGS,
   SUPPORTED_LANGUAGE_CODES,
   normalizeLanguageCode as normalizeSharedLanguageCode
@@ -148,18 +134,6 @@ interface AppConfig {
   mode: "production" | "unavailable";
   maxSessionSeconds: number;
   audioChunkMs: number;
-}
-
-interface InterpretationResult {
-  originalText: string;
-  translatedText: string;
-  translations?: Record<string, string>;
-  isFinal: boolean;
-  sourceLang: string;
-  targetLang: string;
-  targetLanguages?: string[];
-  detectedLanguage?: string;
-  latencyMs?: number;
 }
 
 interface HistoryItem {
@@ -412,12 +386,6 @@ const initializeGoogleIdentityOnce = ({
 
 const LANGUAGES: Language[] = LANGUAGE_CATALOG.map(({ code, name, region }) => ({ code, name, region }));
 
-const TOOL_ITEMS: Array<{ mode: Mode; label: string; icon: LucideIcon }> = [
-  { mode: "transcribe", label: "Transcribe", icon: FileText },
-  { mode: "translate", label: "Translate", icon: Languages },
-  { mode: "dubbing", label: "Dubbing", icon: Volume2 }
-];
-
 const PRICING_PLANS = PRICING_PLAN_IDS.map((planId) => ({
   ...PLAN_CATALOG[planId],
   highlighted: planId === "creator"
@@ -482,82 +450,12 @@ const pendingTranscriptKeys = (entry: Partial<PendingTranscriptEntry>) =>
     pendingTranscriptKey({ original: entry.original })
   ].filter(Boolean);
 
-const normalizeLanguageDetectionText = (text = "") =>
-  text
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/\p{Diacritic}/gu, "")
-    .replace(/\s+/g, " ");
-
-const languageTokens = (text = "") => normalizeLanguageDetectionText(text).match(/[\p{L}\p{N}']+/gu) || [];
-
-const countLanguageMarkers = (text = "", markers: { phrases?: string[]; words?: string[] }) => {
-  const normalized = normalizeLanguageDetectionText(text);
-  const tokens = new Set(languageTokens(text));
-  let score = 0;
-
-  for (const phrase of markers.phrases || []) {
-    const normalizedPhrase = normalizeLanguageDetectionText(phrase);
-    if (normalizedPhrase && normalized.includes(normalizedPhrase)) score += 2;
-  }
-
-  for (const word of markers.words || []) {
-    const normalizedWord = normalizeLanguageDetectionText(word);
-    if (normalizedWord && tokens.has(normalizedWord)) score += 1;
-  }
-
-  return score;
-};
-
-const ENGLISH_MARKERS = {
-  phrases: ["can you", "could you", "please give", "give me", "thank you", "how are you", "good morning", "no problem"],
-  words: ["the", "and", "you", "your", "please", "give", "book", "hello", "thanks", "thank", "problem", "question", "answer", "friend", "okay", "need", "want", "have", "this", "that", "what", "when", "where", "why", "how", "can", "could", "would", "should"]
-};
-
-const TARGET_LANGUAGE_MARKERS: Record<string, { phrases?: string[]; words?: string[] }> = {
-  es: {
-    phrases: ["por favor", "muchas gracias", "buenos dias", "buenas tardes", "buenas noches", "me puedes", "puedes darme", "tu libro", "su libro", "de nada", "lo siento", "que tal"],
-    words: ["el", "la", "los", "las", "un", "una", "de", "del", "que", "para", "por", "con", "sin", "como", "hola", "gracias", "favor", "vale", "claro", "bueno", "bien", "perdon", "adios", "listo", "puedes", "puede", "puedo", "dame", "darme", "libro", "libros", "necesito", "quiero", "tengo", "tienes", "tiene", "buenos", "buenas", "dias", "noches", "si", "aqui", "ahora", "usted", "tu", "mi", "su", "voy", "hablar", "escuchar", "traducir", "ayuda"]
-  },
-  sw: {
-    phrases: ["asante sana", "unaweza kunipa", "kitabu chako", "habari", "tafadhali"],
-    words: ["habari", "asante", "sawa", "rafiki", "tafadhali", "karibu", "jambo", "ndio", "ndiyo", "hapana", "sana", "unaweza", "kunipa", "kitabu", "chako", "nina", "kwa", "mimi", "wewe", "yeye", "sisi", "wao", "ni", "na", "ya", "za", "wa", "watu", "mtu", "leo", "kesho", "sasa", "hapa", "kazi", "fedha", "familia", "afya", "msaada", "wako", "ninahitaji"]
-  }
-};
-
 const isSourceTaggedFallbackText = (text = "") => /^\[[a-z]{2,12}(?:-[a-z0-9]{2,12})?\]\s+/i.test(text.trim());
 
 const isVisibleTranslationText = (text = "") =>
   Boolean(text.trim()) &&
   !isSourceTaggedFallbackText(text) &&
   !/\b(temporar(?:il)y unavailable|temporar(?:il)y failed|translation unavailable|provider failed|timed out|timeout)\b/i.test(text);
-
-const hasSpanishOrthography = (text = "") => /[\u00e1\u00e9\u00ed\u00f3\u00fa\u00fc\u00f1\u00c1\u00c9\u00cd\u00d3\u00da\u00dc\u00d1\u00bf\u00a1]/.test(text);
-const hasChineseCharacters = (text = "") => /[\u3400-\u9fff\uf900-\ufaff]/.test(text);
-
-const isTargetLanguageText = (text = "", targetLang = "") => {
-  const target = normalizeLanguageCode(targetLang);
-  if (!target || target === "auto" || target === "en") return true;
-
-  const tokenCount = languageTokens(text).length;
-  const englishScore = countLanguageMarkers(text, ENGLISH_MARKERS);
-
-  if (target === "zh") return hasChineseCharacters(text);
-
-  if (target === "es") {
-    const spanishScore = countLanguageMarkers(text, TARGET_LANGUAGE_MARKERS.es);
-    return hasSpanishOrthography(text) || spanishScore >= 2 || (spanishScore >= 1 && englishScore === 0 && tokenCount <= 3);
-  }
-
-  if (target === "sw") {
-    const markerScore = countLanguageMarkers(text, TARGET_LANGUAGE_MARKERS[target] || {});
-    return markerScore >= 2 || (markerScore >= 1 && englishScore === 0 && tokenCount <= 4);
-  }
-
-  if (tokenCount <= 4) return true;
-  return englishScore < 6;
-};
 
 const isValidTranslationText = ({
   text = "",
@@ -630,15 +528,6 @@ const translationStateLabel = (state: TranslationLifecycleState) => {
   return "ready";
 };
 
-const translationStateClass = (state: TranslationLifecycleState) => {
-  if (state === "done" || state === "translated") return "bg-emerald-500/10 text-emerald-300";
-  if (state === "failed") return "bg-red-500/10 text-red-200";
-  if (state === "stale" || state === "cancelled") return "bg-slate-800/80 text-slate-400";
-  if (state === "retrying") return "bg-amber-500/10 text-amber-200";
-  if (state === "translating" || state === "processing") return "bg-blue-500/10 text-blue-200";
-  return "bg-slate-800/80 text-slate-500";
-};
-
 const coerceTranslationState = (value: unknown): TranslationLifecycleState | "" => {
   const state = String(value || "").trim().toLowerCase();
   if (state === "done") return "translated";
@@ -683,7 +572,6 @@ const appendTextWindow = (current: string, next: string, maxChars = LIVE_TEXT_WI
   return combined.length <= maxChars ? combined : combined.slice(-maxChars).replace(/^\S+\s*/, "").trim();
 };
 
-const languageFlag = (code: string) => LANGUAGE_FLAGS[code] || "🌐";
 const speechLanguage = (code: string) => SPEECH_SYNTHESIS_LANGS[code] || code;
 
 let speechVoicesReadyPromise: Promise<SpeechSynthesisVoice[]> | null = null;
@@ -1046,12 +934,6 @@ const clearSessionStorage = () => {
   }
 };
 
-const FlagUs = () => (
-  <span className="relative inline-block h-5 w-7 overflow-hidden rounded-sm border border-white/20 bg-[repeating-linear-gradient(to_bottom,#b91c1c_0_2px,#fff_2px_4px)]">
-    <span className="absolute left-0 top-0 h-3 w-3.5 bg-blue-800" />
-  </span>
-);
-
 const GoogleIcon = ({ className = "h-5 w-5" }: { className?: string }) => (
   <svg className={className} viewBox="0 0 24 24" aria-hidden="true">
     <path fill="#4285F4" d="M21.6 12.23c0-.78-.07-1.53-.2-2.23H12v4.26h5.37a4.59 4.59 0 0 1-1.99 3.01v2.5h3.22c1.88-1.73 3-4.28 3-7.54Z" />
@@ -1109,160 +991,11 @@ const SelectControl = ({
   </label>
 );
 
-const TypingSubtitle = ({ text, muted = false, empty = "Waiting for speech..." }: { text: string; muted?: boolean; empty?: string }) => {
-  const [visibleText, setVisibleText] = useState("");
-  const visibleTextRef = useRef("");
-
-  useEffect(() => {
-    visibleTextRef.current = visibleText;
-  }, [visibleText]);
-
-  useEffect(() => {
-    const cleanText = text.trim();
-    if (!cleanText) {
-      setVisibleText("");
-      return;
-    }
-
-    const initialText = cleanText.startsWith(visibleTextRef.current) ? visibleTextRef.current : "";
-    let index = initialText.length;
-    const step = Math.max(1, Math.ceil((cleanText.length - initialText.length) / 80));
-    setVisibleText(initialText);
-
-    if (initialText === cleanText) return;
-
-    const timer = window.setInterval(() => {
-      index += step;
-      setVisibleText(cleanText.slice(0, index));
-      if (index >= cleanText.length) window.clearInterval(timer);
-    }, 14);
-
-    return () => window.clearInterval(timer);
-  }, [text]);
-
-  if (!text.trim()) return <span className="text-slate-600">{empty}</span>;
-
-  return (
-    <span className={`break-words ${muted ? "text-slate-400" : "text-white"}`}>
-      {visibleText}
-      {visibleText.length < text.trim().length && <span className="ml-1 inline-block h-5 w-1 animate-pulse rounded-full bg-blue-500 align-middle" />}
-    </span>
-  );
-};
-
 const SubscriptionPage = ({ user }: { user: AppUser | null }) => {
   const subscription = user?.subscription; const plans = ["Free Trial", "Monthly", "Quarterly", "Yearly", "Enterprise"];
   const onTrial = Boolean(subscription?.isTrial) && subscription?.trialSecondsRemaining != null;
   return <main className="mx-auto min-h-[70vh] w-full max-w-5xl px-5 py-10"><h1 className="text-3xl font-black">Subscription</h1><p className="mt-2 text-gray-600">Payment processing is not enabled yet. Your account is ready for a future provider.</p>{subscription && <section className="mt-6 grid gap-3 rounded-2xl border bg-white p-5 sm:grid-cols-2 lg:grid-cols-4"><div><b>Current plan</b><p>{subscription.planLabel}</p></div><div><b>{onTrial ? "Trial remaining" : "Remaining days"}</b><p>{onTrial ? `${formatTime(Math.max(0, subscription.trialSecondsRemaining || 0))} of 5:00` : subscription.daysRemaining == null ? "Never" : subscription.daysRemaining}</p></div><div><b>Expiration date</b><p>{subscription.isUnlimited ? "Never expires" : onTrial ? "Ends when your 5 minutes of usage are used" : subscription.subscriptionEndsAt ? new Date(subscription.subscriptionEndsAt).toLocaleDateString() : "Never expires"}</p></div><div><b>Renewal date</b><p>{subscription.nextRenewalAt ? new Date(subscription.nextRenewalAt).toLocaleDateString() : "Not scheduled"}</p></div></section>}<section className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">{plans.map((plan) => <article key={plan} className="rounded-xl border bg-white p-4"><h2 className="font-black">{plan}</h2><p className="mt-2 text-sm text-gray-500">Provider-ready plan</p></article>)}</section><section className="mt-6 rounded-xl border bg-white p-5"><h2 className="font-black">Payment history</h2><p className="mt-2 text-sm text-gray-500">No payment history yet.</p></section></main>;
 };
-
-const LanguageSelect = ({
-  label,
-  value,
-  disabled,
-  onChange
-}: {
-  label: string;
-  value: string;
-  disabled?: boolean;
-  onChange: (value: string) => void;
-}) => (
-  <label className="flex min-w-0 flex-1 flex-col gap-1.5">
-    <span className="text-xs font-bold uppercase tracking-widest text-slate-500">{label}</span>
-    <span className="relative">
-      <select
-        value={value}
-        disabled={disabled}
-        onChange={(event) => onChange(event.target.value)}
-        className="w-full appearance-none rounded-lg border border-white/10 bg-slate-950/75 px-3 py-3 pr-9 text-sm font-semibold text-slate-100 outline-none transition focus:border-blue-500/50 focus:ring-2 focus:ring-blue-500/15 disabled:cursor-not-allowed disabled:opacity-60"
-      >
-        {LANGUAGES.map((language) => (
-          <option key={language.code} value={language.code}>
-            {language.name} - {language.region}
-          </option>
-        ))}
-      </select>
-      <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
-    </span>
-  </label>
-);
-
-const TargetLanguageTriangle = ({
-  sourceLang,
-  targetLanguages,
-  disabled,
-  onSourceChange,
-  onToggleTarget,
-  onSwap
-}: {
-  sourceLang: string;
-  targetLanguages: string[];
-  disabled?: boolean;
-  onSourceChange: (value: string) => void;
-  onToggleTarget: (value: string) => void;
-  onSwap: () => void;
-}) => (
-  <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(220px,0.7fr)_1fr] lg:items-center">
-    <LanguageSelect label="Speaker Language" value={sourceLang} disabled={disabled} onChange={onSourceChange} />
-
-    <div className="rounded-lg border border-white/10 bg-slate-950/55 p-4">
-      <div className="mx-auto max-w-sm">
-        <div className="flex justify-center">
-          <span className="inline-flex min-h-11 min-w-20 items-center justify-center gap-2 rounded-lg border border-slate-500/25 bg-slate-900 px-4 py-2 text-sm font-black text-white">
-            <span aria-hidden="true">{languageFlag(sourceLang)}</span>
-            {sourceLang.toUpperCase()}
-          </span>
-        </div>
-        <div className={`mt-3 grid gap-2 ${targetLanguages.length === 1 ? "grid-cols-1 sm:px-16" : targetLanguages.length === 2 ? "grid-cols-2" : "grid-cols-3"}`}>
-          {targetLanguages.map((language) => (
-            <button
-              key={language}
-              type="button"
-              disabled={disabled}
-              onClick={() => onToggleTarget(language)}
-              className="inline-flex min-h-11 min-w-0 items-center justify-center gap-2 rounded-lg border border-blue-400/30 bg-blue-500/15 px-3 py-2 text-sm font-black text-blue-50 transition hover:bg-blue-500/25 disabled:cursor-not-allowed disabled:opacity-60"
-              aria-pressed
-            >
-              <span aria-hidden="true">{languageFlag(language)}</span>
-              {language.toUpperCase()}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="mt-4 grid grid-cols-4 gap-2 sm:grid-cols-6 lg:grid-cols-8">
-        {LANGUAGES.filter((language) => language.code !== sourceLang).map((language) => {
-          const active = targetLanguages.includes(language.code);
-          const locked = disabled || (!active && targetLanguages.length >= MAX_TARGET_LANGUAGES);
-
-          return (
-            <button
-              key={language.code}
-              type="button"
-              disabled={locked}
-              onClick={() => onToggleTarget(language.code)}
-              className={`min-h-9 rounded-lg border px-2 py-1.5 text-xs font-black uppercase transition ${
-                active
-                  ? "border-blue-400/40 bg-blue-500 text-white"
-                  : "border-white/10 bg-white/[0.04] text-slate-400 hover:border-white/20 hover:text-white disabled:opacity-35"
-              }`}
-              aria-pressed={active}
-              title={language.name}
-            >
-              {language.code}
-            </button>
-          );
-        })}
-      </div>
-
-      <div className="mt-3 flex justify-center border-t border-white/10 pt-3">
-        <button onClick={onSwap} disabled={disabled} className="flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-slate-950/70 text-slate-400 hover:border-blue-500/40 hover:text-white disabled:opacity-40" aria-label="Swap primary language">
-          <ArrowRightLeft className="h-5 w-5" />
-        </button>
-      </div>
-    </div>
-  </div>
-);
 
 const GoogleSignIn = ({
   disabled = false,
@@ -1630,7 +1363,6 @@ export default function App() {
   const isPro = user?.plan === "pro" || isAdminRole(user?.role);
   const isRecording = microphoneActive || mediaRecorderActive || ["connecting", "calibrating", "draining", "translating"].includes(status);
   const latestOriginal = [...originalSegments.slice(-LIVE_SEGMENT_WINDOW), liveText].filter(Boolean).join(" ").trim() || finalText;
-  const latestTranslation = formatTranslationsText(finalTranslations, targetLanguages);
   const isTranslationActive = translationsPending.length > 0 || (mode !== "transcribe" && Object.values(translationStatuses).some((translationState) =>
     ["queued", "processing", "translating", "retrying"].includes(translationState as string)
   ));
@@ -1872,7 +1604,7 @@ export default function App() {
     }
   }, []);
 
-  const applyUserSettings = (settings?: UserSettings) => {
+  const applyUserSettings = useCallback((settings?: UserSettings) => {
     if (!settings) return;
 
     setSourceLang(normalizeLanguageCode(settings.preferredSourceLang || "en") || "en");
@@ -1897,7 +1629,7 @@ export default function App() {
     setPerSpeakerSummary(Boolean(settings.perSpeakerSummary));
     setSentimentTracking(Boolean(settings.sentimentTracking));
     setKeywordsExtraction(settings.keywordsExtraction ?? true);
-  };
+  }, []);
 
   const refreshMe = useCallback(
     async (activeToken = token) => {
@@ -1924,7 +1656,7 @@ export default function App() {
         if (PROTECTED_VIEWS.has(view)) navigate("login");
       }
     },
-    [navigate, token, updateSocketAuth, view]
+    [applyUserSettings, navigate, token, updateSocketAuth, view]
   );
 
   useEffect(() => {
@@ -1960,6 +1692,10 @@ export default function App() {
 
   useEffect(() => {
     if (token) void refreshMe(token);
+    // Intentionally run once on mount only: refreshMe() persists a fresh JWT (a new `iat`) via
+    // setToken(), so depending on `token`/`refreshMe` here would re-trigger this effect on every
+    // refresh, refreshing again forever.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -3362,16 +3098,24 @@ export default function App() {
       setSocketConnected(false);
       setSocketReconnecting(false);
     };
-    // finishDrain is intentionally NOT a dependency here: it transitively depends on
-    // refreshMe -> token, and /api/auth/me issues a fresh JWT (a new iat) on every call. The
-    // 15s trial-countdown poller (see the refreshMe effect above) calls refreshMe while
-    // recording, which reassigns `token` roughly every 15s, which would give finishDrain a new
-    // identity every 15s too. If finishDrain were a dependency, that churn would re-run this
-    // entire effect — disconnecting and recreating the live socket connection out from under
-    // any in-flight translation request, roughly every 15 seconds, for any trial user actively
-    // recording. finishDrainRef (kept fresh on every render, see finishDrainRef.current =
-    // finishDrain above) lets this effect call the latest finishDrain without depending on it.
-  }, [isAuthed, queueDubbingTranslations, updateSocketAuth, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript]);
+    // finishDrain and stopSession are intentionally NOT dependencies here. Both transitively
+    // depend on refreshMe -> token (stopSession also depends on `status` directly), and
+    // /api/auth/me issues a fresh JWT (a new iat) on every call. The 15s trial-countdown poller
+    // (see the refreshMe effect above) calls refreshMe while recording, which reassigns `token`
+    // roughly every 15s, which would give both a new identity every 15s too (and stopSession a
+    // new identity on every status transition as well). If either were a dependency, that churn
+    // would re-run this entire effect — disconnecting and recreating the live socket connection
+    // out from under any in-flight translation request, roughly every 15 seconds, for any trial
+    // user actively recording. finishDrainRef (kept fresh on every render, see
+    // finishDrainRef.current = finishDrain above) lets this effect call the latest finishDrain
+    // without depending on it; the rare trial_expired handler below intentionally calls whatever
+    // stopSession closure this effect last captured rather than depending on the churny one.
+    //
+    // appendTranscriptHistory, cleanupMedia, navigate, and schedulePartialTranscript are genuinely
+    // stable across the token-refresh churn above (none of their own dependency chains include
+    // `token`, `refreshMe`, or `status`), so they are safe to declare as real dependencies.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthed, queueDubbingTranslations, updateSocketAuth, updateTranslationStatuses, flushQueuedAudioChunks, rememberPendingFinalTranscript, forgetPendingFinalTranscript, findPendingFinalTranscript, appendTranscriptHistory, cleanupMedia, navigate, schedulePartialTranscript]);
 
   useEffect(() => {
     const reconnectSocket = () => {
@@ -3437,7 +3181,7 @@ export default function App() {
     dubbingLifecycleRef.current?.resetSeen();
   }, [dubbingLanguageSignature, stopDubbingPlayback]);
 
-  const applyAuthSession = (session: { token: string; user: AppUser }, destination: View = "dashboard") => {
+  const applyAuthSession = useCallback((session: { token: string; user: AppUser }, destination: View = "dashboard") => {
     const normalizedUser = normalizeAuthUser(session.user) as AppUser;
     tokenRef.current = session.token;
     setToken(session.token);
@@ -3448,7 +3192,7 @@ export default function App() {
     setAuthError(null);
     setView(destination);
     window.history.replaceState(null, "", destination === "admin" ? "/admin" : `#${destination}`);
-  };
+  }, [applyUserSettings, updateSocketAuth]);
 
   const handleAuthSubmit = async (payload: { name?: string; email: string; password: string }) => {
     if (authRequestRef.current) return;
@@ -3503,7 +3247,7 @@ export default function App() {
       authRequestRef.current = null;
       setAuthProvider(null);
     }
-  }, []);
+  }, [applyAuthSession]);
 
   const handleAdminUnauthorized = useCallback(() => {
     clearSessionStorage();
@@ -4336,7 +4080,7 @@ export default function App() {
 
       setAlert(message);
     }
-  }, [autoGainControl, beginDrain, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, scheduleAudioRecovery, shareableMode, sourceLang, targetLang, targetLanguages, user?.id, user?.plan, status]);
+  }, [autoGainControl, autoStopOnSilence, beginDrain, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, scheduleAudioRecovery, shareableMode, sourceLang, targetLang, targetLanguages, user?.id, user?.plan, user?.role, user?.subscription, status]);
 
   const handleMicClick = useCallback(() => {
     const phase = utteranceLifecycleRef.current.snapshot().phase;
@@ -4372,7 +4116,7 @@ export default function App() {
       console.warn("[MIC_BUTTON_DISABLED_REASON]", { ...blockedReasons, utteranceLifecyclePhaseStale: phase !== "idle" });
     }
     void startSession();
-  }, [isAuthed, isRecording, startSession, status, stopSession, user?.role, user?.subscription]);
+  }, [audioSource, isAuthed, isRecording, startSession, status, stopSession, user?.role, user?.subscription]);
 
   useEffect(() => {
     // TranslationPanel's native disabled={isBusy} mirrors status === "stopping" exactly (see
@@ -4980,95 +4724,6 @@ export default function App() {
       </div>
     </main>
   );
-
-  const renderAdmin = () => {
-    const barData = adminStats ? [
-      { name: 'Gemini', cost: adminStats.gemini.cost, requests: adminStats.gemini.requests },
-      { name: 'OpenAI', cost: adminStats.openai.cost, requests: adminStats.openai.requests }
-    ] : [];
-
-    const lineData = adminStats?.history || [];
-
-    const totalCost = adminStats ? adminStats.gemini.cost + adminStats.openai.cost : 0;
-    const budgetUsage = adminStats ? (totalCost / adminStats.budget) * 100 : 0;
-    const maxBarCost = Math.max(...barData.map((entry) => entry.cost), 0.001);
-    const recentLineData = lineData.slice(-24);
-    const maxHistoryCost = Math.max(...recentLineData.map((entry: any) => Number(entry.gemini || 0) + Number(entry.openai || 0)), 0.001);
-
-    return (
-      <main className="mx-auto w-full max-w-6xl px-5 py-8">
-        <div className="mb-6 flex items-center justify-between">
-          <h1 className="text-4xl font-black text-white">Admin Dashboard</h1>
-          <div className="text-right">
-            <p className="text-xs font-bold uppercase tracking-widest text-slate-500">Global Budget</p>
-            <p className="text-xl font-black text-white">${totalCost.toFixed(2)} / ${adminStats?.budget?.toFixed(2)}</p>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
-          <GlassPanel className="p-6 md:col-span-2">
-            <p className="mb-6 text-sm font-bold uppercase tracking-widest text-slate-500">API Cost Breakdown (USD)</p>
-            <div className="grid h-64 grid-cols-1 gap-6 md:grid-cols-[220px_1fr]">
-              <div className="flex items-end gap-5 rounded-lg border border-white/5 bg-slate-950/50 p-4">
-                {barData.map((entry) => (
-                  <div key={entry.name} className="flex flex-1 flex-col items-center gap-2">
-                    <div className="flex h-40 w-full items-end rounded bg-slate-900">
-                      <div
-                        className={`w-full rounded-t transition-all duration-500 ${entry.name === "Gemini" ? "bg-blue-500" : "bg-emerald-500"}`}
-                        style={{ height: `${Math.max(4, (entry.cost / maxBarCost) * 100)}%` }}
-                      />
-                    </div>
-                    <p className="text-xs font-black text-white">{entry.name}</p>
-                    <p className="text-[11px] text-slate-500">${entry.cost.toFixed(4)} / {entry.requests} req</p>
-                  </div>
-                ))}
-              </div>
-
-              <div className="rounded-lg border border-white/5 bg-slate-950/50 p-4">
-                <div className="mb-3 flex items-center justify-between text-[10px] font-black uppercase tracking-widest text-slate-500">
-                  <span>24H Spend</span>
-                  <span>${maxHistoryCost.toFixed(4)} peak</span>
-                </div>
-                <div className="flex h-44 items-end gap-1">
-                  {recentLineData.length > 0 ? (
-                    recentLineData.map((entry: any, index: number) => {
-                      const total = Number(entry.gemini || 0) + Number(entry.openai || 0);
-                      return (
-                        <div
-                          key={`${entry.timestamp || index}`}
-                          className="flex-1 rounded-t bg-blue-400/40 transition-all"
-                          style={{ height: `${Math.max(3, (total / maxHistoryCost) * 100)}%` }}
-                          title={`${entry.timestamp || ""} $${total.toFixed(4)}`}
-                        />
-                      );
-                    })
-                  ) : (
-                    <div className="flex h-full w-full items-center justify-center text-sm text-slate-600">No usage history yet.</div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </GlassPanel>
-
-          <GlassPanel className="flex flex-col justify-center p-6">
-            <p className="mb-2 text-sm font-bold uppercase tracking-widest text-slate-500">Monthly Budget Usage</p>
-            <div className="relative pt-1">
-              <div className="mb-4 flex items-center justify-between">
-                <div>
-                  <span className="inline-block rounded-full bg-blue-500/20 px-2 py-1 text-xs font-semibold uppercase text-blue-400">
-                    {budgetUsage.toFixed(1)}% consumed
-                  </span>
-                </div>
-              </div>
-              <div className="mb-4 flex h-2 overflow-hidden rounded bg-slate-800 text-xs">
-                <div style={{ width: `${Math.min(100, budgetUsage)}%` }} className={`shadow-none transition-all duration-500 flex flex-col text-center whitespace-nowrap text-white justify-center ${budgetUsage > 90 ? 'bg-red-500' : budgetUsage > 75 ? 'bg-amber-500' : 'bg-blue-500'}`}></div>
-              </div>
-            </div>
-          </GlassPanel>
-        </div>
-      </main>
-    );
-  };
 
   const renderSettings = () => (
     <main className="mx-auto w-full max-w-6xl px-5 py-8">

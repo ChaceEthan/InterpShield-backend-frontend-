@@ -1,8 +1,10 @@
+// @ts-nocheck
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  GEMINI_TIMEOUT_MS,
   buildGeminiGenerateContentUrl,
   buildGeminiModelsListUrl,
   classifyGeminiError,
@@ -45,6 +47,22 @@ const geminiSuccessResponse = (text) =>
 
 const openAISuccessResponse = (text) =>
   jsonResponse(200, { choices: [{ message: { content: text } }] });
+
+// A real fetch() rejects a pending request the moment its AbortSignal fires; a naive mock that
+// just returns `new Promise(() => {})` does not replicate that, so it can never actually be
+// unblocked by translateOnce's own timeout-driven abort() — leaving the test itself hanging
+// instead of testing what happens when a genuine network stall gets cut off by the timeout.
+const stalledFetch = async (_url, options = {}) =>
+  new Promise((_resolve, reject) => {
+    const signal = options.signal;
+    if (signal?.aborted) {
+      reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+      return;
+    }
+    signal?.addEventListener("abort", () => {
+      reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+    });
+  });
 
 const translations = {
   es: "Confirme que la sala de conferencias permanecerá abierta hasta las seis.",
@@ -621,7 +639,7 @@ let openAIQuotaFailure;
   assert.equal(unavailableError.providerRetryExhausted, true);
 }
 
-const translateWithBackendProviderFallback = async ({ language, geminiRequest, openAIRequest }) => {
+const translateWithBackendProviderFallback = async ({ language, geminiRequest, openAIRequest }, { geminiTimeoutMs } = {}) => {
   let geminiFailure;
 
   try {
@@ -632,7 +650,8 @@ const translateWithBackendProviderFallback = async ({ language, geminiRequest, o
       targetLang: language,
       includeMetadata: true,
       request: geminiRequest,
-      sleep: async () => undefined
+      sleep: async () => undefined,
+      ...(geminiTimeoutMs ? { timeoutMs: geminiTimeoutMs } : {})
     });
   } catch (error) {
     geminiFailure = error;
@@ -917,4 +936,78 @@ assert.match(interpreterSource, /: DEFAULT_TRANSLATION_PROVIDER;\s*\n\s*const or
   assert.equal(frResult.provider, "gemini");
   assert.equal(deResult.text, "Psychisches Wohlbefinden.", "German resolves via OpenAI independently of French's outcome");
   assert.equal(deResult.provider, "openai");
+}
+
+// Real production evidence: Gemini's fetch() genuinely never resolves (a network-level stall,
+// not an HTTP error response), the internal AbortController/timeout fires, and the resulting
+// error must be classified as a real network_timeout — not a billing/quota failure, and not
+// something that silently retries forever. `timeoutMs` is overridden to a few milliseconds so
+// this test proves the real timeout code path without waiting the real 25-second budget.
+{
+  let calls = 0;
+  const start = Date.now();
+  let failure;
+  // The internal AbortController timer is intentionally created with unref() in production (so a
+  // slow provider never blocks process shutdown); with nothing else scheduled, a bare test would
+  // let Node consider the event loop "empty" and exit before that unref'd timer ever fires. A
+  // small ref'd keep-alive timer is test-only scaffolding to give the real timer a chance to run.
+  const keepAlive = setTimeout(() => {}, 500);
+  try {
+    await translateWithGemini({
+      apiKey: "test-only",
+      text: sourceText,
+      sourceLang: "en",
+      targetLang: "fr",
+      timeoutMs: 40,
+      request: async (url, options) => {
+        calls += 1;
+        // Simulates a stalled Render -> Google connection: only resolves if/when aborted.
+        return stalledFetch(url, options);
+      },
+      sleep: async () => undefined
+    });
+  } catch (error) {
+    failure = error;
+  } finally {
+    clearTimeout(keepAlive);
+  }
+  const elapsedMs = Date.now() - start;
+  assert.ok(failure, "a genuinely stalled Gemini fetch must still reject once its timeout elapses");
+  assert.match(failure.message, /timed out/i);
+  assert.equal(failure.errorCategory, "network_timeout", "a real stall must classify as network_timeout, never as a billing/quota failure");
+  assert.equal(calls, 1, "a hard network stall (no status code) must not be retried within the same attempt budget");
+  assert.ok(elapsedMs < 2000, `the timeout must actually bound the call instead of hanging (took ${elapsedMs}ms)`);
+}
+
+// The full production chain from Phase 3: Gemini times out (a real stall, not an HTTP error),
+// then OpenAI is attempted as fallback and returns 429 with no credits. The result must reach a
+// terminal FAILED state with both providers' diagnostics available — never left implying the
+// target is still "retrying" or "translating" once both providers have genuinely been exhausted.
+{
+  let openAICalls = 0;
+  let failure;
+  const keepAlive = setTimeout(() => {}, 500);
+  try {
+    await translateWithBackendProviderFallback({
+      language: "fr",
+      // Only resolves if/when aborted: a genuine network stall, not an HTTP error response.
+      geminiRequest: stalledFetch,
+      openAIRequest: async () => {
+        openAICalls += 1;
+        return jsonResponse(429, {
+          error: { message: "You have no credits remaining.", code: "insufficient_quota", type: "insufficient_quota" }
+        });
+      }
+    }, { geminiTimeoutMs: 40 });
+  } catch (error) {
+    failure = error;
+  } finally {
+    clearTimeout(keepAlive);
+  }
+
+  assert.ok(failure, "Gemini timeout + OpenAI 429 must terminate, not hang indefinitely");
+  assert.equal(openAICalls, 1, "OpenAI fallback must be attempted exactly once after a genuine Gemini timeout");
+  assert.equal(failure.httpStatus, 429);
+  assert.equal(failure.errorCategory, "billing_quota_exhausted");
+  assert.equal(failure.providerRetryExhausted, true, "a terminal OpenAI billing failure must not be retried further, so the target can settle into FAILED instead of staying RETRYING/Translating forever");
 }

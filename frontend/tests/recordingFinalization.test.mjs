@@ -161,7 +161,7 @@ assert.doesNotMatch(appSource, /RECORDING_SESSION_CONTINUES|CONTINUOUS_INACTIVIT
   const translationJobsCreated = [];
   const cardsCompleted = [];
 
-  const beginDrainForUtterance = (utteranceId) => {
+  const beginDrainForUtterance = (_utteranceId) => {
     if (awaitingFinalTranscript) return false; // mirrors: if (awaitingFinalTranscriptRef.current) return false;
     awaitingFinalTranscript = true;
     return true;

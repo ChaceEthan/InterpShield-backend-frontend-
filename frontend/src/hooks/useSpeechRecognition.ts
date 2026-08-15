@@ -106,7 +106,7 @@ export const useSpeechRecognition = (options: SpeechRecognitionOptions = {}) => 
           restartTimeoutRef.current = window.setTimeout(() => {
             try {
               recognitionRef.current?.start();
-            } catch (e) {
+            } catch {
               // Browser already started, ignore
             }
           }, 100);
@@ -190,7 +190,7 @@ export const useSpeechRecognition = (options: SpeechRecognitionOptions = {}) => 
       isManualStopRef.current = false;
       recognitionRef.current?.start();
       return true;
-    } catch (error) {
+    } catch {
       // Already started or other error
       return false;
     }
@@ -208,7 +208,7 @@ export const useSpeechRecognition = (options: SpeechRecognitionOptions = {}) => 
 
     try {
       recognitionRef.current?.stop();
-    } catch (error) {
+    } catch {
       // Already stopped
     }
   }, []);
@@ -218,7 +218,7 @@ export const useSpeechRecognition = (options: SpeechRecognitionOptions = {}) => 
     stop();
     try {
       recognitionRef.current?.abort();
-    } catch (error) {
+    } catch {
       // Already aborted
     }
   }, [stop]);

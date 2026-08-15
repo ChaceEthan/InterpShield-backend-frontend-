@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { createDeepgramSession } from "./deepgram.js";
-import { classifyGeminiError, translateWithGemini } from "./gemini.js";
+import { GEMINI_TIMEOUT_MS, classifyGeminiError, translateWithGemini } from "./gemini.js";
 import { classifyOpenAIError, translateWithOpenAI } from "./openai.js";
 import {
   detectLocalSourceLanguage,
@@ -88,7 +88,7 @@ const ADMIN_STATS_EMIT_MS = 10000;
 const FINAL_TRANSCRIPT_DUPLICATE_WINDOW_MS = 1500;
 const TRANSLATED_SENTENCE_DUPLICATE_WINDOW_MS = 2500;
 const PROVIDER_TIMEOUT_MS = {
-  gemini: 25000,
+  gemini: GEMINI_TIMEOUT_MS,
   openai: 22000
 };
 const PROVIDER_FAILURE_THRESHOLD = 6;
@@ -1884,7 +1884,10 @@ export const createInterpreterSession = async ({
             targetLang: language,
             translationContext: languageTranslationContext,
             signal: abortController?.signal,
-            includeMetadata: true
+            includeMetadata: true,
+            sessionId,
+            jobId,
+            requestId: requestId || `${jobId}:${language}:${provider}:${Date.now().toString(36)}`
           }),
           timeoutMs,
           `${providerName} translation timed out for ${language}`

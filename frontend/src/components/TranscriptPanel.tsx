@@ -77,7 +77,7 @@ export const LiveTranscriptPanel: React.FC<LiveTranscriptPanelProps> = ({
       {/* Transcript list */}
       <div ref={scrollRef} className="max-h-[400px] scroll-smooth space-y-0 overflow-y-auto overscroll-contain pb-4 pr-1 [scrollbar-gutter:stable]">
         <AnimatePresence mode="popLayout">
-          {displayEntries.map((entry, index) => (
+          {displayEntries.map((entry) => (
             <motion.button
               key={entry.id}
               layoutId={entry.id}

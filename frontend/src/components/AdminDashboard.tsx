@@ -47,7 +47,7 @@ const formatTrialUsed = (user: AdminUser) => {
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 };
 
-export function AdminLogin({ api, error, busy, onLogin }: { api: string; error: string | null; busy: boolean; onLogin: (email: string, password: string) => void }) {
+export function AdminLogin({ api: _api, error, busy, onLogin }: { api: string; error: string | null; busy: boolean; onLogin: (email: string, password: string) => void }) {
   const [email, setEmail] = useState(""); const [password, setPassword] = useState("");
   return <main className="mx-auto flex min-h-[calc(100dvh-76px)] w-full max-w-md items-center px-5 py-10"><section className="w-full rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
     <div className="mb-6 flex items-center gap-3"><span className="grid h-10 w-10 place-items-center rounded-xl bg-blue-600 text-white"><Shield className="h-5 w-5" /></span><div><h1 className="text-xl font-black text-gray-950">Admin access</h1><p className="text-sm text-gray-500">Authorized personnel only</p></div></div>

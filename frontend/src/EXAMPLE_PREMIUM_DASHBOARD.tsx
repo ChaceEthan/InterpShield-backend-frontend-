@@ -1,6 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Menu, Settings, LogOut, History } from 'lucide-react';
+import { Settings, LogOut } from 'lucide-react';
 
 // Import premium hooks
 import { useSocket } from './hooks/useSocket';
@@ -9,7 +9,7 @@ import { useAuth } from './hooks/useAuth';
 import { useAudioStream, getSupportedAudioMimeType } from './hooks/useAudioStream';
 
 // Import premium components
-import { GlassPanel, StatusBadge, AnimatedIcon } from './components/GlassUI';
+import { GlassPanel, StatusBadge } from './components/GlassUI';
 import { AnimatedMic, LiveIndicator, SessionTimer } from './components/AnimatedMic';
 import { LiveTranscriptPanel, LanguageSelector, ConnectionStatus } from './components/TranscriptPanel';
 import { LANGUAGE_CATALOG, LANGUAGE_FLAGS } from '../../shared/languages.mjs';
@@ -138,7 +138,7 @@ export default function PremiumDashboard() {
       });
 
       // Create enhanced audio stream
-      const enhanced = audio.createEnhancedStream(stream);
+      audio.createEnhancedStream(stream);
 
       // Start recording
       setIsRecording(true);

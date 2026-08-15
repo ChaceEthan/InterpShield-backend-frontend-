@@ -20,7 +20,10 @@ import {
 
 const GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_GEMINI_MODEL = "gemini-flash-latest";
-const GEMINI_TIMEOUT_MS = 25000;
+// Single source of truth for the Gemini HTTP timeout budget: interpreter.js's outer
+// per-attempt AbortController/Promise.race timeout imports this instead of hardcoding its own
+// matching constant, so the two timeout layers can never silently drift apart.
+export const GEMINI_TIMEOUT_MS = 25000;
 const GEMINI_MAX_ATTEMPTS = 3;
 const GEMINI_RETRY_BASE_MS = 1000;
 const GEMINI_RETRY_MAX_MS = 4000;
@@ -281,7 +284,19 @@ const contextInstructions = (translationContext = {}) => {
   return instructions;
 };
 
-const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, translationContext, timeoutMs = GEMINI_TIMEOUT_MS, signal, request = globalThis.fetch }) => {
+// Production-safe diagnostics only: never logs GEMINI_API_KEY/OPENAI_API_KEY, auth headers, or
+// full transcripts. Exists to answer, on the NEXT occurrence, exactly which stage of the HTTP
+// round trip a stalled Gemini request is stuck in (connect, headers, or body) instead of guessing.
+const logGeminiDiagnostic = (event, payload = {}) => {
+  const safePayload = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (value === undefined || value === null) continue;
+    safePayload[key] = value;
+  }
+  console.info(JSON.stringify({ timestamp: new Date().toISOString(), severity: "INFO", event, ...safePayload }));
+};
+
+const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, translationContext, timeoutMs = GEMINI_TIMEOUT_MS, signal, request = globalThis.fetch, sessionId, jobId, requestId }) => {
   const targetLanguage = describeLanguage(targetLang);
   const sourceLanguage = sourceLang ? describeSourceLanguage(sourceLang) : "auto-detected language";
   const controller = new AbortController();
@@ -293,6 +308,47 @@ const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, tran
   }, timeoutMs);
   timeout.unref?.();
 
+  const promptContextLines = [
+    "You are a professional real-time interpreter.",
+    `Translate the user's text from ${sourceLanguage} to ${targetLanguage}.`,
+    `Supported input and output languages are: ${SUPPORTED_LANGUAGE_LIST}.`,
+    `Translate to ${targetLanguage}.`,
+    `The output language must be ${targetLanguage}.`,
+    "Speak naturally like a real East African human interpreter, not a literal machine translator.",
+    "Preserve slang meaning, emotion, respect level, personality, and conversational flow.",
+    "Prefer local vocabulary and natural sentence structure over word-for-word translation.",
+    "Avoid robotic, overly formal, or over-English phrasing.",
+    "Never return English unless the target language is English (en) or the requested target is unsupported.",
+    ...targetLanguageInstructions(targetLang),
+    ...contextInstructions(translationContext),
+    "Do not copy, echo, transliterate, explain, label, or quote the source text.",
+    "Preserve tone, intent, names, numbers, and formatting where possible.",
+    "Return only the translated text.",
+    "",
+    "Text:",
+    text
+  ];
+  const promptText = promptContextLines.join("\n");
+  const sourceChars = text?.length || 0;
+  const contextChars = promptText.length - sourceChars;
+  const requestBody = JSON.stringify({
+    contents: [{ role: "user", parts: [{ text: promptText }] }],
+    generationConfig: { temperature: 0, maxOutputTokens: 512 }
+  });
+
+  const requestStartedAt = Date.now();
+  logGeminiDiagnostic("GEMINI_REQUEST_START", {
+    sessionId,
+    jobId,
+    requestId,
+    targetLanguage: targetLang,
+    model,
+    sourceChars,
+    contextChars,
+    estimatedRequestChars: requestBody.length,
+    timeoutMs
+  });
+
   let response;
   try {
     response = await request(buildGeminiGenerateContentUrl(model), {
@@ -302,43 +358,31 @@ const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, tran
         "Content-Type": "application/json",
         "X-goog-api-key": apiKey
       },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: "user",
-            parts: [
-              {
-                text: [
-                  "You are a professional real-time interpreter.",
-                  `Translate the user's text from ${sourceLanguage} to ${targetLanguage}.`,
-                  `Supported input and output languages are: ${SUPPORTED_LANGUAGE_LIST}.`,
-                  `Translate to ${targetLanguage}.`,
-                  `The output language must be ${targetLanguage}.`,
-                  "Speak naturally like a real East African human interpreter, not a literal machine translator.",
-                  "Preserve slang meaning, emotion, respect level, personality, and conversational flow.",
-                  "Prefer local vocabulary and natural sentence structure over word-for-word translation.",
-                  "Avoid robotic, overly formal, or over-English phrasing.",
-                  "Never return English unless the target language is English (en) or the requested target is unsupported.",
-                  ...targetLanguageInstructions(targetLang),
-                  ...contextInstructions(translationContext),
-                  "Do not copy, echo, transliterate, explain, label, or quote the source text.",
-                  "Preserve tone, intent, names, numbers, and formatting where possible.",
-                  "Return only the translated text.",
-                  "",
-                  "Text:",
-                  text
-                ].join("\n")
-              }
-            ]
-          }
-        ],
-        generationConfig: {
-          temperature: 0,
-          maxOutputTokens: 512
-        }
-      })
+      body: requestBody
+    });
+    logGeminiDiagnostic("GEMINI_HTTP_RESPONSE", {
+      sessionId,
+      jobId,
+      requestId,
+      targetLanguage: targetLang,
+      model,
+      httpStatus: response.status,
+      latencyMs: Date.now() - requestStartedAt
     });
   } catch (error) {
+    logGeminiDiagnostic("GEMINI_REQUEST_ERROR", {
+      sessionId,
+      jobId,
+      requestId,
+      targetLanguage: targetLang,
+      model,
+      errorName: error?.name || null,
+      errorCategory: timedOut || error?.name === "AbortError" ? "network_timeout" : null,
+      httpStatus: null,
+      latencyMs: Date.now() - requestStartedAt,
+      aborted: Boolean(mergedSignal.signal?.aborted),
+      timedOut
+    });
     if (signal?.aborted) throw new Error("Gemini translation aborted");
     if (timedOut || error?.name === "AbortError") {
       const timeoutError = new Error(`Gemini translation timed out for ${targetLanguage}`);
@@ -354,6 +398,15 @@ const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, tran
   }
 
   const data = await response.json().catch(() => ({}));
+  logGeminiDiagnostic("GEMINI_RESPONSE_PARSED", {
+    sessionId,
+    jobId,
+    requestId,
+    targetLanguage: targetLang,
+    model,
+    translatedTextLength: extractGeminiText(data).length,
+    latencyMs: Date.now() - requestStartedAt
+  });
   if (!response.ok) {
     const reason = data?.error?.message || data?.message || response.statusText || "Gemini request failed";
     const error = new Error(reason);
@@ -370,6 +423,19 @@ const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, tran
     error.errorDetails = Array.isArray(data?.error?.details) ? data.error.details : [];
     error.retryAfterMs = getRetryAfterMs(error) ?? parseGeminiRetryDelayMs(error);
     error.errorCategory = classifyGeminiError(error);
+    logGeminiDiagnostic("GEMINI_REQUEST_ERROR", {
+      sessionId,
+      jobId,
+      requestId,
+      targetLanguage: targetLang,
+      model,
+      errorName: error.name,
+      errorCategory: error.errorCategory,
+      httpStatus: error.httpStatus,
+      latencyMs: Date.now() - requestStartedAt,
+      aborted: false,
+      timedOut: false
+    });
     throw error;
   }
 
@@ -384,7 +450,7 @@ const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, tran
   return { text: translatedText, model };
 };
 
-export const translateWithGemini = async ({ apiKey, model = GEMINI_MODEL, text, sourceLang, targetLang, translationContext, signal, includeMetadata = false, request = globalThis.fetch, sleep = delay }) => {
+export const translateWithGemini = async ({ apiKey, model = GEMINI_MODEL, text, sourceLang, targetLang, translationContext, signal, includeMetadata = false, request = globalThis.fetch, sleep = delay, sessionId, jobId, requestId, timeoutMs = GEMINI_TIMEOUT_MS }) => {
   const cleanText = text?.trim();
 
   if (!cleanText) {
@@ -426,9 +492,12 @@ export const translateWithGemini = async ({ apiKey, model = GEMINI_MODEL, text, 
           sourceLang,
           targetLang,
           translationContext,
-          timeoutMs: GEMINI_TIMEOUT_MS,
+          timeoutMs,
           signal,
-          request
+          request,
+          sessionId,
+          jobId,
+          requestId
         });
 
         if (signal?.aborted) throw new Error("Gemini translation aborted");
@@ -522,7 +591,13 @@ export const translateWithGemini = async ({ apiKey, model = GEMINI_MODEL, text, 
           continue;
         }
 
-        const retryable = !status || [408, 409, 500, 502, 503, 504].includes(status);
+        // A genuine network_timeout already consumed this attempt's full timeoutMs budget with
+        // no response at all — retrying it here would silently multiply worst-case latency by
+        // up to GEMINI_MAX_ATTEMPTS (e.g. 3 x 25s) for exactly the failure mode where that cost
+        // matters most to a live interpreter. The caller (interpreter.js) already owns its own
+        // retry/circuit-breaker decision for this provider via its own outer attempt loop and
+        // cooldown tracking, so a hard stall must fail fast here and let that layer decide.
+        const retryable = error.errorCategory !== "network_timeout" && (!status || [408, 409, 500, 502, 503, 504].includes(status));
         if (!retryable || attempt >= GEMINI_MAX_ATTEMPTS) {
           error.providerRetryExhausted = true;
           throw error;
