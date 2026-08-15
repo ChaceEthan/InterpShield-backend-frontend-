@@ -3320,6 +3320,11 @@ export default function App() {
 
     clearSessionStorage();
     stopDubbingPlayback(true);
+    // A logout mid-recording must fully release capture and reset the utterance lifecycle back
+    // to idle — otherwise the next login's first mic press inherits a stale non-idle phase.
+    if (recordingRef.current || utteranceLifecycleRef.current.snapshot().phase !== "idle") {
+      cleanupMedia({ stopReason: "logout" });
+    }
     setToken(null);
     setUser(null);
     setStatus("idle");
@@ -3360,16 +3365,74 @@ export default function App() {
   }, [fetchHistory, view]);
 
   const startSession = useCallback(async () => {
-    if (sessionActionInFlightRef.current || startInFlightRef.current || recordingRef.current || utteranceLifecycleRef.current.snapshot().phase !== "idle") {
+    // "session_action_in_progress" must only ever mean a real session action is actually
+    // running — never a merely stale utteranceLifecycleRef phase. Conflating the two (as this
+    // guard used to, by OR-ing a raw phase !== "idle" check into the same block) permanently
+    // wedges the mic button any time the lifecycle phase outlives the session that set it: every
+    // later press is rejected before getUserMedia/getDisplayMedia is ever reached, with no path
+    // back to idle short of a page reload.
+    if (sessionActionInFlightRef.current || startInFlightRef.current || stopInFlightRef.current || recordingRef.current) {
       console.warn("[MIC_START_BLOCKED]", {
         reason: "session_action_in_progress",
         sessionActionInFlight: sessionActionInFlightRef.current,
         startInFlight: startInFlightRef.current,
+        stopInFlight: stopInFlightRef.current,
         recordingActive: recordingRef.current,
         phase: utteranceLifecycleRef.current.snapshot().phase
       });
       return;
     }
+
+    const lifecyclePhaseAtEntry = utteranceLifecycleRef.current.snapshot().phase;
+    if (lifecyclePhaseAtEntry !== "idle") {
+      // Every ref that would indicate a real in-progress session (checked above) is false, so a
+      // non-idle lifecycle phase here can only be a stale leftover from a previous session that
+      // completed, failed, or was interrupted without utteranceLifecycleRef itself being reset
+      // back to idle. Before trusting that diagnosis, confirm there is genuinely no live
+      // recorder/stream this phase could still legitimately belong to.
+      const staleRecorder = mediaRecorderRef.current;
+      const recorderGenuinelyActive = staleRecorder?.state !== undefined && staleRecorder.state !== "inactive";
+      const streamGenuinelyLive = streamRef.current?.getTracks().some((track) => track.readyState === "live") ?? false;
+      if (recorderGenuinelyActive || streamGenuinelyLive) {
+        console.warn("[MIC_START_BLOCKED]", {
+          reason: "recording_already_active",
+          phase: lifecyclePhaseAtEntry,
+          recorderState: staleRecorder?.state || "none",
+          streamLive: streamGenuinelyLive,
+          source: audioSourceRef.current
+        });
+        return;
+      }
+      console.warn("[MIC_STALE_LIFECYCLE_RECOVERED]", {
+        previousPhase: lifecyclePhaseAtEntry,
+        status,
+        recordingActive: recordingRef.current,
+        recorderState: staleRecorder?.state || "none",
+        streamLive: streamGenuinelyLive,
+        source: audioSourceRef.current
+      });
+      // Normalize only capture/utterance-lifecycle state — never auth, user, subscription,
+      // translation history, settings, or provider state.
+      utteranceLifecycleRef.current.resetToIdle();
+      sessionReadyRef.current = false;
+      awaitingFinalTranscriptRef.current = false;
+      setAwaitingFinalTranscript(false);
+      drainPendingLanguagesRef.current.clear();
+      recorderStopReasonRef.current = "";
+      recorderStartedForGenerationRef.current = null;
+      recorderStoppedForGenerationRef.current = null;
+      finalizationEmittedForGenerationRef.current = null;
+      recorderGenerationRestartRef.current = false;
+      if (drainTimeoutRef.current) window.clearTimeout(drainTimeoutRef.current);
+      drainTimeoutRef.current = null;
+      if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
+      captionWatchdogTimerRef.current = null;
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+      void audioContextRef.current?.close().catch(() => undefined);
+      audioContextRef.current = null;
+    }
+
     console.info("[MIC_START_ENTERED]", { phase: utteranceLifecycleRef.current.snapshot().phase, source: audioSourceRef.current });
     primeSpeechSynthesis();
 
@@ -4063,20 +4126,22 @@ export default function App() {
       stopSession();
       return;
     }
-    // The click registers (the button is not natively disabled here), but startSession()'s
-    // own entry guard can still silently no-op if any of these are stuck non-idle/true from
-    // a prior session that failed to fully reset — log exactly which one so a real device
-    // report can show precisely why nothing happened.
+    // The click registers (the button is not natively disabled here), but startSession()'s own
+    // entry guard can still silently no-op if any of these are stuck true from a prior session
+    // that failed to fully reset — log exactly which one so a real device report can show
+    // precisely why nothing happened. A stale, non-idle lifecycle phase alone does NOT block
+    // startSession() (it self-heals via [MIC_STALE_LIFECYCLE_RECOVERED]), so it's reported here
+    // as context, not as a blocking reason.
     const blockedReasons = {
       sessionActionInFlight: sessionActionInFlightRef.current,
       startInFlight: startInFlightRef.current,
+      stopInFlight: stopInFlightRef.current,
       recordingActive: recordingRef.current,
-      utteranceLifecyclePhaseNotIdle: phase !== "idle",
       notAuthenticated: !isAuthed,
       trialExhausted: Boolean(user?.role === "user" && user.subscription && !user.subscription.canUseInterpreter)
     };
-    if (Object.values(blockedReasons).some(Boolean)) {
-      console.warn("[MIC_BUTTON_DISABLED_REASON]", blockedReasons);
+    if (Object.values(blockedReasons).some(Boolean) || phase !== "idle") {
+      console.warn("[MIC_BUTTON_DISABLED_REASON]", { ...blockedReasons, utteranceLifecyclePhaseStale: phase !== "idle" });
     }
     void startSession();
   }, [isAuthed, isRecording, startSession, status, stopSession, user?.role, user?.subscription]);
@@ -4096,6 +4161,29 @@ export default function App() {
       awaitingFinalTranscript: awaitingFinalTranscriptRef.current,
       source: audioSource
     });
+
+    // The impossible combination this whole fix exists to catch: every indicator agrees nothing
+    // is recording or in flight, yet the utterance lifecycle never made it back to "idle". This
+    // opportunistically self-heals it (there is provably no live recorder/stream to protect)
+    // even before the user presses the mic again, and gives production visibility into how the
+    // stale phase is actually being reached.
+    if (status === "idle" && !isRecording && !startInFlightRef.current && !stopInFlightRef.current && !sessionActionInFlightRef.current) {
+      const lifecycle = utteranceLifecycleRef.current.snapshot();
+      if (lifecycle.phase !== "idle") {
+        const recorder = mediaRecorderRef.current;
+        const recorderGenuinelyActive = recorder?.state !== undefined && recorder.state !== "inactive";
+        const streamGenuinelyLive = streamRef.current?.getTracks().some((track) => track.readyState === "live") ?? false;
+        console.error("[MIC_LIFECYCLE_INVARIANT_VIOLATION]", {
+          status,
+          recordingActive: recordingRef.current,
+          phase: lifecycle.phase,
+          recorderState: recorder?.state || "none",
+          streamLive: streamGenuinelyLive,
+          source: audioSource
+        });
+        if (!recorderGenuinelyActive && !streamGenuinelyLive) utteranceLifecycleRef.current.resetToIdle();
+      }
+    }
   }, [status, isRecording, audioSource]);
 
   useEffect(() => {
