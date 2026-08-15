@@ -6,7 +6,7 @@ import History from "../models/History.js";
 import User from "../models/User.js";
 import { httpError, safeUser } from "./authService.js";
 import { canChangeUserRole, canManageUser } from "../middleware/authorization.js";
-import { activateSubscription, addDays, applyUnlimited, expireSubscription, initializeTrial, subscriptionSnapshot } from "./subscriptionService.js";
+import { activateSubscription, addTrialSeconds, applyUnlimited, expireSubscription, expireTrialNow, initializeTrial, resetTrialUsage, subscriptionSnapshot } from "./subscriptionService.js";
 
 /** @typedef {{id: string, role: string}} AdminActor */
 /** @typedef {{search?: unknown, role?: unknown, status?: unknown, plan?: unknown, limit?: unknown}} AdminUserQuery */
@@ -184,8 +184,9 @@ export const updateUserRole = async ({ actor, targetId, role, reason, ip }) => {
 export const updateUserSubscription = async ({ actor, targetId, action, days, type, reason, ip }) => {
   const target = await User.findById(targetId); if (!target) throw httpError("User not found.", 404);
   if (!canManageUser(actor, target)) throw httpError("Access denied.", 403); const cleanReason = requireReason(reason); const now = new Date();
-  if (action === "grant_trial") { target.role = "user"; target.trialStartAt = now; target.trialEndsAt = addDays(now, 7); target.subscriptionType = "trial"; target.subscriptionStatus = "active"; target.status = "active"; target.isTrial = true; target.isUnlimited = false; }
-  else if (action === "extend_trial") { target.trialEndsAt = addDays(target.trialEndsAt && new Date(target.trialEndsAt) > now ? target.trialEndsAt : now, Math.max(1, Number(days) || 7)); target.status = "active"; target.subscriptionStatus = "active"; target.subscriptionType = "trial"; target.isTrial = true; }
+  if (action === "reset_trial") resetTrialUsage(target, now);
+  else if (action === "add_trial_minutes") addTrialSeconds(target, Math.max(1, Number(days) || 5) * 60);
+  else if (action === "expire_trial") expireTrialNow(target);
   else if (["end_trial", "expire"].includes(action)) expireSubscription(target);
   else if (action === "activate") activateSubscription(target, { type: type || "monthly", provider: "manual" });
   else if (action === "cancel") { target.subscriptionStatus = "cancelled"; target.nextRenewalAt = null; }

@@ -126,7 +126,7 @@ interface AppUser {
   provider: string;
   role?: "super_admin" | "admin" | "user";
   status?: "active" | "expired" | "suspended" | "deactivated";
-  subscription?: { planLabel: string; subscriptionStatus: string; subscriptionType: string; trialEndsAt?: string | null; subscriptionEndsAt?: string | null; daysRemaining?: number | null; isTrial: boolean; isUnlimited: boolean; canUseInterpreter: boolean; nextRenewalAt?: string | null };
+  subscription?: { planLabel: string; subscriptionStatus: string; subscriptionType: string; trialSecondsRemaining?: number | null; trialSecondsUsed?: number | null; trialSecondsTotal?: number; subscriptionEndsAt?: string | null; daysRemaining?: number | null; isTrial: boolean; isUnlimited: boolean; canUseInterpreter: boolean; nextRenewalAt?: string | null };
   planOverride?: "free" | "starter" | "pro" | "unlimited";
   mustChangePassword?: boolean;
   settings?: UserSettings;
@@ -1135,7 +1135,8 @@ const TypingSubtitle = ({ text, muted = false, empty = "Waiting for speech..." }
 
 const SubscriptionPage = ({ user }: { user: AppUser | null }) => {
   const subscription = user?.subscription; const plans = ["Free Trial", "Monthly", "Quarterly", "Yearly", "Enterprise"];
-  return <main className="mx-auto min-h-[70vh] w-full max-w-5xl px-5 py-10"><h1 className="text-3xl font-black">Subscription</h1><p className="mt-2 text-gray-600">Payment processing is not enabled yet. Your account is ready for a future provider.</p>{subscription && <section className="mt-6 grid gap-3 rounded-2xl border bg-white p-5 sm:grid-cols-2 lg:grid-cols-4"><div><b>Current plan</b><p>{subscription.planLabel}</p></div><div><b>Remaining days</b><p>{subscription.daysRemaining == null ? "Never" : subscription.daysRemaining}</p></div><div><b>Expiration date</b><p>{subscription.subscriptionEndsAt || subscription.trialEndsAt ? new Date(subscription.subscriptionEndsAt || subscription.trialEndsAt || "").toLocaleDateString() : "Never expires"}</p></div><div><b>Renewal date</b><p>{subscription.nextRenewalAt ? new Date(subscription.nextRenewalAt).toLocaleDateString() : "Not scheduled"}</p></div></section>}<section className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">{plans.map((plan) => <article key={plan} className="rounded-xl border bg-white p-4"><h2 className="font-black">{plan}</h2><p className="mt-2 text-sm text-gray-500">Provider-ready plan</p></article>)}</section><section className="mt-6 rounded-xl border bg-white p-5"><h2 className="font-black">Payment history</h2><p className="mt-2 text-sm text-gray-500">No payment history yet.</p></section></main>;
+  const onTrial = Boolean(subscription?.isTrial) && subscription?.trialSecondsRemaining != null;
+  return <main className="mx-auto min-h-[70vh] w-full max-w-5xl px-5 py-10"><h1 className="text-3xl font-black">Subscription</h1><p className="mt-2 text-gray-600">Payment processing is not enabled yet. Your account is ready for a future provider.</p>{subscription && <section className="mt-6 grid gap-3 rounded-2xl border bg-white p-5 sm:grid-cols-2 lg:grid-cols-4"><div><b>Current plan</b><p>{subscription.planLabel}</p></div><div><b>{onTrial ? "Trial remaining" : "Remaining days"}</b><p>{onTrial ? `${formatTime(Math.max(0, subscription.trialSecondsRemaining || 0))} of 5:00` : subscription.daysRemaining == null ? "Never" : subscription.daysRemaining}</p></div><div><b>Expiration date</b><p>{subscription.isUnlimited ? "Never expires" : onTrial ? "Ends when your 5 minutes of usage are used" : subscription.subscriptionEndsAt ? new Date(subscription.subscriptionEndsAt).toLocaleDateString() : "Never expires"}</p></div><div><b>Renewal date</b><p>{subscription.nextRenewalAt ? new Date(subscription.nextRenewalAt).toLocaleDateString() : "Not scheduled"}</p></div></section>}<section className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">{plans.map((plan) => <article key={plan} className="rounded-xl border bg-white p-4"><h2 className="font-black">{plan}</h2><p className="mt-2 text-sm text-gray-500">Provider-ready plan</p></article>)}</section><section className="mt-6 rounded-xl border bg-white p-5"><h2 className="font-black">Payment history</h2><p className="mt-2 text-sm text-gray-500">No payment history yet.</p></section></main>;
 };
 
 const LanguageSelect = ({
@@ -1892,6 +1893,15 @@ export default function App() {
     [navigate, token, updateSocketAuth, view]
   );
 
+  useEffect(() => {
+    if (!isRecording || user?.role !== "user" || !user.subscription || user.subscription.isUnlimited || user.subscription.trialSecondsRemaining == null) return undefined;
+    // The 5-minute trial is server-authoritative and metered in the backend while the live
+    // session is open; this just periodically re-reads that value so the countdown shown
+    // here (and the block-on-zero check in startSession) never drifts far from the DB.
+    const timer = window.setInterval(() => { void refreshMe(); }, 15000);
+    return () => window.clearInterval(timer);
+  }, [isRecording, refreshMe, user?.role, user?.subscription]);
+
   const updateSettings = async (settings: UserSettings) => {
     if (!token || !user) return;
 
@@ -2285,7 +2295,8 @@ export default function App() {
     setStatus("idle");
     utteranceLifecycleRef.current.resetToIdle();
     stopInFlightRef.current = false;
-  }, [cleanupMedia]);
+    void refreshMe();
+  }, [cleanupMedia, refreshMe]);
   finishDrainRef.current = finishDrain;
 
   const beginDrain = useCallback((reason = "vad_sustained_silence", generation = activeRecordingGenerationRef.current) => {
@@ -2411,7 +2422,8 @@ export default function App() {
     setStatus("idle");
     utteranceLifecycleRef.current.resetToIdle();
     stopInFlightRef.current = false;
-  }, [cleanupMedia, status]);
+    void refreshMe();
+  }, [cleanupMedia, refreshMe, status]);
 
   useEffect(() => {
     if (!isAuthed || !tokenRef.current) return undefined;
@@ -2725,6 +2737,11 @@ export default function App() {
 
     socket.on("session_error", handleSessionError);
     socket.on("app-error", handleSessionError);
+    socket.on("trial_expired", ({ message }: { message?: string }) => {
+      if (recordingRef.current) stopSession();
+      setAlert(message || "Your 5-minute free trial has ended. Choose a plan to continue using InterpShield.");
+      navigate("subscription");
+    });
 
     const trackLatency = (latency?: number, provider?: string) => {
       if (typeof latency === "number" && provider) {
@@ -3302,7 +3319,7 @@ export default function App() {
     }
 
     if (user?.role === "user" && user.subscription && !user.subscription.canUseInterpreter) {
-      setAlert("Your free trial has expired. Please purchase a subscription to continue using InterpShield.");
+      setAlert("Your 5-minute free trial has ended. Choose a plan to continue using InterpShield.");
       navigate("subscription");
       return;
     }

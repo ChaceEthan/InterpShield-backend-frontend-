@@ -2,7 +2,7 @@
 import { verifyToken } from "../services/authService.js";
 import User from "../models/User.js";
 import { isAccountActive } from "../middleware/authorization.js";
-import { EXPIRED_ACCESS_MESSAGE, normalizeSubscription, subscriptionSnapshot } from "../services/subscriptionService.js";
+import { consumeTrialUsage, EXPIRED_ACCESS_MESSAGE, hasActiveSubscription, isUnlimitedUser, normalizeSubscription, subscriptionSnapshot } from "../services/subscriptionService.js";
 import { createInterpreterSession, isTranslationDisplayable } from "../services/interpreter.js";
 import {
   createAudioPipelineSession,
@@ -19,6 +19,57 @@ const LOG_TEXT_PREVIEW_CHARS = 96;
 const DISCONNECTED_SESSION_GRACE_MS = 2 * 60 * 1000;
 const callRooms = new Map();
 const reconnectableSessions = new Map();
+// Server-authoritative trial metering, keyed by clientSessionId (NOT socket.id) so a single
+// meter survives socket reconnects instead of being duplicated or orphaned: the interpreter
+// `session`/`audioPipeline` already survive reconnects via reconnectableSessions, and this
+// mirrors that same lifecycle rather than living on a per-connection closure variable.
+const TRIAL_METER_INTERVAL_MS = 10000;
+const trialMeters = new Map();
+
+const chargeTrialMeter = async (meter, { finalCharge = false } = {}) => {
+  const now = Date.now();
+  const elapsedSeconds = (now - meter.lastChargedAt) / 1000;
+  meter.lastChargedAt = now;
+  if (elapsedSeconds < 0.5 && !finalCharge) return null;
+  try {
+    const user = await User.findById(meter.userId);
+    if (!user) return null;
+    normalizeSubscription(user);
+    if (isUnlimitedUser(user) || hasActiveSubscription(user)) return user;
+    consumeTrialUsage(user, elapsedSeconds);
+    await user.save();
+    return user;
+  } catch (error) {
+    console.error("Trial usage metering failed:", error?.message || error);
+    return null;
+  }
+};
+
+const startTrialMeter = (clientSessionId, userId) => {
+  if (!clientSessionId || !userId || trialMeters.has(clientSessionId)) return;
+  const meter = { userId, lastChargedAt: Date.now(), timer: null, onExpired: null };
+  meter.timer = setInterval(async () => {
+    const user = await chargeTrialMeter(meter);
+    if (user && !isUnlimitedUser(user) && !hasActiveSubscription(user) && Number(user.trialSecondsRemaining) <= 0) {
+      meter.onExpired?.();
+    }
+  }, TRIAL_METER_INTERVAL_MS);
+  meter.timer.unref?.();
+  trialMeters.set(clientSessionId, meter);
+};
+
+const setTrialMeterExpiryHandler = (clientSessionId, handler) => {
+  const meter = trialMeters.get(clientSessionId);
+  if (meter) meter.onExpired = handler;
+};
+
+const stopTrialMeter = async (clientSessionId) => {
+  const meter = trialMeters.get(clientSessionId);
+  if (!meter) return;
+  trialMeters.delete(clientSessionId);
+  clearInterval(meter.timer);
+  await chargeTrialMeter(meter, { finalCharge: true });
+};
 const socketRuntime = {
   startedAt: Date.now(),
   connectedSockets: 0,
@@ -269,6 +320,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     const getActiveSocket = () => outputTarget.socket || socket;
 
     const stopSession = (reason = "manual") => {
+      void stopTrialMeter(clientSessionId);
       clearDisconnectCleanupTimer();
       const activeSocket = getActiveSocket();
       const activeSession = socket.data.interpreterSession || session;
@@ -541,8 +593,14 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
     };
 
     const handleStartSession = async (payload = {}, ack) => {
-      const authenticatedUser = await User.findById(authenticatedUserId).lean();
+      const authenticatedUser = await User.findById(authenticatedUserId);
+      const trialSecondsBeforeNormalize = authenticatedUser?.trialSecondsRemaining;
       normalizeSubscription(authenticatedUser);
+      // Persist a legacy 7-day-to-300-second trial migration immediately on first access
+      // check, rather than waiting for the first metered usage tick.
+      if (authenticatedUser && trialSecondsBeforeNormalize !== authenticatedUser.trialSecondsRemaining) {
+        await authenticatedUser.save();
+      }
       if (!isAccountActive(authenticatedUser)) {
         const message = subscriptionSnapshot(authenticatedUser).canUseInterpreter
           ? "Your account has been suspended. Contact support."
@@ -662,6 +720,13 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           getTranslationHealth: session.getTranslationHealth
         });
         socketRuntime.totalReconnects += 1;
+        startTrialMeter(clientSessionId, authenticatedUserId);
+        setTrialMeterExpiryHandler(clientSessionId, () => {
+          const activeSocket = getActiveSocket();
+          activeSocket.emit("session_error", { message: EXPIRED_ACCESS_MESSAGE });
+          activeSocket.emit("trial_expired", { message: EXPIRED_ACCESS_MESSAGE });
+          stopSession("trial_expired");
+        });
         const readyPayload = { sessionId: session.sessionId, recordingGeneration: payload.recordingGeneration };
         socket.emit("session_ready", readyPayload);
         socket.emit("session:ready", readyPayload);
@@ -799,6 +864,13 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           getTranslationHealth: session.getTranslationHealth
         });
 
+        startTrialMeter(clientSessionId, authenticatedUserId);
+        setTrialMeterExpiryHandler(clientSessionId, () => {
+          const activeSocket = getActiveSocket();
+          activeSocket.emit("session_error", { message: EXPIRED_ACCESS_MESSAGE });
+          activeSocket.emit("trial_expired", { message: EXPIRED_ACCESS_MESSAGE });
+          stopSession("trial_expired");
+        });
         ack?.({ ok: true, mode: "production", sessionId: session.sessionId, recordingGeneration: payload.recordingGeneration, targetLanguages, room: callRoomInfo });
         logSocketTranslationEvent("SOCKET_SESSION_STARTED", {
           socketId: socket.id,
@@ -914,6 +986,7 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         return;
       }
 
+      void stopTrialMeter(clientSessionId);
       reconnectRecord.recovering = true;
       reconnectRecord.disconnectedAt = Date.now();
       reconnectRecord.disconnectReason = reason;
