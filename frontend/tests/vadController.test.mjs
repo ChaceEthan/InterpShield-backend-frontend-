@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { analyzeTranscriptCompleteness, buildProductionAudioConstraints, createVadController, getDynamicSilenceHoldMs } from "../src/audio/vadController.mjs";
 import { createUtteranceBoundaryController, stableSessionStartTime } from "../src/audio/recorderLifecycle.mjs";
 import { createMeaningfulSpeechGate, DESKTOP_SPEECH_GATE_CONFIG } from "../src/audio/meaningfulSpeechGate.mjs";
@@ -147,6 +148,27 @@ assert.equal(duplicateGuard.update(0, 2), null, "calibration transition is emitt
   gate.confirmMeaningfulSpeech(2000);
   assert.equal(gate.shouldStopForNoSpeech(60000), false, "a non-empty Deepgram partial cancels the no-speech timeout");
   assert.equal(DESKTOP_SPEECH_GATE_CONFIG.startupGraceMs, 4000);
+}
+
+{
+  const gate = createMeaningfulSpeechGate({ noSpeechTimeoutMs: 1000 });
+  gate.start({ now: 1000, recordingGeneration: 5, sessionId: "utt-1" });
+  const initial = gate.snapshot();
+  assert.equal(initial.phase, "listening", "a new utterance begins in listening state");
+  assert.equal(initial.speechStarted, false, "speech has not started before meaningful speech is confirmed");
+  gate.confirmMeaningfulSpeech(1500);
+  assert.equal(gate.snapshot().speechStarted, true, "meaningful speech marks the utterance as started");
+  assert.equal(gate.requestFinalization("vad_sustained_silence").accepted, true, "meaningful speech can request a finalization transition");
+  assert.equal(gate.snapshot().phase, "draining", "a finalized utterance transitions into draining");
+  assert.equal(gate.requestFinalization("vad_sustained_silence").accepted, false, "duplicate finalization transitions are ignored");
+  assert.equal(gate.resetToIdle().phase, "idle", "the lifecycle can return to idle for the next utterance");
+}
+
+{
+  const source = readFileSync(new URL("../src/components/TranscriptArea.tsx", import.meta.url), "utf8");
+  assert.match(source, /whitespace-pre-wrap/, "translation cards preserve multiline content");
+  assert.doesNotMatch(source, /line-clamp|overflow-hidden/, "translation cards must not clip long content");
+  assert.match(source, /pb-24 sm:pb-0/, "mobile layout leaves room for the floating microphone control");
 }
 
 const recorder = {

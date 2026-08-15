@@ -23,8 +23,7 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
   const hasTranslations = translations.some((entry) => entry.text.trim());
   const isTranscribe = mode === "transcribe";
   return (
-    <div      className="mx-auto flex min-h-[220px] w-full min-w-0 max-w-4xl flex-col gap-4 px-1 pb-5 pt-2"
-    >
+    <div className="mx-auto flex min-h-[220px] w-full min-w-0 max-w-4xl flex-col gap-4 px-1 pb-24 sm:pb-0 pt-2">
       <AnimatePresence mode="popLayout">
         {visibleOriginal ? (
           <motion.article
@@ -90,7 +89,7 @@ export function TranscriptArea({ mode, originalText, interimText = "", translati
                     <span className="rounded-full bg-white px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-gray-500 shadow-sm">{entry.state}</span>
                   </span>
                 </div>
-                <p className="min-h-16 break-words text-base font-semibold leading-7 text-gray-950">
+                <p className="min-h-16 whitespace-pre-wrap break-words text-base font-semibold leading-7 text-gray-950">
                   {entry.text || (isRecording ? "Translating..." : "Translation will appear here.")}
                 </p>
                 {entry.diagnostic && (

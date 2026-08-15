@@ -175,17 +175,13 @@ export const createVadController = (options = {}) => {
         return { type: "soft_pause", state, level, speech, silence, silenceMs };
       }
       if (state !== "soft-pause") return null;
-      const analysis = analyzeTranscriptCompleteness(transcript);
-      const speechDurationMs = Math.max(0, (lastSpeechAt || now) - utteranceStartedAt);
-      const transcriptSettled = !transcriptChangedAt || now - transcriptChangedAt >= config.transcriptChangeGraceMs;
-      const dynamicHoldMs = getDynamicSilenceHoldMs(transcript, { speechFinal, utteranceEnd });
-      const hasEnoughSpeech = speechDurationMs >= config.minimumUtteranceMs;
-      const contentAllowsFinalize = analysis.completeShortPhrase || analysis.wordCount >= 3;
-      const signalAgreement = providerFinal || speechFinal || utteranceEnd || analysis.punctuated || silenceMs >= dynamicHoldMs + 300;
-      const safeToFinalize = silenceMs >= 900 && hasEnoughSpeech && analysis.meaningful && contentAllowsFinalize && !analysis.incomplete && transcriptSettled && signalAgreement;
-      if (config.autoFinalize && ((safeToFinalize && silenceMs >= dynamicHoldMs) || (analysis.meaningful && silenceMs >= config.hardFinalizeMs))) {
+      // Capture ownership must not depend on Deepgram partial/final timing.  A
+      // partial can arrive after the speaker has stopped; treating it as fresh
+      // microphone speech previously reset this clock forever.  Once speech is
+      // confirmed, one sustained acoustic silence ends this utterance.
+      if (config.autoFinalize && silenceMs >= config.hardFinalizeMs) {
         state = "finalizing";
-        return { type: "finalize", reason: silenceMs >= config.hardFinalizeMs ? "safety_pause" : "hybrid_end", state, level, speech, silence, silenceMs, dynamicHoldMs };
+        return { type: "finalize", reason: "sustained_silence", state, level, speech, silence, silenceMs };
       }
     }
     return null;

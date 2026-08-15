@@ -1529,6 +1529,8 @@ export default function App() {
   const awaitingFinalTranscriptRef = useRef(false);
   const drainPendingLanguagesRef = useRef<Set<string>>(new Set());
   const finishDrainRef = useRef<(reason: "processed" | "timeout") => void>(() => undefined);
+  const startSessionRef = useRef<() => Promise<void>>(async () => undefined);
+  const explicitStopRequestedRef = useRef(false);
   const lastServerHeartbeatAtRef = useRef(0);
   const sessionStartedAtRef = useRef<number | null>(null);
   const lastInterimRef = useRef("");
@@ -2158,7 +2160,7 @@ export default function App() {
 
   const cleanupMedia = useCallback((options: { preserveRecoveryTimer?: boolean; preserveRestartAttempts?: boolean; preserveTranslationPipeline?: boolean; stopReason?: string; caller?: string } = {}) => {
     const speechSnapshot = utteranceLifecycleRef.current.snapshot();
-    console.info("[SESSION_STOP_REASON]", { reason: options.stopReason || "session_cleanup", caller: options.caller || "cleanupMedia", recordingGeneration: speechSnapshot.recordingGeneration, elapsedSinceStartMs: speechSnapshot.elapsedSinceStartMs, speechStarted: speechSnapshot.speechStarted, meaningfulSpeechDetected: speechSnapshot.meaningfulSpeechDetected, chunksCaptured: speechSnapshot.chunksCaptured, chunksEmitted: speechSnapshot.chunksEmitted });
+    console.info("[SESSION_STOP_REASON]", { reason: options.stopReason || "session_cleanup", caller: options.caller || "cleanupMedia", recordingGeneration: speechSnapshot.recordingGeneration, elapsedSinceStartMs: speechSnapshot.elapsedSinceStartMs, speechStarted: speechSnapshot.speechStarted, meaningfulSpeechDetected: speechSnapshot.meaningfulSpeechDetected, lastMeaningfulSpeechAt: speechSnapshot.lastMeaningfulSpeechAt, silenceStartedAt: speechSnapshot.silenceStartedAt, silenceDurationMs: speechSnapshot.silenceDurationMs, finalizationRequested: speechSnapshot.finalizationRequested, chunksCaptured: speechSnapshot.chunksCaptured, chunksEmitted: speechSnapshot.chunksEmitted, lastAudioLevel: speechSnapshot.lastAudioLevel, threshold: speechSnapshot.threshold });
     if (vadPollTimerRef.current) {
       window.clearInterval(vadPollTimerRef.current);
       vadPollTimerRef.current = null;
@@ -2252,17 +2254,24 @@ export default function App() {
     activeBackendSessionIdRef.current = "";
     activeBackendTranslationJobIdRef.current = "";
     sessionActionInFlightRef.current = false;
-    setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
-    setStatus("idle");
     utteranceLifecycleRef.current.resetToIdle();
     stopInFlightRef.current = false;
+    const shouldContinueListening = reason === "processed" && isDesktopChrome() && !explicitStopRequestedRef.current;
+    if (shouldContinueListening) {
+      console.info("[UTTERANCE_FINALIZED]", { recordingGeneration: activeRecordingGenerationRef.current, nextAction: "auto_restart_listening" });
+      void startSessionRef.current();
+      return;
+    }
+    setAudioDiagnostic({ state: "idle", message: "Microphone ready" });
+    setStatus("idle");
   }, [cleanupMedia]);
   finishDrainRef.current = finishDrain;
 
-  const beginDrain = useCallback(() => {
-    if (!recordingRef.current || awaitingFinalTranscriptRef.current) return;
-    const transition = utteranceLifecycleRef.current.requestFinalization("vad_sustained_silence");
-    if (!transition.accepted) return;
+  const beginDrain = useCallback((reason = "vad_sustained_silence", generation = activeRecordingGenerationRef.current) => {
+    if (!recordingRef.current || awaitingFinalTranscriptRef.current) return false;
+    if (generation !== activeRecordingGenerationRef.current) return false;
+    const transition = utteranceLifecycleRef.current.requestFinalization(reason, generation);
+    if (!transition.accepted) return false;
     awaitingFinalTranscriptRef.current = true;
     setAwaitingFinalTranscript(true);
     drainPendingLanguagesRef.current.clear();
@@ -2270,12 +2279,12 @@ export default function App() {
     setStatus("draining");
     setAudioDiagnostic((current) => ({ ...current, state: "ready", message: "Finishing recording" }));
     const recorder = mediaRecorderRef.current;
-    console.info("[UTTERANCE_FINALIZATION]", { reason: transition.reason, phaseBefore: transition.phaseBefore, phaseAfter: transition.phaseAfter, recorderState: recorder?.state, transcriptPending: true, translationsPending: drainPendingLanguagesRef.current.size });
+    console.info("[UTTERANCE_FINALIZATION]", { reason: transition.reason, recordingGeneration: generation, phaseBefore: transition.phaseBefore, phaseAfter: transition.phaseAfter, recorderState: recorder?.state, transcriptPending: true, translationsPending: drainPendingLanguagesRef.current.size });
     if (recorder?.state === "recording") {
       try { recorder.requestData(); } catch { /* MediaRecorder may already be stopping. */ }
       if (recorderStoppedForGenerationRef.current !== activeRecordingGenerationRef.current) {
         recorderStoppedForGenerationRef.current = activeRecordingGenerationRef.current;
-        recorderStopReasonRef.current = "vad_sustained_silence";
+        recorderStopReasonRef.current = reason;
         recorder.stop();
       }
     }
@@ -2292,6 +2301,7 @@ export default function App() {
     vadPollTimerRef.current = null;
     vadControllerRef.current.stop();
     drainTimeoutRef.current = window.setTimeout(() => finishDrain("timeout"), RECORDING_DRAIN_TIMEOUT_MS);
+    return true;
   }, [finishDrain]);
 
   const scheduleAudioRecovery = useCallback((reason: string) => {
@@ -2349,6 +2359,7 @@ export default function App() {
 
   const stopSession = useCallback(() => {
     if (status === "stopping" || stopInFlightRef.current) return;
+    explicitStopRequestedRef.current = true;
     stopInFlightRef.current = true;
     sessionActionInFlightRef.current = true;
     setStatus("stopping");
@@ -2577,8 +2588,8 @@ export default function App() {
     const markSessionReady = (payload?: { recordingGeneration?: number; sessionId?: string }) => {
       const readyGeneration = Number(payload?.recordingGeneration || activeSessionPayloadRef.current?.recordingGeneration);
       const currentPhase = utteranceLifecycleRef.current.snapshot().phase;
-      const initialReady = currentPhase === "starting";
-      if (!Number.isFinite(readyGeneration) || readyGeneration !== activeRecordingGenerationRef.current || !["starting", "listening"].includes(currentPhase)) {
+      const initialReady = currentPhase === "listening" && !sessionReadyRef.current;
+      if (!Number.isFinite(readyGeneration) || readyGeneration !== activeRecordingGenerationRef.current || !["listening", "idle"].includes(currentPhase)) {
         console.info("[SESSION_START_ACK_IGNORED]", { readyGeneration, activeGeneration: activeRecordingGenerationRef.current, phase: currentPhase });
         return;
       }
@@ -2694,7 +2705,6 @@ export default function App() {
       vadControllerRef.current.noteTranscript(originalText, { providerFinal, speechFinal, utteranceEnd });
       if (originalText) {
         utteranceLifecycleRef.current.confirmMeaningfulSpeech();
-        vadControllerRef.current.update(getAudioLevelRef.current(), Date.now(), true);
       }
       if (speechStarted && vadControllerRef.current.getState() === "soft-pause") {
         setStatus("speaking");
@@ -2706,6 +2716,7 @@ export default function App() {
     });
 
     socket.on("transcript_final", ({ text, sessionId, jobId, sequence, detectedLanguage, latencyMs, provider, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages }: { text?: string; sessionId?: string; jobId?: string | number; sequence?: number; detectedLanguage?: string; latencyMs?: number; provider?: string; sourceLang?: string; targetLang?: string; targetLanguages?: string[] }) => {
+      if (sessionId && activeSessionIdRef.current && sessionId !== activeSessionIdRef.current) return;
       const originalText = text?.trim() || "";
       if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
       captionWatchdogTimerRef.current = null;
@@ -2823,6 +2834,10 @@ export default function App() {
         ((Number.isFinite(incomingSequence) && incomingSequence > latestTranslationSequenceRef.current) ||
           (!Number.isFinite(incomingSequence) && Boolean(jobId) && !activeBackendTranslationJobIdRef.current))
       );
+      const sequenceIsStale = Number.isFinite(incomingSequence) && incomingSequence < latestTranslationSequenceRef.current && !streamingPreview && !preFinalTranslation;
+      if (sequenceIsStale) {
+        return;
+      }
       const isCurrentLiveTranslation = Boolean(
         streamingPreview ||
           preFinalTranslation ||
@@ -2854,16 +2869,21 @@ export default function App() {
       const mergedTranslations: Record<string, string> =
         shouldUpdateLiveTranslation && !newStreamingPreviewSource ? { ...finalTranslationsRef.current } : {};
 
-      for (const [language, translatedText] of Object.entries(nextTranslations)) {
-        if (isValidTranslationText({ text: translatedText, sourceText, targetLang: language })) {
-          mergedTranslations[language] = translatedText;
-        }
-      }
-
       const incomingTranslation = formatTranslationsText(nextTranslations, nextTargetLanguages);
       const mergedTranslation = formatTranslationsText(mergedTranslations, nextTargetLanguages);
       const mergedTranslationSignature = JSON.stringify(orderedTranslationEntries(mergedTranslations, nextTargetLanguages));
       const isComplete = complete !== false && !partial;
+      for (const [language, translatedText] of Object.entries(nextTranslations)) {
+        const incomingText = String(translatedText || "").trim();
+        if (!isValidTranslationText({ text: incomingText, sourceText, targetLang: language })) continue;
+        const existingText = mergedTranslations[language] || finalTranslationsRef.current[language] || "";
+        const shouldPreserveExisting = !isComplete && Boolean(existingText) && incomingText.length < existingText.length;
+        if (!shouldPreserveExisting) {
+          mergedTranslations[language] = incomingText;
+        }
+      }
+      const alreadyCompletedForCurrentUtterance = !streamingPreview && !isComplete && Boolean(lastCompletedTranslationRef.current) && Boolean(updateOriginal) && Boolean(lastFinalOriginalRef.current) && updateOriginal === lastFinalOriginalRef.current && (Number.isFinite(incomingSequence) ? incomingSequence <= latestTranslationSequenceRef.current : true);
+      if (alreadyCompletedForCurrentUtterance) return;
       const nextStatusUpdates: Record<string, TranslationLifecycleState> = {};
       for (const [language, status] of Object.entries(statusByLanguage || {})) {
         const normalizedStatus = coerceTranslationState(status);
@@ -3260,6 +3280,7 @@ export default function App() {
 
     const recordingGeneration = activeRecordingGenerationRef.current + 1;
     activeRecordingGenerationRef.current = recordingGeneration;
+    explicitStopRequestedRef.current = false;
     startInFlightRef.current = true;
     stopInFlightRef.current = false;
     recorderStartedForGenerationRef.current = null;
@@ -3371,6 +3392,12 @@ export default function App() {
 
       setAudioDiagnostic({ state: "requesting", message: "Requesting microphone permission" });
       const stream = await requestMicrophoneStream(audio, fallbackAudio);
+      if (activeRecordingGenerationRef.current !== recordingGeneration || explicitStopRequestedRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        sessionActionInFlightRef.current = false;
+        startInFlightRef.current = false;
+        return;
+      }
       streamRef.current = stream;
       setMicrophonePermission("granted");
       setMicrophoneAvailable(true);
@@ -3451,6 +3478,7 @@ export default function App() {
       });
 
       recorder.ondataavailable = async (event) => {
+        if (activeRecordingGenerationRef.current !== recordingGeneration || mediaRecorderRef.current !== recorder || (!recordingRef.current && utteranceLifecycleRef.current.snapshot().phase !== "draining")) return;
         const capturedAt = Date.now();
         const audioLevel = enhancedAudio.getAudioLevel();
         let finalChunkSent = false;
@@ -3459,7 +3487,6 @@ export default function App() {
           if (isDesktopChrome()) {
             const speechSnapshot = utteranceLifecycleRef.current.observeAudio({ audioLevel, noiseFloor: vadControllerRef.current.getNoiseFloor(), bytes: event.data.size, containerAudio: /audio\/(webm|ogg)/i.test(recorderMimeType), now: capturedAt });
             if (speechSnapshot.speechLikeSample && speechSnapshot.meaningfulSpeechDetected) {
-              vadControllerRef.current.update(audioLevel, capturedAt, true);
               if (captionWatchdogTimerRef.current) window.clearTimeout(captionWatchdogTimerRef.current);
               captionWatchdogTimerRef.current = null;
             }
@@ -3527,6 +3554,7 @@ export default function App() {
       };
 
       recorder.onstop = () => {
+        if (activeRecordingGenerationRef.current !== recordingGeneration) return;
         const lifecycle = utteranceLifecycleRef.current.snapshot();
         console.info("[MEDIARECORDER_STOP]", { reason: recorderStopReasonRef.current, recordingGeneration: lifecycle.recordingGeneration, sessionId: lifecycle.sessionId, currentState: recorder.state, speechDetected: lifecycle.speechStarted, silenceDuration: lastVadSilenceDurationRef.current, pendingFinalTranscript: awaitingFinalTranscriptRef.current, socketConnected: Boolean(socketRef.current?.connected), mimeType: recorder.mimeType, streamGeneration: audioStreamGenerationRef.current });
         if (recorderStopReasonRef.current === "vad_sustained_silence") emitUtteranceFinalization(Date.now(), true, "recorder_stop");
@@ -3552,8 +3580,8 @@ export default function App() {
       vadControllerRef.current = createVadController({
         autoFinalize: autoStopOnSilence,
         ...(desktopChrome
-          ? { speechThreshold: 0.003, silenceThreshold: 0.0018, noiseFloorMultiplier: 1.5, consecutiveSpeechSamples: 3, hardFinalizeMs: 1700 }
-          : { hardFinalizeMs: 1500 })
+          ? { speechThreshold: 0.003, silenceThreshold: 0.0018, noiseFloorMultiplier: 1.5, consecutiveSpeechSamples: 3, hardFinalizeMs: 1600 }
+          : { hardFinalizeMs: 1400 })
       });
       vadControllerRef.current.start(Date.now());
       setStatus("calibrating");
@@ -3565,7 +3593,7 @@ export default function App() {
         if (!action) return;
         if ("silenceMs" in action) lastVadSilenceDurationRef.current = action.silenceMs || 0;
         if (action.type === "speech_started" || action.type === "speech_resumed") utteranceLifecycleRef.current.confirmMeaningfulSpeech();
-        if (action.type === "soft_pause" || action.type === "finalize") utteranceLifecycleRef.current.noteSilence();
+        utteranceLifecycleRef.current.observeVad({ type: action.type, silenceMs: "silenceMs" in action ? action.silenceMs : 0, now: Date.now() });
         const speechSnapshot = utteranceLifecycleRef.current.snapshot();
         console.info("[VAD_STATE]", { speechStarted: speechSnapshot.speechStarted, meaningfulSpeechDetected: speechSnapshot.meaningfulSpeechDetected, consecutiveSpeechSamples: speechSnapshot.consecutiveSpeechSamples, audioLevel: action.level, threshold: action.speech, silenceDurationMs: "silenceMs" in action ? action.silenceMs : 0, phase: speechSnapshot.phase, recordingGeneration: speechSnapshot.recordingGeneration, noiseFloor: vadControllerRef.current.getNoiseFloor() });
         if (action.type === "calibrated") {
@@ -3611,7 +3639,7 @@ export default function App() {
         if (action.type === "finalize") {
           setStatus("finalizing");
           setAudioDiagnostic((current) => ({ ...current, state: "recording", message: "Finishing caption" }));
-          beginDrain();
+          beginDrain("vad_sustained_silence", activeRecordingGenerationRef.current);
         }
       }, VAD_POLL_INTERVAL_MS);
 
@@ -3693,6 +3721,7 @@ export default function App() {
       setAlert(message);
     }
   }, [autoGainControl, beginDrain, cleanupMedia, echoCancellation, emitAudioChunkPayload, isAuthed, microphoneId, navigate, noiseSuppression, preferredProvider, refreshMicrophones, scheduleAudioRecovery, shareableMode, sourceLang, targetLang, targetLanguages, user?.id, user?.plan, status]);
+  startSessionRef.current = startSession;
 
   const selectMode = (nextMode: Mode) => {
     if (isRecording) return;

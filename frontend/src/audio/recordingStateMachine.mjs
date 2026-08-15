@@ -1,5 +1,5 @@
 export const createRecordingStateMachine = ({ silenceMs = 1500, drainTimeoutMs = 8000, setTimer = setTimeout, clearTimer = clearTimeout, onPhaseChange = () => {}, onStopCapture = () => {}, onDrainComplete = () => {} } = {}) => {
-  let phase = "idle", meaningfulSpeech = false, silenceTimer = null, drainTimer = null, awaitingFinalTranscript = false;
+  let phase = "idle", meaningfulSpeech = false, silenceTimer = null, drainTimer = null, awaitingFinalTranscript = false, captureStopped = false;
   const pendingLanguages = new Set(), dubbingSubmissions = new Set();
   const change = (next) => { if (phase !== next) { phase = next; onPhaseChange(next); } };
   const clearSilence = () => { if (silenceTimer !== null) clearTimer(silenceTimer); silenceTimer = null; };
@@ -7,25 +7,25 @@ export const createRecordingStateMachine = ({ silenceMs = 1500, drainTimeoutMs =
     if (!['draining', 'translating'].includes(phase)) return false;
     clearSilence(); if (drainTimer !== null) clearTimer(drainTimer); drainTimer = null;
     awaitingFinalTranscript = false; pendingLanguages.clear(); dubbingSubmissions.clear(); meaningfulSpeech = false;
-    if (reason === 'processed') change('listening');
-    else { change('idle'); onStopCapture(); }
+    change('idle');
     onDrainComplete(reason); return true;
   };
   const maybeFinish = () => { if (!awaitingFinalTranscript && !pendingLanguages.size && !dubbingSubmissions.size) finish('processed'); };
   const beginDrain = () => {
     if (phase !== 'listening') return false;
-    clearSilence(); awaitingFinalTranscript = true; change('draining');
+    clearSilence(); awaitingFinalTranscript = true; captureStopped = true; onStopCapture(); change('draining');
     drainTimer = setTimer(() => finish('timeout'), drainTimeoutMs); return true;
   };
   return {
-    start() { clearSilence(); if (drainTimer !== null) clearTimer(drainTimer); drainTimer = null; meaningfulSpeech = false; awaitingFinalTranscript = false; pendingLanguages.clear(); dubbingSubmissions.clear(); change('listening'); },
+    start() { if (phase !== "idle") return false; clearSilence(); if (drainTimer !== null) clearTimer(drainTimer); drainTimer = null; meaningfulSpeech = false; awaitingFinalTranscript = false; captureStopped = false; pendingLanguages.clear(); dubbingSubmissions.clear(); change('listening'); return true; },
     noteMeaningfulSpeech() { if (phase === 'listening') { meaningfulSpeech = true; clearSilence(); } },
     noteSilence() { if (phase !== 'listening' || !meaningfulSpeech || silenceTimer !== null) return false; silenceTimer = setTimer(() => { silenceTimer = null; beginDrain(); }, silenceMs); return true; },
     beginDrain,
     noteFinalTranscript(languages = []) { if (!['draining', 'translating'].includes(phase)) return; awaitingFinalTranscript = false; for (const language of languages) pendingLanguages.add(language); if (pendingLanguages.size) change('translating'); maybeFinish(); },
     noteLanguageSettled(language, { dubbingQueued = false } = {}) { pendingLanguages.delete(language); if (dubbingQueued) dubbingSubmissions.add(language); maybeFinish(); },
     noteDubbingSubmitted(language) { dubbingSubmissions.delete(language); maybeFinish(); },
-    snapshot() { return { phase, meaningfulSpeech, awaitingFinalTranscript, pendingLanguages: [...pendingLanguages], dubbingSubmissions: [...dubbingSubmissions] }; }
+    canEmitAudio() { return phase === "listening" && !captureStopped; },
+    snapshot() { return { phase, meaningfulSpeech, awaitingFinalTranscript, captureStopped, pendingLanguages: [...pendingLanguages], dubbingSubmissions: [...dubbingSubmissions] }; }
   };
 };
 
@@ -50,7 +50,6 @@ export const createRecorderGenerationController = ({ onStart = () => {}, onStop 
     beginDrain() { if (phase !== "listening") return false; phase = "draining"; return true; },
     finish(reason = "processed") {
       if (!['draining', 'finalizing'].includes(phase) || stopInFlight || stoppedGeneration === generation) return false;
-      if (reason === "processed") { phase = "listening"; return true; }
       phase = "finalizing"; stopInFlight = true; stoppedGeneration = generation; onStop({ generation, reason });
       stopInFlight = false; phase = "idle"; return true;
     },
