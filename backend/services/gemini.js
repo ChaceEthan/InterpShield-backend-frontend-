@@ -370,6 +370,12 @@ const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, tran
       latencyMs: Date.now() - requestStartedAt
     });
   } catch (error) {
+    // A native fetch AbortError fires whenever ANY signal in the merged set aborts — including
+    // the CALLER intentionally cancelling a superseded preview via its own AbortController. That
+    // is not a timeout and must never be reported as one: only THIS function's own timeout timer
+    // firing (`timedOut`) is a genuine timeout. If the caller's signal is aborted while `timedOut`
+    // is still false, we were cancelled on purpose.
+    const intentionalAbort = !timedOut && Boolean(signal?.aborted);
     logGeminiDiagnostic("GEMINI_REQUEST_ERROR", {
       sessionId,
       jobId,
@@ -377,13 +383,20 @@ const translateOnce = async ({ apiKey, model, text, sourceLang, targetLang, tran
       targetLanguage: targetLang,
       model,
       errorName: error?.name || null,
-      errorCategory: timedOut || error?.name === "AbortError" ? "network_timeout" : null,
+      errorCategory: intentionalAbort ? "intentional_abort" : (timedOut || error?.name === "AbortError" ? "network_timeout" : null),
       httpStatus: null,
       latencyMs: Date.now() - requestStartedAt,
       aborted: Boolean(mergedSignal.signal?.aborted),
       timedOut
     });
-    if (signal?.aborted) throw new Error("Gemini translation aborted");
+    if (intentionalAbort) {
+      const cancelledError = new Error("Gemini translation cancelled (superseded)");
+      cancelledError.provider = "Gemini";
+      cancelledError.providerModel = model;
+      cancelledError.errorCategory = "intentional_abort";
+      cancelledError.intentionalAbort = true;
+      throw cancelledError;
+    }
     if (timedOut || error?.name === "AbortError") {
       const timeoutError = new Error(`Gemini translation timed out for ${targetLanguage}`);
       timeoutError.provider = "Gemini";
@@ -524,8 +537,13 @@ export const translateWithGemini = async ({ apiKey, model = GEMINI_MODEL, text, 
         };
         return includeMetadata ? metadata : result.text;
       } catch (error) {
-        if (signal?.aborted || /aborted/i.test(error?.message || "")) {
-          throw new Error("Gemini translation aborted");
+        if (error?.intentionalAbort || signal?.aborted || /aborted/i.test(error?.message || "")) {
+          const cancelledError = new Error("Gemini translation aborted");
+          cancelledError.provider = "Gemini";
+          cancelledError.providerModel = candidateModel;
+          cancelledError.errorCategory = "intentional_abort";
+          cancelledError.intentionalAbort = true;
+          throw cancelledError;
         }
 
         const status = getErrorStatusCode(error);

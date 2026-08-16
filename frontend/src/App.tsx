@@ -2736,6 +2736,24 @@ export default function App() {
     });
 
     const handleTranslationUpdate = ({ original, text, translations, statusByLanguage, failedLanguages, diagnostics, diagnosticsByLanguage, latencyMs, provider, sessionId, jobId, sequence, sourceLang: eventSourceLang, targetLang: eventTargetLang, targetLanguages: eventTargetLanguages, partial, complete, streaming, lang, status }: { original?: string; text?: string; translations?: Record<string, string>; statusByLanguage?: Record<string, string>; failedLanguages?: string[]; diagnostics?: TranslationProviderDiagnostic | null; diagnosticsByLanguage?: Record<string, TranslationProviderDiagnostic>; latencyMs?: number; provider?: string; sessionId?: string; jobId?: string | number; sequence?: number; sourceLang?: string; targetLang?: string; targetLanguages?: string[]; partial?: boolean; complete?: boolean; streaming?: boolean; lang?: string; status?: string }) => {
+      // Second line of defense (the backend already suppresses these via
+      // hasMeaningfulTranslationPayload before they ever reach the socket): a payload with no
+      // translations, no per-language status, no failures, no top-level status, and no text is
+      // internal lifecycle noise, not translation output. Bailing out before any state is read or
+      // mutated means it can never regress a card back to "processing"/blank, erase a previous
+      // successful translation, or trigger retry UI merely because the event fired.
+      const hasAnyTranslationContent = Boolean(
+        (translations && Object.keys(translations).length > 0) ||
+        (statusByLanguage && Object.keys(statusByLanguage).length > 0) ||
+        (Array.isArray(failedLanguages) && failedLanguages.length > 0) ||
+        text ||
+        status
+      );
+      if (!hasAnyTranslationContent) {
+        console.info("[EMPTY_TRANSLATION_PAYLOAD_IGNORED]", { sessionId, jobId, sequence });
+        return;
+      }
+
       const currentPendingTranscript = pendingFinalTranscriptRef.current;
       const updateOriginal = original?.trim() || "";
       const previewJob = typeof jobId === "string" && jobId.startsWith("preview-");

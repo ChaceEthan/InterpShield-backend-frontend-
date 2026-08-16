@@ -198,7 +198,7 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
   }
 
   if (signal?.aborted) {
-    throw new Error("OpenAI translation aborted");
+    throw Object.assign(new Error("OpenAI translation aborted"), { provider: "openai", errorCategory: "intentional_abort", intentionalAbort: true });
   }
 
   const targetLanguage = describeLanguage(targetLang);
@@ -287,7 +287,7 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
       const echoedSource = normalizeForComparison(translatedText) === normalizeForComparison(cleanText);
 
       if (signal?.aborted) {
-        throw new Error("OpenAI translation aborted");
+        throw Object.assign(new Error("OpenAI translation aborted"), { provider: "openai", errorCategory: "intentional_abort", intentionalAbort: true });
       }
 
       if (echoedSource) {
@@ -307,8 +307,12 @@ export const translateWithOpenAI = async ({ apiKey, text, sourceLang, targetLang
       };
       return includeMetadata ? metadata : translatedText;
     } catch (error) {
-      if (signal?.aborted || error?.name === "AbortError") {
-        throw new Error("OpenAI translation aborted");
+      // Mirrors gemini.js: a native AbortError fires for our OWN timeout (requestTimedOut) just
+      // as much as for the CALLER intentionally cancelling a superseded request — only the
+      // former is a genuine timeout/failure signal.
+      const intentionalAbort = !requestTimedOut && (Boolean(signal?.aborted) || error?.name === "AbortError");
+      if (intentionalAbort) {
+        throw Object.assign(new Error("OpenAI translation aborted"), { provider: "openai", errorCategory: "intentional_abort", intentionalAbort: true });
       }
 
       lastError = error;

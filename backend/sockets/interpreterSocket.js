@@ -281,6 +281,21 @@ const sanitizeTranslationResult = (result = {}) => {
   };
 };
 
+// A payload is only worth putting on the wire as translation_update/translation_result/
+// translated_text if it carries something the frontend can actually act on: real translated
+// text, a per-language status/failure the frontend explicitly understands (e.g. "processing",
+// "translated", "failed"), or a top-level status/text. Internal lifecycle bookkeeping that has
+// none of that (no translations, no per-language status, no failures, no text, no status) is
+// noise, not translation output, and must never reach the socket.
+export const hasMeaningfulTranslationPayload = (payload = {}) =>
+  Boolean(
+    (payload.translations && Object.keys(payload.translations).length > 0) ||
+    (payload.statusByLanguage && Object.keys(payload.statusByLanguage).length > 0) ||
+    (Array.isArray(payload.failedLanguages) && payload.failedLanguages.length > 0) ||
+    payload.text ||
+    payload.status
+  );
+
 export const registerInterpreterSocket = (io, env, getPublicConfig) => {
   io.on("connection", (socket) => {
     const outputTarget = { socket };
@@ -426,8 +441,14 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
 
     const emitInterpreterResult = (result) => {
       const emitTranslationPayload = (payload) => {
+        if (!hasMeaningfulTranslationPayload(payload)) {
+          console.info("[EMPTY_TRANSLATION_PAYLOAD_SUPPRESSED]", { sessionId: payload.sessionId, jobId: payload.jobId, sequence: payload.sequence });
+          return;
+        }
         const activeSocket = getActiveSocket();
-        const diagnostic = { sessionId: payload.sessionId, jobId: payload.jobId, sequence: payload.sequence, status: payload.status, languages: Object.keys(payload.translations || {}), complete: payload.complete };
+        const translationLanguages = Object.keys(payload.translations || {});
+        const statusLanguages = Object.keys(payload.statusByLanguage || {});
+        const diagnostic = { sessionId: payload.sessionId, jobId: payload.jobId, sequence: payload.sequence, status: payload.status, languages: translationLanguages.length > 0 ? translationLanguages : statusLanguages, complete: payload.complete };
         console.info("[DESKTOP_PIPELINE_TRANSLATION_RESULT]", diagnostic);
         logSocketTranslationEvent("SOCKET_TRANSLATION_EMIT", {
           socketId: activeSocket.id,

@@ -1106,3 +1106,146 @@ assert.match(
     "the shared context builder used by final jobs still includes full styleMemory"
   );
 }
+
+// Production evidence: GEMINI_REQUEST_ERROR { jobId: "preview-41-zh", errorName: "AbortError",
+// errorCategory: "network_timeout", aborted: true, timedOut: false } followed by TRANSLATION_FAILED
+// { jobId: "preview-41-zh", reason: "Gemini translation aborted", timeoutMs: 25000 }. A native
+// fetch AbortError fires whenever ANY signal in the merged set aborts — including the CALLER
+// (interpreter.js) intentionally cancelling a superseded preview via its own AbortController, which
+// is not a timeout at all. translateOnce/translateWithGemini must distinguish that from a genuine
+// timeout using actual state (their own `timedOut` flag), not merely error.name === "AbortError".
+
+// TEST 1 — intentional preview abort: the CALLER's own signal aborts while translateOnce's
+// internal timeout has not fired. Must be classified intentional_abort (never network_timeout),
+// must not be retryable, and must not degrade Gemini provider health / trigger cooldown.
+{
+  const callerController = new AbortController();
+  const abortErr = () => Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+  // Mirrors a real in-flight fetch: never resolves on its own, only rejects when its signal aborts.
+  const hangingUntilAbortedRequest = async (_url, options = {}) =>
+    new Promise((_resolve, reject) => {
+      if (options.signal?.aborted) {
+        reject(abortErr());
+        return;
+      }
+      options.signal?.addEventListener("abort", () => reject(abortErr()));
+    });
+
+  const translationPromise = translateWithGemini({
+    apiKey: "test-only",
+    model: "models/gemini-flash-latest",
+    text: sourceText,
+    sourceLang: "en",
+    targetLang: "fr",
+    includeMetadata: true,
+    signal: callerController.signal,
+    request: hangingUntilAbortedRequest,
+    sleep: async () => undefined
+  });
+
+  // Give the request a tick to actually be in flight before superseding it — cancellation always
+  // targets an already-started request in production, never one that hasn't been issued yet.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  callerController.abort();
+
+  let caughtError = null;
+  try {
+    await translationPromise;
+  } catch (error) {
+    caughtError = error;
+  }
+
+  assert.ok(caughtError, "a superseded preview request must reject, not silently resolve");
+  assert.equal(caughtError.errorCategory, "intentional_abort", "a caller-cancelled request must be classified as intentional_abort, never network_timeout");
+  assert.equal(caughtError.intentionalAbort, true, "the error must carry an explicit, unambiguous marker instead of relying on error.name/message text downstream");
+  assert.equal(isRetryableProviderError(caughtError), false, "an intentional abort must never be retried");
+  assert.equal(
+    shouldDegradeProviderHealth({ error: caughtError, provider: "gemini" }),
+    false,
+    "an intentional abort must never degrade Gemini provider health or trigger a cooldown"
+  );
+}
+
+// TEST 2 — a genuine timeout: translateOnce's OWN timer fires (nothing external cancelled it).
+// Must remain classified network_timeout and stay eligible for the existing bounded retry logic —
+// the fix for TEST 1 must not blind the app to real Gemini outages/stalls.
+{
+  const abortErr = () => Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+  // A real fetch() rejects the instant its AbortSignal fires — including translateOnce's OWN
+  // internal timeout, which aborts the merged signal it hands to `request`. A mock that never
+  // settles at all would hang forever regardless of that timeout firing.
+  const neverResolvingRequest = async (_url, options = {}) =>
+    new Promise((_resolve, reject) => {
+      if (options.signal?.aborted) {
+        reject(abortErr());
+        return;
+      }
+      options.signal?.addEventListener("abort", () => reject(abortErr()));
+    });
+  // translateOnce's own timeout timer is intentionally unref()'d (so a hung request never keeps
+  // a real server process alive) — in this isolated script, with nothing else ref'd, Node can
+  // decide the event loop is "empty" before that timer gets a chance to fire. A trivial ref'd
+  // interval keeps the process alive long enough for the genuine timeout to occur, exactly as it
+  // would in a real, always-running server process.
+  const keepAlive = setInterval(() => undefined, 1000);
+  const shortTimeoutPromise = translateWithGemini({
+    apiKey: "test-only",
+    model: "models/gemini-flash-latest",
+    text: sourceText,
+    sourceLang: "en",
+    targetLang: "fr",
+    includeMetadata: true,
+    timeoutMs: 20,
+    request: neverResolvingRequest,
+    sleep: async () => undefined
+  });
+
+  let caughtError = null;
+  try {
+    await shortTimeoutPromise;
+  } catch (error) {
+    caughtError = error;
+  } finally {
+    clearInterval(keepAlive);
+  }
+
+  assert.ok(caughtError, "a genuine timeout must still reject");
+  assert.equal(caughtError.errorCategory, "network_timeout", "a genuine internal timeout must remain classified as network_timeout");
+  assert.notEqual(caughtError.intentionalAbort, true, "a genuine timeout must never be marked as an intentional abort");
+  // A genuine timeout already consumed its own full timeoutMs budget with no response at all —
+  // gemini.js deliberately does NOT retry it internally (retrying would multiply worst-case
+  // latency) and marks it providerRetryExhausted, so isRetryableProviderError correctly says this
+  // SAME attempt should not be retried again. That is a distinct question from whether the
+  // interpreter.js's OUTER loop may still move on to a different provider (e.g. OpenAI) for this
+  // language — which it may, exactly as an intentional abort must not (see TEST 1).
+  assert.equal(caughtError.providerRetryExhausted, true, "a genuine timeout is marked provider-exhausted for this attempt by gemini.js's own bounded retry logic");
+  assert.equal(isRetryableProviderError(caughtError), false, "isRetryableProviderError respects providerRetryExhausted — this SAME attempt must not be retried again");
+  assert.equal(
+    shouldDegradeProviderHealth({ error: caughtError, provider: "gemini" }),
+    true,
+    "a genuine timeout must still degrade provider health, or real Gemini outages would go undetected"
+  );
+}
+
+// The classification lives in gemini.js's own catch blocks, not just interpreter.js's consumers —
+// assert the actual source carries the explicit marker rather than only asserting on behavior,
+// so a future refactor that accidentally drops the marker (while still passing the above
+// behavioral checks by coincidence) gets caught here too.
+{
+  const geminiSource = readFileSync(resolve(__dirname, "../services/gemini.js"), "utf8");
+  assert.match(
+    geminiSource,
+    /const intentionalAbort = !timedOut && Boolean\(signal\?\.aborted\);/,
+    "translateOnce distinguishes a caller-initiated abort from its own timeout using actual state (the timedOut flag), not merely error.name"
+  );
+  assert.match(
+    geminiSource,
+    /cancelledError\.errorCategory = "intentional_abort";\s*cancelledError\.intentionalAbort = true;/,
+    "an intentional abort is marked with an explicit, unambiguous errorCategory/flag instead of being inferred downstream from message text"
+  );
+  assert.match(
+    geminiSource,
+    /if \(error\?\.intentionalAbort \|\| signal\?\.aborted \|\| \/aborted\/i\.test\(error\?\.message \|\| ""\)\) \{/,
+    "translateWithGemini's outer retry loop preserves the intentional-abort marker on re-throw instead of discarding it via a fresh, untagged Error"
+  );
+}

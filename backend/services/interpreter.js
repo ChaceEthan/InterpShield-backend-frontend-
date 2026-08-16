@@ -501,6 +501,7 @@ export const isRetryableProviderError = (error = {}) => {
   const message = getProviderErrorMessage(error);
   if (!message) return false;
   if (error?.providerRetryExhausted) return false;
+  if (error?.intentionalAbort) return false;
 
   const statusCode = getErrorStatusCode(error);
   if ([408, 409, 429, 500, 502, 503, 504].includes(statusCode)) return true;
@@ -877,9 +878,15 @@ export const isTranslationDisplayable = ({ text = "", sourceText = "", sourceLan
 };
 
 export const shouldDegradeProviderHealth = ({ result = null, error = null, sourceText = "", sourceLang = "", targetLang = "", provider = "" } = {}) => {
-  if (result?.stale) return false;
+  if (result?.stale || result?.cancelled) return false;
 
   const candidateError = error || result?.error;
+  // A real fetch AbortError fires equally for OUR intentional cancellation of a superseded
+  // preview and for a genuine internal timeout aborting a stalled request — error.name alone
+  // cannot tell them apart. gemini.js/openai.js already resolve that ambiguity explicitly via
+  // errorCategory/intentionalAbort/timedOut, so use that normalized state instead.
+  if (candidateError?.intentionalAbort || candidateError?.errorCategory === "intentional_abort") return false;
+
   const providerName = result?.provider || provider;
   const translatedText = result?.translatedText || "";
   const displayable = Boolean(
@@ -895,7 +902,12 @@ export const shouldDegradeProviderHealth = ({ result = null, error = null, sourc
   if (translatedText && !displayable) return false;
   if (translatedText && displayable) return false;
 
-  if (result?.timedOut || candidateError?.name === "AbortError") return true;
+  if (
+    result?.timedOut ||
+    candidateError?.timedOut ||
+    candidateError?.errorCategory === "network_timeout" ||
+    candidateError?.name === "AbortError"
+  ) return true;
 
   return Boolean(
     candidateError && (
@@ -2001,6 +2013,32 @@ export const createInterpreterSession = async ({
         };
       } catch (error) {
         const responseTimeMs = Date.now() - attemptStartedAt;
+        // gemini.js/openai.js already distinguish a genuine provider timeout/failure from US
+        // intentionally aborting a superseded preview (or a stale job's final request) via this
+        // explicit marker — never inferred from error.name, which is "AbortError" either way.
+        // Route it through the exact same short-circuit as a stale job: no TRANSLATION_FAILED
+        // log, no retry, no provider fallback, no provider-health degradation, no FAILED UI.
+        if (error?.intentionalAbort) {
+          logTranslationEvent("PROVIDER_REQUEST_CANCELLED", {
+            sessionId,
+            requestId: requestId || `${jobId}:${language}:${provider}:${Date.now().toString(36)}`,
+            jobId,
+            provider,
+            targetLang: language,
+            reason: "superseded_or_intentionally_aborted"
+          });
+          if (state) {
+            state.status = "cancelled";
+            state.lastError = null;
+          }
+          return {
+            provider,
+            stale: true,
+            cancelled: true,
+            error,
+            responseTimeMs
+          };
+        }
         const timedOut = /timed out|timeout/i.test(error?.message || "");
         if (timedOut) translationMetrics.timeoutCount += 1;
         rememberProviderLatency(provider, responseTimeMs);

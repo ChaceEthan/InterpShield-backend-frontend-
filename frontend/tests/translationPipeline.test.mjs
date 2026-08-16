@@ -206,4 +206,32 @@ assert.match(appSource, /for \(const language of failedLanguages \|\| \[\]\) \{\
   assert.ok(mergedTranslationsIndex > newStreamingPreviewSourceIndex && mergedTranslationsIndex < newStreamingPreviewSourceIndex + 1800, "the fold runs before mergedTranslations is computed, i.e. before any language's current-utterance text can be dropped");
 }
 
+// ROOT CAUSE #8 (production evidence: [DESKTOP_PIPELINE_TRANSLATION_RESULT] { jobId: "preview-46",
+// status: undefined, languages: [], complete: false } arriving via translation_update/
+// translation_result/translated_text): the backend already suppresses genuinely empty/cancelled
+// lifecycle payloads before they reach the socket (hasMeaningfulTranslationPayload in
+// interpreterSocket.js), but handleTranslationUpdate needs its own second line of defense — a
+// payload with no translations, no per-language status, no failures, no top-level status, and no
+// text must be ignored before ANY state is read or mutated, so a stray empty event (e.g. replayed
+// after a socket reconnect) can never regress a card, erase a previous successful translation
+// (e.g. Chinese DONE), or trigger retry UI.
+{
+  const handlerIndex = appSource.indexOf("const handleTranslationUpdate = (");
+  assert.ok(handlerIndex > -1, "handleTranslationUpdate exists");
+  const guardBlock = appSource.slice(handlerIndex, handlerIndex + 2600);
+  assert.match(
+    guardBlock,
+    /const hasAnyTranslationContent = Boolean\(\s*\(translations && Object\.keys\(translations\)\.length > 0\) \|\|\s*\(statusByLanguage && Object\.keys\(statusByLanguage\)\.length > 0\) \|\|\s*\(Array\.isArray\(failedLanguages\) && failedLanguages\.length > 0\) \|\|\s*text \|\|\s*status\s*\);/,
+    "a payload is only considered meaningful if it carries translations, per-language status, failures, text, or a top-level status"
+  );
+  assert.match(
+    guardBlock,
+    /if \(!hasAnyTranslationContent\) \{\s*console\.info\("\[EMPTY_TRANSLATION_PAYLOAD_IGNORED\]", \{ sessionId, jobId, sequence \}\);\s*return;\s*\}/,
+    "an empty/non-actionable payload is ignored with a single concise diagnostic log, before any other processing"
+  );
+  const currentPendingIndex = guardBlock.indexOf("const currentPendingTranscript = pendingFinalTranscriptRef.current;");
+  const guardIndex = guardBlock.indexOf("if (!hasAnyTranslationContent)");
+  assert.ok(guardIndex > -1 && currentPendingIndex > -1 && guardIndex < currentPendingIndex, "the empty-payload guard runs before any pending-transcript lookup or other state access, guaranteeing it cannot mutate translationStatus/finalTranslations/translatedTextWindow/failure UI/retry UI for a non-actionable payload");
+}
+
 console.log("Translation pipeline regression tests passed.");
