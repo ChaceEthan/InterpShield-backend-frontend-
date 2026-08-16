@@ -12,7 +12,7 @@
     "test": "node tests/vadController.test.mjs && node tests/recordingFinalization.test.mjs && node tests/mediaRecorderFormat.test.mjs && node tests/adminDubbingPricing.test.mjs && node tests/tabAudioSource.test.mjs && node tests/trialUsage.test.mjs && node tests/stuckTranslating.test.mjs && node tests/trackEndPolicy.test.mjs && node tests/micButtonRecovery.test.mjs && node tests/staleLifecycleRecovery.test.mjs && node tests/translationPipeline.test.mjs && node tests/containerHeaderRecovery.test.mjs"
   },
   "engines": {
-    "node": "20.x"
+    "node": "22.x"
   },
   "dependencies": {
     "framer-motion": "^11.3.19",
