@@ -167,4 +167,43 @@ assert.match(
 assert.doesNotMatch(appSource, /let currentTargetLanguage/, "no shared mutable currentTargetLanguage exists for translation dispatch/consumption");
 assert.match(appSource, /for \(const language of failedLanguages \|\| \[\]\) \{\s*if \(!mergedTranslations\[language\] && !nextTranslations\[language\]\) \{\s*nextStatusUpdates\[language\] = "failed";/, "a failed language is marked failed only under its own key, and only when it genuinely has no merged or incoming text of its own");
 
+// ROOT CAUSE #7 (long-session "DONE + Translation unavailable — retry" on one language while a
+// SIBLING language's preview is still streaming): mergedTranslations was reset to a bare `{}`
+// the instant a genuinely new utterance's streaming preview arrived (newStreamingPreviewSource),
+// discarding EVERY language's current-utterance translation at once — not just scoping to the
+// language the preview belonged to. Under light load the previous utterance's transcript_final
+// handler always won that race and had already folded finished languages into
+// translatedTextWindow first, so this stayed latent. Under a long, continuously busy session
+// (heavier Gemini queueing/backlog), a slower OTHER language (e.g. Chinese) could still be sitting
+// only in finalTranslationsRef.current — not yet folded — when the NEXT utterance's French preview
+// started streaming. That reset silently dropped Chinese's already-completed text while its
+// translationStatuses entry stayed "translated", producing the exact invalid combination: a DONE
+// badge with an empty body, which falls through to translationPlaceholder's "Translation
+// unavailable — retry" fallback. Fix: fold any still-unfolded current-utterance translations into
+// the rolling window BEFORE discarding them, mirroring the transcript_final handler's own fold
+// step, so a sibling language's preview can never erase a completed translation — only move it
+// from "in progress" to "history", exactly like a normal utterance boundary would.
+{
+  const newStreamingPreviewSourceIndex = appSource.indexOf("const newStreamingPreviewSource = streamingPreview &&");
+  assert.ok(newStreamingPreviewSourceIndex > -1, "the newStreamingPreviewSource computation exists");
+  const foldBlock = appSource.slice(newStreamingPreviewSourceIndex, newStreamingPreviewSourceIndex + 1800);
+  assert.match(
+    foldBlock,
+    /if \(newStreamingPreviewSource && shouldUpdateLiveTranslation && Object\.keys\(finalTranslationsRef\.current\)\.length > 0\) \{/,
+    "a new utterance's streaming preview folds any still-pending current-utterance translations before they can be discarded"
+  );
+  assert.match(
+    foldBlock,
+    /const staleCurrentUtteranceTranslations = finalTranslationsRef\.current;\s*setTranslatedTextWindow\(\(current\) => \{/,
+    "the fold captures finalTranslationsRef.current (every language's current-utterance text, not just the incoming preview's language) before it is reset"
+  );
+  assert.match(
+    foldBlock,
+    /next\[language\] = appendTextWindow\(next\[language\] \|\| "", trimmed\);/,
+    "folding appends onto the existing rolling window rather than replacing it, consistent with ROOT CAUSE #2's fold"
+  );
+  const mergedTranslationsIndex = appSource.indexOf("const mergedTranslations: Record<string, string> =", newStreamingPreviewSourceIndex);
+  assert.ok(mergedTranslationsIndex > newStreamingPreviewSourceIndex && mergedTranslationsIndex < newStreamingPreviewSourceIndex + 1800, "the fold runs before mergedTranslations is computed, i.e. before any language's current-utterance text can be dropped");
+}
+
 console.log("Translation pipeline regression tests passed.");

@@ -2844,6 +2844,26 @@ export default function App() {
       const nextTranslations = normalizeTranslationMap(translations, text || "", singleLanguage, { sourceText });
       const newStreamingPreviewSource = streamingPreview && updateOriginal && updateOriginal !== lastTranslationOriginalRef.current;
       const shouldUpdateLiveTranslation = Boolean(isCurrentLiveTranslation);
+      if (newStreamingPreviewSource && shouldUpdateLiveTranslation && Object.keys(finalTranslationsRef.current).length > 0) {
+        // A brand-new utterance's preview can start streaming for one language (e.g. French)
+        // before the previous utterance's transcript_final boundary folded its still-in-flight
+        // translations into history — under normal latency transcript_final always wins that
+        // race, but under provider slowness/backlog it doesn't. Discarding finalTranslationsRef
+        // wholesale below would silently drop an already-completed OTHER-language translation
+        // (e.g. Chinese) that hasn't been folded into translatedTextWindow yet, leaving its
+        // status stuck at "translated" while its text vanishes — the invalid "DONE + Translation
+        // unavailable" state. Fold it into the rolling window first, exactly like the
+        // transcript_final handler above does for a normal utterance boundary.
+        const staleCurrentUtteranceTranslations = finalTranslationsRef.current;
+        setTranslatedTextWindow((current) => {
+          const next = { ...current };
+          for (const [language, staleText] of Object.entries(staleCurrentUtteranceTranslations)) {
+            const trimmed = staleText?.trim();
+            if (trimmed) next[language] = appendTextWindow(next[language] || "", trimmed);
+          }
+          return next;
+        });
+      }
       const mergedTranslations: Record<string, string> =
         shouldUpdateLiveTranslation && !newStreamingPreviewSource ? { ...finalTranslationsRef.current } : {};
 
