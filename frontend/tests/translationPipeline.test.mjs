@@ -88,7 +88,7 @@ const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8
 // per-target progress, and only show "Translation did not finish" for a genuine total failure —
 // never for a partial success where at least one target already completed.
 {
-  assert.match(appSource, /const TRANSLATION_DRAIN_TIMEOUT_MS = 12000;/, "a translation-specific timeout budget exists, separate from the STT-oriented RECORDING_DRAIN_TIMEOUT_MS");
+  assert.match(appSource, /const TRANSLATION_DRAIN_TIMEOUT_MS = 32000;/, "a translation-specific timeout budget exists, separate from the STT-oriented RECORDING_DRAIN_TIMEOUT_MS, sized to stay above the backend's own single-attempt Gemini budget (see ROOT CAUSE #9)");
   assert.match(appSource, /const TRANSLATION_DRAIN_PER_LANGUAGE_MS = 4000;/, "an additional per-target-language allowance exists");
   assert.match(
     appSource,
@@ -102,8 +102,8 @@ const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8
   );
   assert.match(
     appSource,
-    /drainTimeoutRef\.current = window\.setTimeout\(\(\) => finishDrainRef\.current\("timeout"\), TRANSLATION_DRAIN_PER_LANGUAGE_MS \+ TRANSLATION_DRAIN_TIMEOUT_MS \/ 2\);/,
-    "that branch re-arms the drain timeout with a fresh budget instead of letting the remaining target(s) race whatever time was left from the first"
+    /drainTimeoutRef\.current = window\.setTimeout\(\(\) => finishDrainRef\.current\("timeout"\), TRANSLATION_DRAIN_TIMEOUT_MS \+ Math\.max\(0, drainPendingLanguagesRef\.current\.size - 1\) \* TRANSLATION_DRAIN_PER_LANGUAGE_MS\);/,
+    "that branch re-arms the drain timeout with the same full per-attempt budget as the initial arm, not a shortened fraction of it, so the remaining target(s) still get their own full window instead of racing a truncated one (see ROOT CAUSE #9)"
   );
   assert.match(appSource, /const stillPendingLanguages = \[\.\.\.drainPendingLanguagesRef\.current\];/, "finishDrain captures which languages were still pending before clearing the set, so it can tell a partial success from a total failure");
   assert.match(
@@ -149,9 +149,11 @@ const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8
 // ROOT CAUSE #6 (a language stuck in RETRYING/Translating for up to 45s while new source speech
 // kept arriving): the desktop-continuous staleness watchdog existed and did eventually resolve a
 // stuck language to "failed", but its 45-second bound made "stuck" indistinguishable from
-// "broken" during actual live use. Reduced to a bound still generous enough for a genuine
-// Gemini-then-OpenAI fallback with the backend's own bounded per-provider retries.
-assert.match(appSource, /const STALE_TRANSLATION_STATE_MS = 18000;/, "the desktop translation-status staleness watchdog now resolves a stuck language far sooner than the old 45s bound, matching a live-interpreter UX instead of a background task");
+// "broken" during actual live use. Reduced from 45s — but (see ROOT CAUSE #9) an intermediate
+// 18s value overcorrected past the backend's own single-attempt Gemini budget and started
+// failing genuinely healthy in-flight translations, so the bound must stay strictly above that
+// backend budget while still being far below the original 45s.
+assert.match(appSource, /const STALE_TRANSLATION_STATE_MS = 32000;/, "the desktop translation-status staleness watchdog resolves a stuck language far sooner than the old 45s bound while staying above the backend's own single-attempt provider budget, matching a live-interpreter UX instead of a background task without racing legitimate in-flight work");
 assert.match(
   appSource,
   /for \(const \[language, state\] of Object\.entries\(translationStatuses\)\) \{\s*if \(!\["queued", "translating", "processing", "retrying"\]\.includes\(state as string\)\) continue;\s*const updatedAt = translationStatusUpdatedAtRef\.current\[language\] \|\| 0;\s*if \(updatedAt && now - updatedAt > STALE_TRANSLATION_STATE_MS\) \{\s*staleUpdates\[language\] = "failed";/,
@@ -232,6 +234,50 @@ assert.match(appSource, /for \(const language of failedLanguages \|\| \[\]\) \{\
   const currentPendingIndex = guardBlock.indexOf("const currentPendingTranscript = pendingFinalTranscriptRef.current;");
   const guardIndex = guardBlock.indexOf("if (!hasAnyTranslationContent)");
   assert.ok(guardIndex > -1 && currentPendingIndex > -1 && guardIndex < currentPendingIndex, "the empty-payload guard runs before any pending-transcript lookup or other state access, guaranteeing it cannot mutate translationStatus/finalTranslations/translatedTextWindow/failure UI/retry UI for a non-actionable payload");
+}
+
+// ROOT CAUSE #9 (production evidence: a healthy source transcript reached the frontend live, but
+// BOTH Chinese and Greek translation cards ended "FAILED — Translation timed out. Speak again to
+// retry." even though nothing was actually wrong with either translation): the frontend's own
+// translation-stuck watchdogs must never be able to fire before the backend's own declared,
+// legal budget for a single provider attempt has elapsed — otherwise a Gemini call that is still
+// legitimately in flight (Gemini is one blocking HTTP call, not a stream — see
+// backend/services/gemini.js — so there is no incremental status update while it's waiting) gets
+// unilaterally declared failed by the client with no way for the eventual real backend result to
+// undo the premature verdict. This is a timer-ownership bug, not a "the timeout is too short for
+// comfort" preference: it is provably possible for the frontend to give up while the backend is
+// still within its own contract.
+{
+  const geminiSource = readFileSync(new URL("../../backend/services/gemini.js", import.meta.url), "utf8");
+  const geminiTimeoutMatch = geminiSource.match(/export const GEMINI_TIMEOUT_MS = (\d+);/);
+  assert.ok(geminiTimeoutMatch, "GEMINI_TIMEOUT_MS is defined in backend/services/gemini.js");
+  const backendSingleAttemptBudgetMs = Number(geminiTimeoutMatch[1]);
+
+  const staleTranslationMatch = appSource.match(/const STALE_TRANSLATION_STATE_MS = (\d+);/);
+  assert.ok(staleTranslationMatch, "STALE_TRANSLATION_STATE_MS is defined in App.tsx");
+  const staleTranslationWatchdogMs = Number(staleTranslationMatch[1]);
+  assert.ok(
+    staleTranslationWatchdogMs > backendSingleAttemptBudgetMs,
+    `STALE_TRANSLATION_STATE_MS (${staleTranslationWatchdogMs}ms) must stay strictly greater than the backend's single-attempt GEMINI_TIMEOUT_MS (${backendSingleAttemptBudgetMs}ms), or a legitimate in-flight Gemini call gets prematurely marked failed on the desktop staleness watchdog before the backend itself gives up`
+  );
+
+  const drainTimeoutMatch = appSource.match(/const TRANSLATION_DRAIN_TIMEOUT_MS = (\d+);/);
+  assert.ok(drainTimeoutMatch, "TRANSLATION_DRAIN_TIMEOUT_MS is defined in App.tsx");
+  const mobileDrainBudgetMs = Number(drainTimeoutMatch[1]);
+  assert.ok(
+    mobileDrainBudgetMs > backendSingleAttemptBudgetMs,
+    `TRANSLATION_DRAIN_TIMEOUT_MS (${mobileDrainBudgetMs}ms) must stay strictly greater than the backend's single-attempt GEMINI_TIMEOUT_MS (${backendSingleAttemptBudgetMs}ms), or mobile's post-final-transcript drain timeout prematurely marks a still-legitimate translation failed`
+  );
+
+  // The re-arm after one target settles (Section 7) must give the remaining target(s) the same
+  // full per-attempt budget, not a shortened fraction of it — a remaining language's own single
+  // Gemini attempt can independently take up to the backend's full budget regardless of how
+  // quickly a different language already settled.
+  assert.doesNotMatch(
+    appSource,
+    /TRANSLATION_DRAIN_PER_LANGUAGE_MS \+ TRANSLATION_DRAIN_TIMEOUT_MS \/ 2/,
+    "the mobile drain-timeout re-arm after a target settles no longer halves the per-attempt budget for the remaining target(s)"
+  );
 }
 
 console.log("Translation pipeline regression tests passed.");

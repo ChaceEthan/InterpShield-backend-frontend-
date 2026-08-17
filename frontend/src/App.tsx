@@ -262,7 +262,14 @@ const RECORDING_DRAIN_TIMEOUT_MS = 8000;
 // This bound (and per-language allowance) governs that second, translation-only wait, so 2-3
 // target languages under normal provider latency are not killed by the same clock meant to
 // catch a genuinely missing STT final.
-const TRANSLATION_DRAIN_TIMEOUT_MS = 12000;
+//
+// ROOT CAUSE (mobile translation prematurely marked failed): this base value used to be 12000ms
+// — shorter than the backend's own single-attempt Gemini budget (GEMINI_TIMEOUT_MS = 25000ms,
+// see the STALE_TRANSLATION_STATE_MS comment below for the full mechanism). A real Gemini call
+// legitimately taking 12-25 seconds was declared "timed out" here before the backend had used
+// even half its own declared budget. Must stay strictly greater than the longest single-attempt
+// provider timeout the backend can legally spend on one dispatch.
+const TRANSLATION_DRAIN_TIMEOUT_MS = 32000;
 const TRANSLATION_DRAIN_PER_LANGUAGE_MS = 4000;
 const MAX_SOCKET_RECONNECT_ATTEMPTS = 8;
 const CAPTION_WATCHDOG_MS = 12000;
@@ -271,13 +278,24 @@ const MAX_QUEUED_AUDIO_CHUNKS = 240;
 const MAX_PENDING_FINAL_TRANSCRIPTS = 16;
 const CLIENT_HEARTBEAT_MS = 25000;
 const AUTH_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
-// A translation card stuck in queued/processing/retrying is a live-interpreter UX failure, not
-// a background task — 45s let a language sit on "Translating..."/"Retrying" for nearly a minute
-// while the speaker kept talking, which is what "stuck retrying forever" looked like to a real
-// user even though it did technically resolve eventually. 18s is still generous enough for a
-// genuine Gemini-then-OpenAI fallback with the backend's own bounded per-provider retries, but
-// far closer to what a live captioning experience actually requires.
-const STALE_TRANSLATION_STATE_MS = 18000;
+// ROOT CAUSE (production: healthy Chinese AND Greek translations both showing "FAILED —
+// Translation timed out. Speak again to retry." even though source captions worked fine): this
+// watchdog only resets translationStatusUpdatedAtRef on an actual status transition (see
+// updateTranslationStatuses). Backend dispatch emits exactly one "processing" update when a
+// language's single Gemini attempt begins, then goes silent — Gemini is a single blocking HTTP
+// call (see gemini.js), not a stream, so there is no further update until that one attempt
+// resolves (translated/failed) or the backend itself gives up and emits "retrying". A previous
+// version of this constant (18000ms) was SHORTER than the backend's own single-attempt Gemini
+// budget (GEMINI_TIMEOUT_MS = 25000ms in backend/services/gemini.js, wired into
+// PROVIDER_TIMEOUT_MS.gemini in backend/services/interpreter.js) — so any real-world Gemini call
+// that legitimately took 18-25 seconds (well within the backend's own declared, legal budget)
+// was unilaterally declared "timed out" by the frontend before the backend ever got a chance to
+// succeed or fail it, with no way for a subsequent real backend result to undo the premature
+// verdict. This value must always stay strictly greater than the longest single-provider-attempt
+// timeout the backend can legally spend waiting on one dispatch (25000ms for Gemini, the larger
+// of the two configured provider timeouts), plus margin for socket/dispatch overhead — never
+// shorter than what the backend itself considers "still working".
+const STALE_TRANSLATION_STATE_MS = 32000;
 const SOCKET_HEARTBEAT_STALE_MS = 75000;
 let socketInstanceCounter = 0;
 const nextSocketInstanceId = () => `socket-${++socketInstanceCounter}-${Date.now().toString(36)}`;
@@ -3116,9 +3134,12 @@ export default function App() {
           // Section 7: await every selected target independently. One target settling (complete
           // or failed) is real, observable progress on this utterance — extend the mobile drain
           // timeout so the remaining target(s) get their own fresh window instead of racing
-          // whatever was left of the very first target's budget.
+          // whatever was left of the very first target's budget. That fresh window must be the
+          // SAME full per-attempt budget as the initial arm above (not a shortened fraction of
+          // it) — a remaining language's own single Gemini attempt can independently take up to
+          // the backend's full budget regardless of how quickly a different language settled.
           window.clearTimeout(drainTimeoutRef.current);
-          drainTimeoutRef.current = window.setTimeout(() => finishDrainRef.current("timeout"), TRANSLATION_DRAIN_PER_LANGUAGE_MS + TRANSLATION_DRAIN_TIMEOUT_MS / 2);
+          drainTimeoutRef.current = window.setTimeout(() => finishDrainRef.current("timeout"), TRANSLATION_DRAIN_TIMEOUT_MS + Math.max(0, drainPendingLanguagesRef.current.size - 1) * TRANSLATION_DRAIN_PER_LANGUAGE_MS);
         }
       }
     };
