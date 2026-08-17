@@ -61,15 +61,19 @@ assert.doesNotMatch(appSource, /awaitingFinalTranscriptRef\.current = true;[\s\S
 assert.match(appSource, /const continueListening = reason === "vad_sustained_silence" && isDesktopChrome\(\) && !explicitStopRequestedRef\.current;\s*if \(continueListening\) \{\s*const transition = utteranceLifecycleRef\.current\.requestFinalization\(reason, generation\);\s*if \(!transition\.accepted\) return false;/, "the desktop branch only gates on requestFinalization's own phase check, not on any pending-transcript flag");
 
 // Mobile still uses the awaiting-transcript gate (it genuinely stops capture and must wait),
-// and finishDrain's existing drain-timeout is still the safety net that resets a mobile
-// utterance's cards back to ready if no final transcript/translation ever arrives.
+// and finishDrain's existing drain-timeout is still the safety net that resolves a mobile
+// utterance's cards if no final transcript/translation ever arrives.
 assert.match(appSource, /if \(awaitingFinalTranscriptRef\.current\) return false;\s*const transition = utteranceLifecycleRef\.current\.requestFinalization\(reason, generation\);\s*if \(!transition\.accepted\) return false;\s*awaitingFinalTranscriptRef\.current = true;/, "mobile's full-finalize path still gates on and sets awaitingFinalTranscriptRef");
 // A completed translation must win over an earlier timeout: only the languages that were STILL
-// pending when the timeout fired revert to "ready" — a language that already completed (e.g.
-// French arrived, German is still pending) keeps its translated status/text instead of both
-// being wiped back to ready together.
+// pending when the timeout fired are affected — a language that already completed (e.g. French
+// arrived, German is still pending) keeps its translated status/text instead of both being wiped
+// out together. ROOT CAUSE FIX (mobile "stuck on READY / Waiting for speech... forever"): the
+// still-pending languages revert to "failed", not "ready" — "ready" is a state the desktop
+// staleness watchdog never monitors, so a mobile card that landed there was invisible to any
+// recovery mechanism for the rest of the session. "failed" is a real, monitored terminal state.
 assert.match(appSource, /const stillPendingLanguages = \[\.\.\.drainPendingLanguagesRef\.current\];/, "finishDrain captures which languages were still pending before clearing the set");
-assert.match(appSource, /const readyStatuses = Object\.fromEntries\(stillPendingLanguages\.map\(\(language\) => \[language, "ready" as TranslationLifecycleState\]\)\);\s*setTranslationStatuses\(\(current\) => \(\{ \.\.\.current, \.\.\.readyStatuses \}\)\);/, "finishDrain's timeout branch only reverts the still-pending target languages back to ready, preserving any language that already completed");
+assert.match(appSource, /const failedStatuses = Object\.fromEntries\(stillPendingLanguages\.map\(\(language\) => \[language, "failed" as TranslationLifecycleState\]\)\);\s*setTranslationStatuses\(\(current\) => \(\{ \.\.\.current, \.\.\.failedStatuses \}\)\);/, "finishDrain's timeout branch marks the still-pending target languages failed (a monitored terminal state), preserving any language that already completed");
+assert.doesNotMatch(appSource, /readyStatuses/, "the old unmonitored 'ready' reversion on drain timeout is gone");
 assert.match(appSource, /const hasAnyCompletedTranslation = Object\.keys\(finalTranslationsRef\.current\)\.length > 0;/, "finishDrain checks whether any language actually completed before deciding which alert to show");
 assert.match(appSource, /\} else if \(!hasAnyCompletedTranslation\) \{\s*setAlert\("Translation did not finish\. Please try again\."\);/, '"Translation did not finish" is reserved for a genuine total failure (zero languages completed), not shown merely because one of several targets was still pending');
 assert.match(appSource, /drainTimeoutRef\.current = window\.setTimeout\(\(\) => finishDrain\("timeout"\), RECORDING_DRAIN_TIMEOUT_MS\);/, "mobile's full-finalize path still arms the bounded drain-timeout safety net");

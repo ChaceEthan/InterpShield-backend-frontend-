@@ -2367,8 +2367,31 @@ export const createInterpreterSession = async ({
     translationJobs.delete(jobId);
   };
 
+  // "queued_too_long"/"processing_timeout" are the two reasons cleanupStaleTranslationWork's
+  // job-level sweep (the QUEUED_JOB_TIMEOUT/PROCESSING_JOB_TIMEOUT/SEQUENTIAL_JOB_HARD_TIMEOUT
+  // check) uses to give up on a FINAL job as a whole, as opposed to a per-language lane-task
+  // timeout. Final jobs (processSequentialTranslationJob) never enter translationLanes, so they
+  // are never covered by the per-task sweep in cleanupStaleTranslationWork that DOES correctly
+  // call markTranslationLanguageFailed (which emits a socket update) for a stuck language. Before
+  // this fix, a final job swept here purely by setTranslationLanguageStatus (below) with no
+  // onResult/socket emission at all — the frontend never learned the job died, so a target
+  // language's card could sit on "queued"/"processing" (or whatever the client last rendered)
+  // with zero further signal. The other reasons markTranslationJobStale is used for
+  // (newer_final_transcript, session queue overflow, session_stop, an explicit newer preview/job
+  // superseding this one) are all legitimate, expected supersessions where a replacement job or
+  // an explicit session teardown already accounts for the UI state, so they are deliberately left
+  // out of this notification to avoid emitting a spurious "failed" for perfectly normal churn.
+  const SILENT_JOB_STALE_REASONS = new Set(["queued_too_long", "processing_timeout"]);
+
   const markTranslationJobStale = (job, reason) => {
     if (!job || job.stale) return;
+
+    const shouldNotifyStaleTimeout = job.shouldTranslate && SILENT_JOB_STALE_REASONS.has(reason);
+    const languagesToNotify = shouldNotifyStaleTimeout
+      ? [...new Set([...(job.pendingLanguages || []), ...(job.runningLanguages || [])])].filter(
+          (language) => !job.translations?.[language]
+        )
+      : [];
 
     job.stale = true;
     job.cancelled = true;
@@ -2411,6 +2434,11 @@ export const createInterpreterSession = async ({
       targetLanguages: job.direction?.targets,
       reason
     }, "warn");
+
+    for (const language of languagesToNotify) {
+      emitTranslationStatusUpdate(job, language, "failed", "queue", { allowStale: true });
+    }
+
     trimStaleTranslationJobs();
 
     void reason;
@@ -2489,8 +2517,9 @@ export const createInterpreterSession = async ({
 
   const failedLanguagesForJob = (job) => [...(job.failedLanguages || new Set())];
 
-  const emitTranslationStatusUpdate = (job, language, status, provider = "queue") => {
-    if (!job || job.stale || staleTranslationJobs.has(job.id)) return;
+  const emitTranslationStatusUpdate = (job, language, status, provider = "queue", { allowStale = false } = {}) => {
+    if (!job) return;
+    if (!allowStale && (job.stale || staleTranslationJobs.has(job.id))) return;
     setTranslationLanguageStatus(job, language, status);
     const languageState = getOrCreateLanguageState(job, language);
 

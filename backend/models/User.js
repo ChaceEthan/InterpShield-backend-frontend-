@@ -163,6 +163,15 @@ const userSchema = new mongoose.Schema(
   }
 );
 
+// Defense in depth against duplicate accounts for the same person: the schema's own
+// `lowercase: true` transform only normalizes emails going through Mongoose's setters (new
+// documents, `user.email = x` assignments), so it cannot retroactively fix emails already
+// stored with mixed case before this normalization existed, and the plain `unique: true` index
+// above is case-sensitive at the MongoDB layer, so "Name@Example.com" and "name@example.com"
+// would NOT collide there. A case-insensitive collation on a second index closes that gap at
+// the database level, independent of what application code happens to do.
+userSchema.index({ email: 1 }, { unique: true, collation: { locale: "en", strength: 2 }, name: "email_ci_unique" });
+
 /** @type {mongoose.Model<any>} */
 const User = mongoose.models.User || mongoose.model("User", userSchema);
 

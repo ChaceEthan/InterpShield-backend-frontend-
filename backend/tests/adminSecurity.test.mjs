@@ -8,6 +8,8 @@ import { canUseDubbing, checkFeatureAccess, checkMinuteAllowance, hasUnlimitedAc
 import { canMakeTranslationRequest } from "../utils/monetizationUtils.js";
 import { seedAdmin } from "../scripts/seedAdmin.mjs";
 import { runStartupAdminBootstrap } from "../services/adminBootstrap.js";
+import { groupUsersByNormalizedEmail, normalizeEmail } from "../scripts/auditDuplicateUsers.mjs";
+import { subscriptionSnapshot } from "../services/subscriptionService.js";
 
 const runMiddleware = (middleware, user) => { let next = false; let status = 200; let body; middleware({ user }, { status(code) { status = code; return this; }, json(value) { body = value; } }, () => { next = true; }); return { next, status, body }; };
 assert.equal(runMiddleware(requireAdmin, null).status, 403, "unauthenticated requests cannot access admin APIs");
@@ -136,4 +138,66 @@ const failedBootstrap = await runStartupAdminBootstrap({
 assert.equal(failedBootstrap, false, "bootstrap failure does not escape and block startup");
 assert.deepEqual(safeErrors, ["Super admin initialization failed securely."]);
 assert.equal(sensitiveValues.some((value) => safeErrors[0].includes(value)), false, "bootstrap errors do not expose configuration values");
+// ROOT CAUSE (production entitlement contradiction): access must be derived from a single
+// authoritative role/subscription calculation (subscriptionSnapshot + hasUnlimitedAccess), not
+// re-derived per-page. These two named production accounts are the exact ones the owner
+// reported seeing "Unlimited" in the Admin Dashboard but redirected to /subscription from Live
+// Translate — proving the authoritative calculation grants both real interpreter access
+// regardless of a stale/expired subscriptionEndsAt is the regression that must never break.
+const superAdminAccount = {
+  email: "niyongabojosue11@gmail.com",
+  role: "super_admin",
+  status: "active",
+  subscriptionEndsAt: new Date("2020-01-01T00:00:00.000Z"), // deliberately stale/expired
+  subscriptionType: "trial",
+  trialSecondsRemaining: 0
+};
+const adminAccount = {
+  email: "ndayisabadavid830@gmail.com",
+  role: "admin",
+  status: "active",
+  subscriptionEndsAt: new Date("2020-01-01T00:00:00.000Z"), // deliberately stale/expired
+  subscriptionType: "trial",
+  trialSecondsRemaining: 0
+};
+for (const account of [superAdminAccount, adminAccount]) {
+  assert.equal(hasUnlimitedAccess(account), true, `${account.email} bypasses gating via role`);
+  const snapshot = subscriptionSnapshot({ ...account });
+  assert.equal(snapshot.isUnlimited, true, `${account.email} is unlimited regardless of a stale subscriptionEndsAt`);
+  assert.equal(snapshot.canUseInterpreter, true, `${account.email} can use the interpreter (no /subscription redirect)`);
+  assert.equal(snapshot.subscriptionEndsAt, null, `${account.email} never displays a stale expiration date once unlimited`);
+  assert.notEqual(snapshot.planLabel, "Expired", `${account.email} is never labeled Expired while unlimited (the exact contradiction reported: Unlimited in Admin Dashboard, Expired on the Subscription page)`);
+}
+assert.equal(superAdminAccount.role, "super_admin");
+assert.equal(adminAccount.role, "admin", "the second privileged account is admin, never promoted to super_admin by this regression");
+
+// An admin's stale subscription record must not be silently "fixed" by promoting it — the
+// bypass must come from role alone, matching the desired policy: super_admin/admin always
+// unlimited; ordinary users evaluated on real trial/subscription state.
+const expiredOrdinaryUser = { role: "user", status: "expired", subscriptionType: "trial", trialSecondsRemaining: 0 };
+assert.equal(subscriptionSnapshot(expiredOrdinaryUser).canUseInterpreter, false, "an ordinary expired user remains correctly blocked");
+const activeOrdinaryTrialUser = { role: "user", status: "active", subscriptionType: "trial", trialSecondsRemaining: 120 };
+assert.equal(subscriptionSnapshot(activeOrdinaryTrialUser).canUseInterpreter, true, "an ordinary user with remaining trial seconds is allowed");
+const exhaustedOrdinaryTrialUser = { role: "user", status: "active", subscriptionType: "trial", trialSecondsRemaining: 0 };
+assert.equal(subscriptionSnapshot(exhaustedOrdinaryTrialUser).canUseInterpreter, false, "an ordinary user with an exhausted trial is correctly blocked");
+
+// ROOT CAUSE (possible duplicate accounts): email identity must be normalized (trim + lowercase)
+// so "Test@Example.com", "test@example.com", and "TEST@example.com" are recognized as the same
+// logical account by any duplicate-detection tooling, even if legacy/pre-normalization records
+// in the database still differ by case.
+assert.equal(normalizeEmail(" Test@Example.com "), "test@example.com");
+assert.equal(normalizeEmail("TEST@EXAMPLE.COM"), "test@example.com");
+const caseVariantDocs = [
+  { _id: "a", email: "Test@Example.com", createdAt: new Date("2025-01-01") },
+  { _id: "b", email: "test@example.com", createdAt: new Date("2025-06-01") },
+  { _id: "c", email: "TEST@example.com", createdAt: new Date("2025-09-01") },
+  { _id: "d", email: "unrelated@example.com", createdAt: new Date("2025-09-01") }
+];
+const duplicateGroups = groupUsersByNormalizedEmail(caseVariantDocs);
+assert.equal(duplicateGroups.length, 1, "case-variant emails are detected as a single duplicate group");
+assert.equal(duplicateGroups[0].normalizedEmail, "test@example.com");
+assert.equal(duplicateGroups[0].count, 3, "all three case variants are grouped together");
+assert.deepEqual(duplicateGroups[0].accounts.map((/** @type {{id: string}} */ a) => a.id), ["a", "b", "c"], "duplicate accounts are reported oldest-first so a human can identify the original record");
+assert.equal(User.schema.indexes().some((/** @type {[Record<string, any>, Record<string, any>]} */ [keys, options]) => keys.email === 1 && options?.unique && options?.collation?.strength === 2), true, "a case-insensitive unique index guards against future duplicate emails at the database layer");
+
 console.log("Admin security regression tests passed.");

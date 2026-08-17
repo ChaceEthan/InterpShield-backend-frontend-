@@ -8,6 +8,7 @@
     "dev": "nodemon server.js",
     "seed:admin": "node scripts/seedAdmin.mjs",
     "migrate:subscriptions": "node scripts/migrateSubscriptions.mjs",
+    "audit:duplicate-users": "node scripts/auditDuplicateUsers.mjs",
     "build": "node --check server.js && node --check config/env.js && node --check config/database.js && node --check data/languageMemory.js && node --check utils/translationEnhancer.js && node --check models/User.js && node --check models/PaymentHistory.js && node --check models/History.js && node --check models/AuditLog.js && node --check middleware/authorization.js && node --check routes/auth.js && node --check routes/admin.js && node --check routes/user.js && node --check services/authService.js && node --check services/adminService.js && node --check services/adminBootstrap.js && node --check services/userService.js && node --check services/subscriptionService.js && node --check services/subscriptionRepository.js && node --check services/paymentProviders.js && node --check services/subscriptionJobs.js && node --check services/audioPipeline.js && node --check services/deepgram.js && node --check services/gemini.js && node --check services/openai.js && node --check services/interpreter.js && node --check sockets/interpreterSocket.js",
     "start": "node server.js",
     "lint": "npm run build",

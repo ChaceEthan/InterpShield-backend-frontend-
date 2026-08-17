@@ -27,9 +27,12 @@ assert.match(appSource, /window\.setInterval\(\(\) => \{ void refreshMe\(\); \},
 // admin actions (reset/add/expire) replacing the old day-based grant/extend actions.
 assert.match(adminSource, /trialSecondsRemaining\?: number \| null; trialSecondsUsed\?: number \| null; trialSecondsTotal\?: number;/, "the admin user type carries the new trial-seconds fields");
 assert.match(adminSource, /const formatTrialRemaining = \(user: AdminUser\) => \{/, "trial remaining renders as a countdown clock, not a day count");
-assert.match(adminSource, /action: "reset_trial" \}, "reset 5-minute trial"\)\}>Reset 5-min trial</, "admin can reset a user's 5-minute trial");
-assert.match(adminSource, /action: "add_trial_minutes", days: 5 \}, "add 5 trial minutes"\)\}>Add 5 min</, "admin can add trial minutes instead of extending a calendar date");
-assert.match(adminSource, /action: "expire_trial" \}, "expire trial now"\)\}>Expire trial now</, "admin can expire a trial immediately");
+// Subscription actions (reset/add/expire trial, and the rest) are driven by a compact
+// dropdown + Apply button (SUBSCRIPTION_ACTIONS) instead of a wall of individual buttons per
+// row, but each action still carries the exact same reason string sent to the audit log.
+assert.match(adminSource, /value: "reset_trial", label: "Reset 5-min trial", payload: \{ action: "reset_trial" \}, reason: "reset 5-minute trial"/, "admin can reset a user's 5-minute trial");
+assert.match(adminSource, /value: "add_trial_minutes", label: "Add 5 min", payload: \{ action: "add_trial_minutes", days: 5 \}, reason: "add 5 trial minutes"/, "admin can add trial minutes instead of extending a calendar date");
+assert.match(adminSource, /value: "expire_trial", label: "Expire trial now", payload: \{ action: "expire_trial" \}, reason: "expire trial now"/, "admin can expire a trial immediately");
 assert.match(adminSource, /Free trial = 5 minutes \(300 seconds\) of actual interpreter usage, tracked server-side\. Not a calendar window\./, "the subscription management panel explicitly documents the new model so it can't be mistaken for the old one");
 
 console.log("Trial usage-model frontend regression tests passed.");

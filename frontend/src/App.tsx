@@ -2049,16 +2049,33 @@ export default function App() {
     const timeoutWithoutFinalOriginal = reason === "timeout" && !lastFinalOriginalRef.current;
     if (reason === "timeout") {
       // Section 6/7: a language that already completed must not be reverted just because a
-      // DIFFERENT, slower target timed out — only the languages still actually pending revert to
-      // "ready". "Translation did not finish" is reserved for a genuine total failure (zero
+      // DIFFERENT, slower target timed out — only the languages still actually pending are
+      // affected. "Translation did not finish" is reserved for a genuine total failure (zero
       // languages ever completed); if at least one did, that's shown instead, not blanked.
+      //
+      // BUG FIX (mobile "stuck on READY / Waiting for speech... forever"): this used to revert
+      // stillPendingLanguages to "ready" instead of "failed". "ready" is a state the desktop
+      // staleness watchdog (STALE_TRANSLATION_STATE_MS, below) never monitors — it only acts on
+      // ["queued", "translating", "processing", "retrying"] — so once a mobile card landed on
+      // "ready" it was invisible to any recovery mechanism for the rest of the session: no card
+      // ever showed FAILED, nothing ever retried it, and translationStatusUpdatedAtRef still held
+      // its stale timestamp from the abandoned request. The one-time "Translation did not finish"
+      // alert fired, but the per-language card itself silently fell back to the default "Waiting
+      // for speech…" placeholder (translationPlaceholder in translationLifecycle.mjs) forever —
+      // indistinguishable from a card that was never asked to translate anything. Desktop never
+      // hits this path at all (its continue-listening mode doesn't call finishDrain on a normal
+      // utterance boundary — see beginDrain above), which is why only mobile showed this exact
+      // "stuck forever" symptom while desktop correctly reached a genuine FAILED/"Translation
+      // timed out" state via the watchdog. Marking these "failed" here (the same terminal state
+      // and the same message the watchdog uses) gives mobile the identical, honest outcome as
+      // desktop instead of a permanently unmonitored dead end.
       const hasAnyCompletedTranslation = Object.keys(finalTranslationsRef.current).length > 0;
-      const readyStatuses = Object.fromEntries(stillPendingLanguages.map((language) => [language, "ready" as TranslationLifecycleState]));
-      setTranslationStatuses((current) => ({ ...current, ...readyStatuses }));
+      const failedStatuses = Object.fromEntries(stillPendingLanguages.map((language) => [language, "failed" as TranslationLifecycleState]));
+      setTranslationStatuses((current) => ({ ...current, ...failedStatuses }));
       setTranslationDiagnostics((current) => {
         if (stillPendingLanguages.length === 0) return current;
         const next = { ...current };
-        for (const language of stillPendingLanguages) delete next[language];
+        for (const language of stillPendingLanguages) next[language] = "Translation timed out. Speak again to retry.";
         return next;
       });
       if (timeoutWithoutFinalOriginal) {

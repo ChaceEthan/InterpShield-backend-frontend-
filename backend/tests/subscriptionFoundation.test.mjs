@@ -1,3 +1,4 @@
+// @ts-nocheck
 import assert from "node:assert/strict";
 import User from "../models/User.js";
 import PaymentHistory from "../models/PaymentHistory.js";

@@ -174,6 +174,45 @@ assert.doesNotMatch(interpreterSource, /clearPendingTranslationQueue\("newer_fin
 assert.match(interpreterSource, /PROVIDER_HARD_FAILURE_COOLDOWN_MS\s*=\s*5\s*\*\s*60\s*\*\s*1000/);
 assert.match(interpreterSource, /isProviderNonRetryableFailure/);
 assert.match(interpreterSource, /isWaitingBehindActiveFifoJob/);
+
+// ROOT CAUSE (backend): a FINAL translation job (processSequentialTranslationJob) is dispatched
+// entirely through createPerLanguageDispatchQueue and never touches translationLanes/lane.
+// activeTasks — so it is never covered by cleanupStaleTranslationWork's per-lane-task sweep
+// (the one that already correctly calls markTranslationLanguageFailed, which emits a socket
+// update). The ONLY safety net that can ever catch a final job that is genuinely stuck (never
+// resolving any of its target languages) is cleanupStaleTranslationWork's job-level sweep
+// (QUEUED_JOB_TIMEOUT / PROCESSING_JOB_TIMEOUT / SEQUENTIAL_JOB_HARD_TIMEOUT), which called
+// markTranslationJobStale — and that function used to ONLY call setTranslationLanguageStatus
+// directly, with no onResult()/socket emission at all. A client whose final job died this way
+// (as opposed to a per-language provider timeout, which IS reported) never learned anything went
+// wrong: no translated text, no failed status, nothing — indistinguishable from a request that
+// was silently swallowed. Fixed by having markTranslationJobStale notify the client (the same
+// emitTranslationStatusUpdate("failed", ...) mechanism markTranslationLanguageFailed already
+// uses) for a job's still-pending/running target languages specifically when it dies via one of
+// these two silent job-level timeout reasons — never for a legitimate supersession
+// (newer_final_transcript, session queue overflow, session_stop), where a replacement job or an
+// explicit teardown already accounts for the UI state and an extra "failed" emission would be
+// spurious noise.
+assert.match(
+  interpreterSource,
+  /const SILENT_JOB_STALE_REASONS = new Set\(\["queued_too_long", "processing_timeout"\]\);/,
+  "job-level staleness notification is scoped to exactly the two reasons the per-language lane sweep can never reach for a final job"
+);
+assert.match(
+  interpreterSource,
+  /const shouldNotifyStaleTimeout = job\.shouldTranslate && SILENT_JOB_STALE_REASONS\.has\(reason\);/,
+  "only a real translation-requesting job (not a transcript-only pass-through) triggers the notification"
+);
+assert.match(
+  interpreterSource,
+  /for \(const language of languagesToNotify\) \{\s*emitTranslationStatusUpdate\(job, language, "failed", "queue", \{ allowStale: true \}\);\s*\}/,
+  "markTranslationJobStale emits a real failed-status update for each affected language instead of dying silently"
+);
+assert.match(
+  interpreterSource,
+  /const emitTranslationStatusUpdate = \(job, language, status, provider = "queue", \{ allowStale = false \} = \{\}\) => \{\s*if \(!job\) return;\s*if \(!allowStale && \(job\.stale \|\| staleTranslationJobs\.has\(job\.id\)\)\) return;/,
+  "emitTranslationStatusUpdate's stale-job guard is opt-out (allowStale) rather than unconditional, so a job-level staleness notification (which necessarily fires after job.stale is already set) is not itself swallowed by the same guard it needs to bypass"
+);
 assert.doesNotMatch(interpreterSource, /PROVIDER_FALLBACK_STAGGER|waitForNextProviderResult/);
 assert.doesNotMatch(interpreterSource, /void processSequentialTranslationJob\(job\)/);
 assert.doesNotMatch(interpreterSource, /sourceLanguageFallbackText|provider:\s*"source"|\[[Ee][Nn]\]/);
@@ -205,7 +244,18 @@ assert.match(frontendSource, /mimeType:\s*recorderMimeType/, "the actual recorde
 assert.match(frontendSource, /streamGeneration:\s*audioStreamGenerationRef\.current/, "browser audio carries Deepgram generation ownership");
 assert.match(socketSource, /deepgram_stream_reset/, "Deepgram reconnect requests a fresh browser container generation");
 assert.match(frontendSource, /reason === "timeout" && !lastFinalOriginalRef\.current/, "a missing final transcript resets translation cards after drain timeout");
-assert.match(frontendSource, /setTranslationStatuses\(\(current\) => \(\{ \.\.\.current, \.\.\.readyStatuses \}\)\)/, "no-final timeout returns only the still-pending target languages to Ready, preserving any that already completed");
+// ROOT CAUSE (mobile "stuck on READY / Waiting for speech... forever"): a translation-drain
+// timeout used to revert still-pending target languages to "ready" instead of "failed". "ready"
+// is a state the desktop staleness watchdog (STALE_TRANSLATION_STATE_MS) never monitors — it
+// only inspects ["queued", "translating", "processing", "retrying"] — so a mobile card that hit
+// this path became permanently invisible to any recovery mechanism: no card ever showed FAILED,
+// nothing ever retried it, and it just sat on the "Waiting for speech…" placeholder forever, even
+// though a one-time "Translation did not finish" alert had already fired. Marking these languages
+// "failed" (mirroring the desktop watchdog's own outcome) gives every platform the same honest,
+// terminal result instead of a state only one platform's recovery logic actually watches.
+assert.match(frontendSource, /setTranslationStatuses\(\(current\) => \(\{ \.\.\.current, \.\.\.failedStatuses \}\)\)/, "a translation-drain timeout returns the still-pending target languages to a real, monitored terminal state (failed), preserving any that already completed");
+assert.doesNotMatch(frontendSource, /readyStatuses/, "the old unmonitored 'ready' reversion on translation timeout is gone");
+assert.match(frontendSource, /next\[language\] = "Translation timed out\. Speak again to retry\.";/, "the timed-out languages get the same diagnostic message the desktop staleness watchdog uses, instead of having their diagnostic silently deleted");
 assert.match(frontendSource, /AUDIO_CHUNK_EMITTED/);
 assert.match(socketSource, /BACKEND_AUDIO_RECEIVED/);
 assert.match(socketSource, /AUDIO_CHUNK_DROPPED/);
