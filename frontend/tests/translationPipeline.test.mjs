@@ -280,4 +280,61 @@ assert.match(appSource, /for \(const language of failedLanguages \|\| \[\]\) \{\
   );
 }
 
+// ROOT CAUSE #10 (production: Chinese/Greek cards reached DONE showing "Translation unavailable —
+// retry" instead of real translated text): a backend statusByLanguage entry of "translated"/"done"
+// must never be trusted at face value — it is only accepted once mergedTranslations[language]
+// (this utterance's actual accumulated, validated text for that language) is non-empty. Multi-
+// language independence and the exact invalid-payload shapes from the bug report are covered here.
+{
+  // TEST 4 & 5: statusByLanguage.zh = "translated" with translations.zh missing, or present but
+  // empty after trim, must never be accepted as a status update — mergedTranslations[zh] would be
+  // unset in both cases (isValidTranslationText/the merge loop never populates it for empty text).
+  assert.match(
+    appSource,
+    /const isDoneStatusWithoutText = \(candidateStatus: TranslationLifecycleState \| null, language: string\) =>\s*Boolean\(candidateStatus\) && \["translated", "done"\]\.includes\(candidateStatus as string\) && !mergedTranslations\[language\];/,
+    "TEST 4/5: a done/translated status guard exists, keyed on mergedTranslations having real text for that exact language"
+  );
+  assert.match(
+    appSource,
+    /for \(const \[language, status\] of Object\.entries\(statusByLanguage \|\| \{\}\)\) \{\s*const normalizedStatus = coerceTranslationState\(status\);\s*if \(!normalizedStatus\) continue;\s*if \(normalizedStatus === "failed" && \(mergedTranslations\[language\] \|\| nextTranslations\[language\]\)\) continue;\s*if \(isDoneStatusWithoutText\(normalizedStatus, language\)\) \{/,
+    "TEST 4/5: every statusByLanguage entry is checked against isDoneStatusWithoutText before being applied, so a backend-reported translated/done status for a language with no merged text is discarded, not applied"
+  );
+
+  // TEST 1: both Chinese and Greek having real translated text is the ordinary success path —
+  // each language's own entry in mergedTranslations independently drives its own status, so both
+  // reach "translated" together when both genuinely have text (no shared/blocking condition
+  // between languages, e.g. no gate on how many total languages are present in the payload).
+  const nextStatusIndex = appSource.indexOf("const nextStatusUpdates: Record<string, TranslationLifecycleState> = {};");
+  const diagnosticObjectsIndex = appSource.indexOf("const diagnosticObjectsByLanguage", nextStatusIndex);
+  const statusUpdateLoopBlock = appSource.slice(nextStatusIndex, diagnosticObjectsIndex);
+  assert.doesNotMatch(
+    statusUpdateLoopBlock,
+    /if \(Object\.keys\(nextStatusUpdates\)\.length (=|<) targetLanguages\.length\)/,
+    "TEST 1: no language's status is gated on how many OTHER languages also succeeded — each is decided purely from its own mergedTranslations/statusByLanguage entry"
+  );
+
+  // TEST 6: a job-level complete=true flag is never read inside this per-language status-update
+  // loop at all (the loop is well past the outer handler's `complete` destructuring, so this
+  // scoped block can only contain a real reference if the loop itself uses it) — failedLanguages
+  // and statusByLanguage are applied per language, so a job marked complete=true overall cannot
+  // promote a language that is actually still failed/textless into "translated".
+  assert.doesNotMatch(statusUpdateLoopBlock, /\bcomplete\b/, "TEST 6: the per-language status-update loop never conditions on the job-level `complete` flag, so complete=true cannot force a still-failed/textless language to translated/done");
+}
+
+// TEST 7: once a language's text genuinely lands in mergedTranslations (real provider success),
+// the same statusByLanguage-driven loop (and the fallback loop over nextTranslations further
+// below) marks it "translated", and the render layer (displayTranslationEntries) shows the exact
+// accumulated text for that language — covered by ROOT CAUSE #5's existing guard requiring
+// mergedTranslations[language] before "translated" is ever set from nextTranslations too.
+assert.match(
+  appSource,
+  /const translatedText = appendTextWindow\(translatedTextWindow\[language\] \|\| "", finalTranslations\[language\]\?\.trim\(\) \|\| ""\);/,
+  "TEST 7: the rendered card text is the actual accumulated translation for that language, not a placeholder"
+);
+assert.match(
+  appSource,
+  /const state: TranslationLifecycleState = translatedText\s*\? "translated"\s*: \["translated", "done"\]\.includes\(reportedState\)\s*\? "failed"\s*: reportedState;/,
+  "TEST 7 (and the DONE-must-have-text invariant generally): a card only renders as translated/DONE when it actually has translatedText; a reported translated/done status with no rendered text is downgraded to failed at render time, never shown as DONE over an empty/placeholder body"
+);
+
 console.log("Translation pipeline regression tests passed.");

@@ -1402,7 +1402,18 @@ export default function App() {
     // replace, so a still-pending current utterance can never blank out a translation the user
     // already saw.
     const translatedText = appendTextWindow(translatedTextWindow[language] || "", finalTranslations[language]?.trim() || "");
-    const state: TranslationLifecycleState = translatedText ? "translated" : translationStatuses[language] || "ready";
+    const reportedState = translationStatuses[language] || "ready";
+    // Defensive invariant (belt-and-suspenders alongside the statusByLanguage guard in
+    // handleTranslationUpdate above): a card must never render a DONE/translated badge unless it
+    // actually has non-empty translated text to show. If translationStatuses[language] is ever
+    // "translated"/"done" with no rendered text — from this or any future code path — treat it as
+    // the inconsistent state it is and show FAILED (which does have an honest, correct message)
+    // instead of a DONE badge over an empty/placeholder body.
+    const state: TranslationLifecycleState = translatedText
+      ? "translated"
+      : ["translated", "done"].includes(reportedState)
+        ? "failed"
+        : reportedState;
     return [language, translatedText, state, translationDiagnostics[language] || ""] as const;
   });
   const microphoneStatusLabel = audioDiagnostic.state === "recording" && audioDiagnostic.mimeType
@@ -2965,15 +2976,36 @@ export default function App() {
       const alreadyCompletedForCurrentUtterance = !streamingPreview && !isComplete && Boolean(lastCompletedTranslationRef.current) && Boolean(updateOriginal) && Boolean(lastFinalOriginalRef.current) && updateOriginal === lastFinalOriginalRef.current && (Number.isFinite(incomingSequence) ? incomingSequence <= latestTranslationSequenceRef.current : true);
       if (alreadyCompletedForCurrentUtterance) return;
       const nextStatusUpdates: Record<string, TranslationLifecycleState> = {};
+      // ROOT CAUSE (production: DONE badge with "Translation unavailable — retry" body): this
+      // loop used to pass a backend-reported "translated"/"done" statusByLanguage entry straight
+      // through into nextStatusUpdates with no check that the same language actually has
+      // validated text in mergedTranslations. If the backend ever reports a language translated
+      // while its translations[language] is missing/empty, or the text existed but was rejected
+      // by isValidTranslationText() in the merge loop above (e.g. a source-echo), the language's
+      // status became "translated"/"done" with no text behind it — the card's badge said DONE,
+      // but translationPlaceholder() (which only runs when its own text is empty) has no honest
+      // "done" message to show, so it fell back to its "translated"/"done" defensive branch:
+      // "Translation unavailable — retry" rendered UNDER a DONE badge. A done/translated status
+      // must never be accepted for a language that doesn't actually have merged text.
+      const isDoneStatusWithoutText = (candidateStatus: TranslationLifecycleState | null, language: string) =>
+        Boolean(candidateStatus) && ["translated", "done"].includes(candidateStatus as string) && !mergedTranslations[language];
       for (const [language, status] of Object.entries(statusByLanguage || {})) {
         const normalizedStatus = coerceTranslationState(status);
         if (!normalizedStatus) continue;
         if (normalizedStatus === "failed" && (mergedTranslations[language] || nextTranslations[language])) continue;
+        if (isDoneStatusWithoutText(normalizedStatus, language)) {
+          console.warn("[TRANSLATION_STATUS_TEXT_MISMATCH]", { sessionId, jobId, language, status: normalizedStatus, hasText: false });
+          continue;
+        }
         nextStatusUpdates[language] = normalizedStatus;
       }
       if (lang && status) {
         const normalizedStatus = coerceTranslationState(status);
-        if (normalizedStatus && !(normalizedStatus === "failed" && (mergedTranslations[lang] || nextTranslations[lang]))) {
+        if (
+          normalizedStatus &&
+          !(normalizedStatus === "failed" && (mergedTranslations[lang] || nextTranslations[lang])) &&
+          !isDoneStatusWithoutText(normalizedStatus, lang)
+        ) {
           nextStatusUpdates[lang] = normalizedStatus;
         }
       }

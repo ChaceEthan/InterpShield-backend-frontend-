@@ -338,3 +338,66 @@ const room = upsertCallRoomParticipant(rooms, {
 assert.equal(room.participants.size, 1);
 removeCallRoomParticipant(rooms, "call-1", "participant-1");
 assert.equal(rooms.size, 0);
+
+// ROOT CAUSE (production: PROCESSING -> DONE badge with "Translation unavailable — retry" body
+// instead of real Chinese/Greek text): a valid backend payload must never claim a language is
+// "translated"/"done" in statusByLanguage while that same language's entry in `translations` is
+// missing or empty. Two invariants make this structurally impossible on the backend:
+//
+// 1. translationStatusForJob (the ONLY function that builds the statusByLanguage/translationStatus
+//    field for every job-scoped emission — the sequential-job success/failure/status-update paths)
+//    gates "translated" strictly on `job.translations?.[language]` being truthy, so it can never
+//    report a language translated without real text already present on the job.
+// 2. The one place a "translated" status literal is constructed by hand instead of going through
+//    translationStatusForJob (the fast-local streaming-preview emission) sets it in the exact same
+//    object literal as the `translations: { [language]: safeTranslatedText }` entry it is paired
+//    with, and only inside the branch already gated on `safeTranslatedText` being truthy and
+//    passing isTranslationDisplayable — so status and text can never diverge there either.
+//
+// This is what makes it safe for the frontend to trust "translated"/"done" IF it also independently
+// verifies the text (see App.tsx's isDoneStatusWithoutText guard) — but the backend contract itself
+// must hold first, or that frontend guard would be silently discarding every real translation.
+assert.match(
+  interpreterSource,
+  /const translationStatusForJob = \(job\) => \{\s*const statuses = \{\};\s*\s*for \(const language of job\.direction\.targets\.slice\(0, MAX_TARGET_LANGUAGES\)\) \{\s*if \(job\.translations\?\.\[language\]\) \{\s*statuses\[language\] = "translated";/,
+  "translationStatusForJob only ever reports a language translated when job.translations[language] is truthy — the single authoritative statusByLanguage builder for every job-scoped translation emission"
+);
+assert.match(
+  interpreterSource,
+  /translations: \{ \[language\]: safeTranslatedText \},\s*translationOutputs: translationOutputsForTranslations\(direction, \{ \[language\]: safeTranslatedText \}\),\s*translationStatus: \{ \[language\]: "translated" \},/,
+  'the one hand-built "translated" status literal (fast-local streaming preview) is emitted in the same object as the matching translations entry for the same language and text'
+);
+{
+  const statusLiteralIndex = interpreterSource.indexOf('translationStatus: { [language]: "translated" },');
+  assert.ok(statusLiteralIndex > -1, 'the hand-built "translated" status literal exists');
+  const guardIndex = interpreterSource.lastIndexOf("safeTranslatedText &&", statusLiteralIndex);
+  assert.ok(guardIndex > -1, "a safeTranslatedText-truthiness guard precedes the status literal");
+  const gapBlock = interpreterSource.slice(guardIndex, statusLiteralIndex);
+  assert.match(gapBlock, /safeTranslatedText &&\s*isTranslationDisplayable\(\{/, "the guard is the isTranslationDisplayable condition, not an unrelated earlier use of safeTranslatedText");
+  assert.ok(statusLiteralIndex - guardIndex < 1500, 'the hand-built "translated" status literal sits inside (close to) the branch gated on safeTranslatedText truthiness plus isTranslationDisplayable, not in some unrelated later block');
+}
+
+// Frontend defensive invariant (belt-and-suspenders, since a future backend regression should
+// never be able to reach the UI as a false DONE): a language must only enter nextStatusUpdates as
+// "translated"/"done" when mergedTranslations[language] already holds real validated text.
+assert.match(
+  frontendSource,
+  /const isDoneStatusWithoutText = \(candidateStatus: TranslationLifecycleState \| null, language: string\) =>\s*Boolean\(candidateStatus\) && \["translated", "done"\]\.includes\(candidateStatus as string\) && !mergedTranslations\[language\];/,
+  "App.tsx defines an explicit guard for a done/translated status reported without merged text"
+);
+assert.match(
+  frontendSource,
+  /if \(isDoneStatusWithoutText\(normalizedStatus, language\)\) \{\s*console\.warn\("\[TRANSLATION_STATUS_TEXT_MISMATCH\]", \{ sessionId, jobId, language, status: normalizedStatus, hasText: false \}\);\s*continue;\s*\}/,
+  "the statusByLanguage loop skips (never applies) a translated/done status that lacks merged text, instead of setting an inconsistent DONE badge with no text behind it"
+);
+assert.match(
+  frontendSource,
+  /!isDoneStatusWithoutText\(normalizedStatus, lang\)/,
+  "the legacy single lang/status event path is gated by the same done-without-text guard as the statusByLanguage loop"
+);
+assert.match(
+  frontendSource,
+  /const state: TranslationLifecycleState = translatedText\s*\? "translated"\s*: \["translated", "done"\]\.includes\(reportedState\)\s*\? "failed"\s*: reportedState;/,
+  'the render layer\'s second, independent guard downgrades a reported "translated"/"done" status to "failed" whenever the language has no actual rendered text, so a DONE badge can never appear over an empty/placeholder body regardless of how translationStatuses got there'
+);
+console.log("Translation integrity regression tests passed.");
