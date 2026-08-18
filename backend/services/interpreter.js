@@ -2253,7 +2253,13 @@ export const createInterpreterSession = async ({
             languageState.retryCount = attempt + 1;
             languageState.status = "retrying";
           }
-          setTranslationLanguageStatus(translationJobs.get(jobId), language, "retrying");
+          // Must emit (not just set local state): the frontend's translation staleness watchdog
+          // only resets its clock on an actual status-change event reaching the client. Without
+          // this emit, an internal provider-attempt retry (each attempt can legally take up to
+          // the provider's full timeout) is invisible to the frontend, letting several silent
+          // attempts add up to well past the client's staleness budget even though the backend
+          // is still legitimately working.
+          emitTranslationStatusUpdate(translationJobs.get(jobId), language, "retrying", provider);
           logTranslationEvent("PROVIDER_RETRY", {
             sessionId,
             jobId,

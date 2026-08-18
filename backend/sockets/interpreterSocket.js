@@ -957,7 +957,8 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
         session.sendAudio(processedAudio.buffer, {
           streamGeneration,
           containerHeader: Boolean(payload.containerHeader),
-          sequence
+          sequence,
+          audioLevel: Number(payload?.audioLevel)
         });
         console.info("[AUDIO_CHUNK_ACCEPTED]", { sequence, bytes: processedAudio.buffer.length, sessionId: session.sessionId, streamGeneration, audioLevel: Number(payload?.audioLevel) });
         if (process.env.NODE_ENV !== "production" && (sequence === 1 || sequence % 25 === 0)) {

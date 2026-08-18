@@ -10,6 +10,10 @@ const MAX_RECONNECT_ATTEMPTS = 5;
 const DEEPGRAM_KEEPALIVE_MS = 8000;
 const DEEPGRAM_HEALTH_CHECK_MS = 5000;
 const DEEPGRAM_STALL_MS = 45000;
+// Separate from VAD speech/silence thresholds (frontend, unchanged) — this is only a floor for
+// "was the source track producing any real energy," used to tell genuine source silence (e.g. a
+// paused video/tab) apart from a truly stuck stream before triggering a destructive reconnect.
+const MEANINGFUL_AUDIO_LEVEL = 0.005;
 const DEEPGRAM_LANGUAGE_ALIASES = {
   lg: "multi",
   luganda: "multi",
@@ -292,6 +296,11 @@ export const createDeepgramSession = ({
       const now = Date.now();
       const lastActivityAt = Math.max(health.lastMessageAt || 0, health.lastTranscriptAt || 0, health.lastOpenAt || 0);
       const audioActive = health.lastAudioSentAt && now - health.lastAudioSentAt < DEEPGRAM_STALL_MS * 2;
+      // Telemetry may be absent (older client, mic path that doesn't report levels) — in that case
+      // fall back to the prior timing-only behavior rather than blocking a legitimate reconnect.
+      const hasAudioLevelTelemetry = (health.audioLevelSamples || 0) > 0;
+      const sourceLikelyGenuinelySilent =
+        hasAudioLevelTelemetry && (!health.lastMeaningfulAudioAt || now - health.lastMeaningfulAudioAt >= DEEPGRAM_STALL_MS);
       console.info("[DEEPGRAM_AUDIO_CONTINUITY]", {
         socketGeneration: connectionGeneration,
         audioActive,
@@ -299,10 +308,21 @@ export const createDeepgramSession = ({
         transcripts: health.transcripts,
         msSinceLastAudio: health.lastAudioSentAt ? now - health.lastAudioSentAt : null,
         msSinceLastMessage: health.lastMessageAt ? now - health.lastMessageAt : null,
-        msSinceLastTranscript: health.lastTranscriptAt ? now - health.lastTranscriptAt : null
+        msSinceLastTranscript: health.lastTranscriptAt ? now - health.lastTranscriptAt : null,
+        hasAudioLevelTelemetry,
+        msSinceLastMeaningfulAudio: health.lastMeaningfulAudioAt ? now - health.lastMeaningfulAudioAt : null,
+        sourceLikelyGenuinelySilent
       });
 
       if (audioActive && lastActivityAt && now - lastActivityAt > DEEPGRAM_STALL_MS) {
+        if (sourceLikelyGenuinelySilent) {
+          // The source track itself has produced no real energy for the whole stall window (e.g.
+          // the tab/video was paused) — Deepgram going quiet is the correct, expected behavior for
+          // real silence, not a broken stream. Reconnecting here would just recreate the same dead
+          // loop against a still-silent source, so wait instead of restarting.
+          console.info("[DEEPGRAM_RECONNECT_SKIPPED_GENUINE_SILENCE]", { socketGeneration: connectionGeneration });
+          return;
+        }
         health.stallDetectedAt = now;
         restartStream("stream_stalled");
       }
@@ -478,8 +498,13 @@ export const createDeepgramSession = ({
     }
   };
 
-  const sendAudio = (buffer, { streamGeneration = connectionGeneration, containerHeader = false, sequence = null } = {}) => {
+  const sendAudio = (buffer, { streamGeneration = connectionGeneration, containerHeader = false, sequence = null, audioLevel = null } = {}) => {
     if (!buffer?.length) return;
+
+    if (Number.isFinite(audioLevel)) {
+      health.audioLevelSamples = (health.audioLevelSamples || 0) + 1;
+      if (audioLevel > MEANINGFUL_AUDIO_LEVEL) health.lastMeaningfulAudioAt = Date.now();
+    }
 
     const incomingGeneration = Number(streamGeneration);
     if (incomingGeneration !== connectionGeneration) {

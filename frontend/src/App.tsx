@@ -103,6 +103,11 @@ interface UserSettings {
   keywordsExtraction?: boolean;
 }
 
+interface ApiError extends Error {
+  status?: number;
+  isNetworkError?: boolean;
+}
+
 interface AppUser {
   id: string;
   name: string;
@@ -925,12 +930,19 @@ const requestApi = async <T,>(path: string, options: RequestInit = {}, token?: s
         ...(options.headers || {})
       }
     });
-  } catch {
-    throw new Error("Unable to reach InterpShield backend. Make sure it is running and VITE_API_URL is correct.");
+  } catch (cause) {
+    const networkError = new Error("Unable to reach InterpShield backend. Make sure it is running and VITE_API_URL is correct.");
+    (networkError as ApiError).isNetworkError = true;
+    (networkError as ApiError).cause = cause;
+    throw networkError;
   }
 
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || "Request failed.");
+  if (!response.ok) {
+    const httpError = new Error(data.error || "Request failed.");
+    (httpError as ApiError).status = response.status;
+    throw httpError;
+  }
   return data as T;
 };
 
@@ -1745,7 +1757,17 @@ export default function App() {
         sessionStorage.removeItem("interp_shield_token");
         sessionStorage.removeItem("interp_shield_user");
         updateSocketAuth(data.token);
-      } catch {
+      } catch (error) {
+        const apiError = error as ApiError;
+        const isAuthFailure = apiError.status === 401 || apiError.status === 403;
+        if (!isAuthFailure) {
+          // Transient network failure (e.g. ERR_CONNECTION_CLOSED) — the current token is still
+          // valid until it actually expires server-side, so do not log out or tear down the live
+          // socket/session over a hiccup. Just skip this refresh cycle and retry on the next tick.
+          console.warn("[AUTH_REFRESH_TRANSIENT_FAILURE]", apiError.message);
+          return;
+        }
+
         if (recordingRef.current) {
           setAlert("Your login session needs attention, but the live interpreter is still running.");
           return;
