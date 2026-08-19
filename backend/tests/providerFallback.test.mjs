@@ -23,6 +23,7 @@ import {
 import {
   DEFAULT_TRANSLATION_PROVIDER,
   OPENAI_QUOTA_COOLDOWN_MS,
+  PROVIDER_HARD_FAILURE_COOLDOWN_MS,
   applyProviderFailureToHealth,
   buildProviderExecutionOrder,
   createProviderUnavailableError,
@@ -1248,4 +1249,126 @@ assert.match(
     /if \(error\?\.intentionalAbort \|\| signal\?\.aborted \|\| \/aborted\/i\.test\(error\?\.message \|\| ""\)\) \{/,
     "translateWithGemini's outer retry loop preserves the intentional-abort marker on re-throw instead of discarding it via a fresh, untagged Error"
   );
+}
+
+// Direct reproduction of the actual production evidence from the local checkout smoke test:
+// Gemini returns real Chinese/Greek text on success (200), and a rejected OpenAI credential
+// (401) must stop wasting requests immediately rather than after two failures like other
+// non-retryable errors (bad language code, malformed request) tolerate.
+{
+  const zhResult = await translateWithGemini({
+    apiKey: "test-only",
+    text: sourceText,
+    sourceLang: "en",
+    targetLang: "zh",
+    includeMetadata: true,
+    request: async () => geminiSuccessResponse(translations.zh),
+    sleep: async () => undefined
+  });
+  assert.equal(zhResult.provider, "gemini");
+  assert.equal(zhResult.text, translations.zh);
+  assert.ok(zhResult.text.length > 0, "Gemini Chinese success must carry real translated text, not an empty/placeholder string");
+
+  const elGreekText = "Αυτή είναι μια δοκιμαστική μετάφραση.";
+  const elResult = await translateWithGemini({
+    apiKey: "test-only",
+    text: sourceText,
+    sourceLang: "en",
+    targetLang: "el",
+    includeMetadata: true,
+    request: async () => geminiSuccessResponse(elGreekText),
+    sleep: async () => undefined
+  });
+  assert.equal(elResult.provider, "gemini");
+  assert.equal(elResult.text, elGreekText);
+}
+
+// A single OpenAI 401 must enter a hard cooldown immediately (not after PROVIDER_NON_RETRYABLE_
+// FAILURE_THRESHOLD failures) — retrying a rejected API key can never succeed until an operator
+// rotates it, so waiting for a second failure only wastes one more guaranteed-failing request.
+{
+  const now = Date.now();
+  const openaiHealth = { failures: 0, cooldownUntil: 0, lastSuccessAt: 0, lastFailure: null };
+  const authError = Object.assign(new Error("OpenAI 401: Incorrect API key provided"), {
+    provider: "openai",
+    httpStatus: 401,
+    reason: "Incorrect API key provided",
+    errorCategory: "authentication_failure"
+  });
+
+  const outcome = applyProviderFailureToHealth({ provider: "openai", health: openaiHealth, error: authError, now });
+
+  assert.equal(outcome.cooldownApplied, true, "the very first authentication failure must apply a cooldown, not wait for a second occurrence");
+  assert.equal(outcome.errorCategory, "authentication_failure");
+  assert.ok(openaiHealth.cooldownUntil >= now + PROVIDER_HARD_FAILURE_COOLDOWN_MS, "an authentication failure must receive the full hard-failure cooldown, not the short transient-overload cooldown");
+  assert.equal(isProviderAvailableFromHealth({ openai: openaiHealth }, "openai", now + 1), false, "OpenAI must be unavailable immediately after the single authentication failure");
+
+  // The very next translation job (for any language) must skip OpenAI entirely — no wasted 401.
+  let openaiRequestsAttempted = 0;
+  const nextJobOrder = buildProviderExecutionOrder({
+    providerHealth: { gemini: { failures: 0, cooldownUntil: 0, lastSuccessAt: now }, openai: openaiHealth },
+    env: { geminiApiKey: "configured", openaiApiKey: "configured" },
+    preferredProvider: "auto"
+  });
+  assert.deepEqual(nextJobOrder, ["gemini"], "a provider order built while OpenAI is in its authentication-failure cooldown must exclude OpenAI entirely");
+  for (const provider of nextJobOrder) {
+    if (provider === "openai") openaiRequestsAttempted += 1;
+  }
+  assert.equal(openaiRequestsAttempted, 0, "no language's dispatch loop may attempt OpenAI again while its authentication-failure cooldown is active");
+
+  // Gemini must remain completely unaffected by OpenAI's credential failure — it is never
+  // disabled, permanently or otherwise, by a different provider's outage.
+  assert.equal(isProviderAvailableFromHealth({ gemini: { failures: 0, cooldownUntil: 0 } }, "gemini", now), true);
+}
+
+// Gemini's own overload (503) must stay short-lived and self-healing — a real provider_overloaded
+// failure must never escalate into the same hard, credential-style cooldown OpenAI's 401 gets,
+// and Gemini must become selectable again once its (much shorter) cooldown elapses.
+{
+  const now = Date.now();
+  const geminiHealth = { failures: 0, cooldownUntil: 0, lastSuccessAt: 0, lastFailure: null };
+  const overloadError = Object.assign(new Error("The model is overloaded. Please try again later."), {
+    provider: "gemini",
+    httpStatus: 503,
+    reason: "The model is overloaded. Please try again later.",
+    errorCategory: "provider_overloaded"
+  });
+
+  const outcome = applyProviderFailureToHealth({ provider: "gemini", health: geminiHealth, error: overloadError, now });
+
+  assert.equal(outcome.cooldownApplied, true);
+  assert.ok(geminiHealth.cooldownUntil < now + PROVIDER_HARD_FAILURE_COOLDOWN_MS, "provider_overloaded must recover far sooner than a hard authentication-failure cooldown");
+  assert.equal(isProviderAvailableFromHealth({ gemini: geminiHealth }, "gemini", now + 1), false, "Gemini is briefly unavailable immediately after a 503");
+  assert.equal(isProviderAvailableFromHealth({ gemini: geminiHealth }, "gemini", geminiHealth.cooldownUntil + 1), true, "Gemini must become selectable again once its short overload cooldown elapses — it is never disabled permanently");
+}
+
+// Full terminal chain: Gemini exhausts its bounded 503 retries for a target language, OpenAI's
+// credential is rejected (401), and the language must settle into an honest terminal failure —
+// never left implying it is still queued/processing/retrying once both providers are exhausted.
+{
+  let geminiCalls = 0;
+  let openaiCalls = 0;
+  let failure;
+  try {
+    await translateWithBackendProviderFallback({
+      language: "zh",
+      geminiRequest: async () => {
+        geminiCalls += 1;
+        return jsonResponse(503, { error: { message: "The model is overloaded. Please try again later." } });
+      },
+      openAIRequest: async () => {
+        openaiCalls += 1;
+        return jsonResponse(401, { error: { message: "Incorrect API key provided" } });
+      }
+    });
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure, "Gemini exhaustion plus a rejected OpenAI credential must terminate, not hang");
+  assert.equal(geminiCalls, 3, "Gemini's own bounded retry budget (initial + 2 retries) must be respected before falling back");
+  assert.equal(openaiCalls, 1, "OpenAI is attempted exactly once as fallback — a 401 must not be retried");
+  assert.equal(failure.httpStatus, 401);
+  assert.equal(failure.errorCategory, "authentication_failure");
+  assert.equal(failure.providerRetryExhausted, true, "a terminal authentication failure must not be retried further, so the language can settle into FAILED instead of staying RETRYING/Translating forever");
 }

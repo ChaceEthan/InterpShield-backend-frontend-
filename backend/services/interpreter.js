@@ -94,7 +94,7 @@ const PROVIDER_TIMEOUT_MS = {
 const PROVIDER_FAILURE_THRESHOLD = 6;
 const PROVIDER_NON_RETRYABLE_FAILURE_THRESHOLD = 2;
 const PROVIDER_COOLDOWN_MS = 45000;
-const PROVIDER_HARD_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
+export const PROVIDER_HARD_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 export const OPENAI_QUOTA_COOLDOWN_MS = 30 * 60 * 1000;
 export const PROVIDER_QUOTA_COOLDOWN_MS = 30 * 60 * 1000;
 const SESSION_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
@@ -559,6 +559,18 @@ export const applyProviderFailureToHealth = ({ provider, health, error, now = Da
 
   if (["temporary_rate_limit", "provider_overloaded", "network_timeout"].includes(errorCategory)) {
     const cooldownMs = Math.max(PROVIDER_COOLDOWN_MS, Number.isFinite(retryAfterMs) ? retryAfterMs : 0);
+    health.cooldownUntil = Math.max(Number(health.cooldownUntil || 0), now + cooldownMs);
+    return { cooldownApplied: true, cooldownMs, reason: errorCategory, errorCategory };
+  }
+
+  // A rejected credential (401/403) will never self-heal by retrying — every language dispatched
+  // to this provider before the operator rotates the key would otherwise waste a full request on
+  // a guaranteed failure. Unlike the generic non-retryable threshold below (which tolerates one
+  // extra failure in case a single odd request, e.g. an unsupported language code, was the real
+  // cause), an authentication/permission failure applies its cooldown on the very first
+  // occurrence — the same as a transient provider overload gets immediately above.
+  if (["authentication_failure", "permission_failure"].includes(errorCategory)) {
+    const cooldownMs = PROVIDER_HARD_FAILURE_COOLDOWN_MS;
     health.cooldownUntil = Math.max(Number(health.cooldownUntil || 0), now + cooldownMs);
     return { cooldownApplied: true, cooldownMs, reason: errorCategory, errorCategory };
   }
