@@ -4087,6 +4087,23 @@ export default function App() {
       vadPollTimerRef.current = window.setInterval(() => {
         if (!recordingRef.current) return;
         if (dubbingTransmissionGatedRef.current) return;
+        // ROOT CAUSE (long desktop/tab sessions: audioLevel decaying from real speech energy down
+        // to ~1e-137, then ~1e-200, then ~1e-293 over tens of seconds, while MediaRecorder kept
+        // emitting ~185-byte header-only chunks and Deepgram kept returning DEEPGRAM_RESULTS_EMPTY):
+        // browsers (Chrome in particular) auto-suspend a WebAudio AudioContext after it has carried
+        // only silence for a while, as a power-saving measure. Once suspended, the analyser this
+        // graph feeds (see createAmplifiedAudioStream) stops receiving fresh frames, so
+        // getAudioLevelRef() keeps sampling stale/zero data and its exponential smoothing
+        // (smoothedLevel = smoothedLevel * 0.75 + rms * 0.25) decays multiplicatively toward zero
+        // forever — explaining the exact shape of the observed numbers. The only place that resumed
+        // a suspended context used to be the "speech_candidate" VAD branch below, which requires the
+        // analyser to already be reading a non-trivial signal to ever fire — a deadlock once the
+        // context was actually suspended (no signal -> never reaches speech_candidate -> context
+        // never resumed -> still no signal). Checking and resuming unconditionally on every poll
+        // tick, before the VAD even reads a level, breaks that deadlock regardless of why the
+        // context suspended. This does not touch MediaRecorder or the captured track itself — it
+        // only concerns the separate analysis graph used for VAD/level metering.
+        if (enhancedAudio.audioContext?.state === "suspended") void enhancedAudio.audioContext.resume().catch(() => undefined);
         const action = vadControllerRef.current.update(getAudioLevelRef.current(), Date.now(), false);
         if (!action) return;
         if ("silenceMs" in action) lastVadSilenceDurationRef.current = action.silenceMs || 0;
@@ -4099,7 +4116,6 @@ export default function App() {
           return;
         }
         if (action.type === "speech_candidate") {
-          if (enhancedAudio.audioContext?.state === "suspended") void enhancedAudio.audioContext.resume().catch(() => undefined);
           return;
         }
         if (action.type === "speech_cancelled") {
