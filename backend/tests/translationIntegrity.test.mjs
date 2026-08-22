@@ -261,6 +261,27 @@ assert.match(socketSource, /BACKEND_AUDIO_RECEIVED/);
 assert.match(socketSource, /AUDIO_CHUNK_DROPPED/);
 assert.match(readFileSync(resolve(__dirname, "../services/deepgram.js"), "utf8"), /DEEPGRAM_FINAL_TRANSCRIPT/);
 assert.match(frontendSource, /STALE_TRANSLATION_STATE_MS/);
+// ROOT CAUSE (production: repeating SOCKET_CONNECTED -> SOCKET_DISCONNECTED reason "io client
+// disconnect" -> reconnect loops while audio capture stayed healthy throughout): the frontend's
+// own stale-heartbeat watchdog (SOCKET_HEARTBEAT_STALE_MS) force-closes the transport if it
+// hasn't seen the backend's app-level heartbeat in that long. If this value is ever shorter than
+// the backend's own native engine.io liveness window (pingInterval + pingTimeout), the client
+// watchdog always races ahead of and pre-empts the transport's own ping/pong, so any ordinary
+// heartbeat-emission delay (GC pause, a burst of concurrent translation dispatch) that a healthy
+// transport would have shrugged off becomes a self-inflicted disconnect/reconnect loop.
+{
+  const serverSource = readFileSync(resolve(__dirname, "../server.js"), "utf8");
+  const pingTimeoutMatch = serverSource.match(/pingTimeout:\s*(\d+)/);
+  const pingIntervalMatch = serverSource.match(/pingInterval:\s*(\d+)/);
+  const heartbeatStaleMatch = frontendSource.match(/SOCKET_HEARTBEAT_STALE_MS\s*=\s*(\d+)/);
+  assert.ok(pingTimeoutMatch && pingIntervalMatch && heartbeatStaleMatch, "all three Socket.IO heartbeat constants must be present and greppable");
+  const nativeLivenessWindowMs = Number(pingTimeoutMatch[1]) + Number(pingIntervalMatch[1]);
+  const heartbeatStaleMs = Number(heartbeatStaleMatch[1]);
+  assert.ok(
+    heartbeatStaleMs > nativeLivenessWindowMs,
+    `SOCKET_HEARTBEAT_STALE_MS (${heartbeatStaleMs}) must exceed the backend's native pingInterval+pingTimeout window (${nativeLivenessWindowMs}), or the client watchdog force-disconnects healthy connections before the transport's own liveness check ever would`
+  );
+}
 assert.match(frontendSource, /latestTranslationSequenceRef/);
 assert.match(frontendSource, /streamingPreview/);
 assert.match(frontendSource, /latestTranslationSequenceRef\.current\s*=\s*transcriptSequence/);

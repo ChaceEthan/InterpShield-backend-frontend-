@@ -13,7 +13,7 @@
     "start": "node server.js",
     "lint": "npm run build",
     "test:translation": "node tests/translationIntegrity.test.mjs && node tests/providerFallback.test.mjs && node tests/translationPayloadGuards.test.mjs",
-    "test:streaming": "node tests/streamingReliability.test.mjs && node tests/longSessionStability.test.mjs",
+    "test:streaming": "node tests/streamingReliability.test.mjs && node tests/longSessionStability.test.mjs && node tests/translationReconnectResync.test.mjs",
     "test:admin": "node tests/adminSecurity.test.mjs && node tests/subscriptionFoundation.test.mjs",
     "test": "npm run test:admin && npm run test:translation && npm run test:streaming",
     "clean": "node -e \"console.log('backend has no generated build output')\""

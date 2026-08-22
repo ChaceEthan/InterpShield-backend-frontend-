@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-// The free trial moved from a 7-day calendar window to 300 seconds (5 minutes) of actual,
+// The free trial moved from a 7-day calendar window to 180 seconds (3 minutes) of actual,
 // server-metered interpreter usage. These are source-pattern regression guards (this
 // codebase's established convention for App.tsx/AdminDashboard.tsx, since they aren't
 // imported/executed directly by the plain-node test runner) proving the frontend no longer
@@ -12,7 +12,7 @@ const adminSource = readFileSync(new URL("../src/components/AdminDashboard.tsx",
 assert.doesNotMatch(appSource, /trialEndsAt/, "the frontend no longer references the retired calendar-based trialEndsAt field");
 assert.doesNotMatch(adminSource, /trialEndsAt|Days Remaining|Grant 7-day trial|Extend trial/, "the admin dashboard no longer shows obsolete 7-day trial wording or actions");
 assert.match(appSource, /trialSecondsRemaining\?: number \| null; trialSecondsUsed\?: number \| null; trialSecondsTotal\?: number;/, "the frontend subscription type carries the server-authoritative trial-seconds fields");
-assert.match(appSource, /Your 5-minute free trial has ended\. Choose a plan to continue using InterpShield\./, "trial exhaustion shows the exact required message, not the old free-form 7-day wording");
+assert.match(appSource, /Your 3-minute free trial has ended\. Choose a plan to continue using InterpShield\./, "trial exhaustion shows the exact required message, not the old free-form 7-day wording");
 
 // A server-pushed trial_expired event (fired the moment the backend meter reaches zero mid
 // session) must stop the local capture, not just show a toast the user could miss.
@@ -30,9 +30,9 @@ assert.match(adminSource, /const formatTrialRemaining = \(user: AdminUser\) => \
 // Subscription actions (reset/add/expire trial, and the rest) are driven by a compact
 // dropdown + Apply button (SUBSCRIPTION_ACTIONS) instead of a wall of individual buttons per
 // row, but each action still carries the exact same reason string sent to the audit log.
-assert.match(adminSource, /value: "reset_trial", label: "Reset 5-min trial", payload: \{ action: "reset_trial" \}, reason: "reset 5-minute trial"/, "admin can reset a user's 5-minute trial");
+assert.match(adminSource, /value: "reset_trial", label: "Reset 3-min trial", payload: \{ action: "reset_trial" \}, reason: "reset 3-minute trial"/, "admin can reset a user's 3-minute trial");
 assert.match(adminSource, /value: "add_trial_minutes", label: "Add 5 min", payload: \{ action: "add_trial_minutes", days: 5 \}, reason: "add 5 trial minutes"/, "admin can add trial minutes instead of extending a calendar date");
 assert.match(adminSource, /value: "expire_trial", label: "Expire trial now", payload: \{ action: "expire_trial" \}, reason: "expire trial now"/, "admin can expire a trial immediately");
-assert.match(adminSource, /Free trial = 5 minutes \(300 seconds\) of actual interpreter usage, tracked server-side\. Not a calendar window\./, "the subscription management panel explicitly documents the new model so it can't be mistaken for the old one");
+assert.match(adminSource, /Free trial = 3 minutes \(180 seconds\) of actual interpreter usage, tracked server-side\. Not a calendar window\./, "the subscription management panel explicitly documents the new model so it can't be mistaken for the old one");
 
 console.log("Trial usage-model frontend regression tests passed.");

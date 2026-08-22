@@ -1,13 +1,13 @@
 // The free trial is usage-based, not calendar-based: every normal new user starts with
-// TRIAL_SECONDS of actual interpreter usage (300s = 5 minutes), tracked server-side in
+// TRIAL_SECONDS of actual interpreter usage (180s = 3 minutes), tracked server-side in
 // trialSecondsRemaining/trialSecondsUsed. TRIAL_DAYS/addDays remain for paid-subscription
 // durations only (monthly/quarterly/yearly), which are unaffected by this trial model.
-export const TRIAL_SECONDS = 300;
+export const TRIAL_SECONDS = 180;
 export const TRIAL_DAYS = 7;
 export const UNLIMITED_ROLES = new Set(["admin", "super_admin"]);
 export const SUBSCRIPTION_TYPES = new Set(["none", "trial", "monthly", "quarterly", "yearly", "enterprise", "unlimited"]);
 export const PAYMENT_PROVIDERS = new Set(["none", "mtn_momo", "airtel_money", "stripe", "equity_bank", "flutterwave", "paypal", "manual"]);
-export const EXPIRED_ACCESS_MESSAGE = "Your 5-minute free trial has ended. Choose a plan to continue using InterpShield.";
+export const EXPIRED_ACCESS_MESSAGE = "Your 3-minute free trial has ended. Choose a plan to continue using InterpShield.";
 
 const dateValue = (value) => value ? new Date(value) : null;
 export const addDays = (date, days) => new Date(new Date(date).getTime() + days * 86400000);
@@ -57,7 +57,7 @@ export const normalizeSubscription = (user, now = new Date()) => {
     } else initializeTrial(user, now);
   }
   // One-time deterministic migration from the old 7-day calendar trial: an account whose
-  // legacy trial had not yet expired carries over into the new model with a fresh 5-minute
+  // legacy trial had not yet expired carries over into the new model with a fresh 3-minute
   // usage allotment; an account whose legacy trial had already expired gets 0 seconds (no
   // trial is silently re-granted to an already-expired account).
   if (user.subscriptionType === "trial" && !Number.isFinite(user.trialSecondsRemaining)) {

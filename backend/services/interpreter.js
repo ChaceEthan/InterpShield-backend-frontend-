@@ -2609,6 +2609,29 @@ export const createInterpreterSession = async ({
     });
   };
 
+  // Socket.IO server-side emits during a client disconnect/reconnect gap are not buffered or
+  // replayed (unlike the client's own offline queue), so any "retrying"/"processing" status
+  // update that fires while the client is between ERR_NETWORK_CHANGED and SOCKET_CONNECTED is
+  // silently lost. That leaves the frontend's per-language staleness watchdog holding a stale
+  // "last updated" timestamp even though this session's provider retries/fallback are still
+  // legitimately in flight, so it can mark a healthy in-progress language FAILED on a timer alone.
+  // Call this once a reconnecting client's socket has actually resumed this session so every
+  // still-pending language gets a fresh status event and the client's watchdog clock resets.
+  const resyncPendingTranslations = () => {
+    for (const job of translationJobs.values()) {
+      if (job.stale || staleTranslationJobs.has(job.id)) continue;
+
+      for (const language of job.direction.targets.slice(0, MAX_TARGET_LANGUAGES)) {
+        if (job.translations?.[language]) continue;
+        if (job.failedLanguages?.has?.(language)) continue;
+
+        const status = job.languageStatuses?.[language] ||
+          (job.runningLanguages?.has?.(language) ? "processing" : "queued");
+        emitTranslationStatusUpdate(job, language, status, "resync");
+      }
+    }
+  };
+
   const markTranslationLanguageFailed = (job, language, errorOrReason = "failed", provider = "queue") => {
     if (!job || !language || job.translations?.[language]) return;
     job.pendingLanguages?.delete?.(language);
@@ -4149,6 +4172,7 @@ export const createInterpreterSession = async ({
   session.sessionId = sessionId;
   session.transcriptHistory = [];
   session.getTranslationHealth = getTranslationHealth;
+  session.resyncPendingTranslations = resyncPendingTranslations;
   rememberSessionHistory(sessionId, session.transcriptHistory);
   const stopDeepgramSession = session.stop;
   session.stop = () => {

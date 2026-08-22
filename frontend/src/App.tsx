@@ -301,7 +301,22 @@ const AUTH_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 // of the two configured provider timeouts), plus margin for socket/dispatch overhead — never
 // shorter than what the backend itself considers "still working".
 const STALE_TRANSLATION_STATE_MS = 32000;
-const SOCKET_HEARTBEAT_STALE_MS = 75000;
+// ROOT CAUSE (production: repeating SOCKET_CONNECTED -> SOCKET_DISCONNECTED reason "io client
+// disconnect" -> DESKTOP_PIPELINE_SOCKET_RECONNECT loops while audio capture stayed healthy the
+// whole time): this watchdog force-closes the transport (engine.close()/disconnect()+connect())
+// whenever the backend's periodic "session:heartbeat" app-level ping hasn't been seen in this
+// many ms — but the previous value (75000) was SHORTER than the backend's own native engine.io
+// liveness window (pingInterval 25000ms + pingTimeout 60000ms = 85000ms, see backend/server.js),
+// so this client-side check always fired and force-disconnected a socket BEFORE the underlying
+// transport's own ping/pong would ever have declared it dead. Any ordinary scheduling delay in
+// the server's heartbeat setInterval (GC pause, a burst of concurrent translation dispatch, brief
+// event-loop contention) — well within a transport that is still perfectly alive — was enough to
+// trigger a self-inflicted disconnect, and since the newly reconnected socket restarts this same
+// race, a single delayed heartbeat could repeat into a visible reconnect loop. This value must
+// stay strictly greater than the backend's own pingInterval + pingTimeout (85000ms) so this
+// watchdog only ever acts as a last-resort recovery for a genuinely wedged connection the native
+// protocol itself failed to notice, never as a competing/duplicate liveness check.
+const SOCKET_HEARTBEAT_STALE_MS = 100000;
 let socketInstanceCounter = 0;
 const nextSocketInstanceId = () => `socket-${++socketInstanceCounter}-${Date.now().toString(36)}`;
 const DEFAULT_TARGET_LANGUAGES = ["es"];
@@ -1702,7 +1717,7 @@ export default function App() {
 
   useEffect(() => {
     if (!isRecording || user?.role !== "user" || !user.subscription || user.subscription.isUnlimited || user.subscription.trialSecondsRemaining == null) return undefined;
-    // The 5-minute trial is server-authoritative and metered in the backend while the live
+    // The 3-minute trial is server-authoritative and metered in the backend while the live
     // session is open; this just periodically re-reads that value so the countdown shown
     // here (and the block-on-zero check in startSession) never drifts far from the DB.
     const timer = window.setInterval(() => { void refreshMe(); }, 15000);
@@ -2655,7 +2670,7 @@ export default function App() {
     socket.on("app-error", handleSessionError);
     socket.on("trial_expired", ({ message }: { message?: string }) => {
       if (recordingRef.current) stopSession();
-      setAlert(message || "Your 5-minute free trial has ended. Choose a plan to continue using InterpShield.");
+      setAlert(message || "Your 3-minute free trial has ended. Choose a plan to continue using InterpShield.");
       navigate("subscription");
     });
 
@@ -3517,7 +3532,7 @@ export default function App() {
 
     if (user?.role === "user" && user.subscription && !user.subscription.canUseInterpreter) {
       console.warn("[MIC_START_BLOCKED]", { reason: "trial_exhausted" });
-      setAlert("Your 5-minute free trial has ended. Choose a plan to continue using InterpShield.");
+      setAlert("Your 3-minute free trial has ended. Choose a plan to continue using InterpShield.");
       navigate("subscription");
       return;
     }

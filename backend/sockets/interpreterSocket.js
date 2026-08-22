@@ -759,6 +759,13 @@ export const registerInterpreterSocket = (io, env, getPublicConfig) => {
           sourceLang,
           targetLanguages
         });
+        // Any translation still in flight when the previous socket dropped had its
+        // "retrying"/"processing" status updates silently swallowed (server-side emits are not
+        // buffered across a disconnect), leaving the client's per-language staleness watchdog
+        // holding a stale timestamp. Re-emit current status for every pending language now that
+        // the new socket is wired up, so the watchdog doesn't fail a translation the backend is
+        // still legitimately working on.
+        session.resyncPendingTranslations?.();
         return;
       }
 
